@@ -386,12 +386,21 @@ class MultiStepRolloutWorker(Worker):
         self.torch_platform.empty_cache()
 
     @Worker.timer("generate_one_epoch")
-    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
+    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel, epoch_idx: int = 0):
+        from rlinf.utils.fine_grained_profiler import get_profiler, is_profiling_enabled
+        profiler = get_profiler()
+        
         self.update_dagger_beta()
-        for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
+        for chunk_idx in range(self.n_train_chunk_steps):
+            for stage_idx in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                actions, result = self.predict(env_output["obs"])
+                
+                # Record predict timing
+                if is_profiling_enabled():
+                    with profiler.record_iteration("predict", chunk_idx, stage_idx, epoch_idx):
+                        actions, result = self.predict(env_output["obs"])
+                else:
+                    actions, result = self.predict(env_output["obs"])
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -439,18 +448,43 @@ class MultiStepRolloutWorker(Worker):
         input_channel: Channel,
         output_channel: Channel,
     ):
+        from rlinf.utils.fine_grained_profiler import get_profiler, enable_profiling
+        
         if self.enable_offload:
             self.reload_model()
 
-        for _ in tqdm(
+        # Enable profiling in this worker process if configured
+        # Use .get() with default to handle missing config keys
+        runner_cfg = self.cfg.get("runner", {})
+        enable_profile = runner_cfg.get("enable_fine_grained_profile", False)
+        
+        profiler = get_profiler()
+        if enable_profile:
+            enable_profiling()
+            profiler.start_session("rollout", self._rank)
+
+        for epoch_idx in tqdm(
             range(self.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            await self.generate_one_epoch(input_channel, output_channel)
+            await self.generate_one_epoch(input_channel, output_channel, epoch_idx=epoch_idx)
 
         if self.enable_offload:
             self.offload_model()
+        
+        # Store profiling intervals in instance variable (not in return value)
+        if enable_profile:
+            self._profile_intervals = profiler.get_intervals_as_dict()
+            profiler.clear()
+        
+        return {}
+    
+    def get_profile_intervals(self) -> dict:
+        """Get the profiling intervals from the last generate call.
+        This is called separately by runner to avoid polluting the return value.
+        """
+        return getattr(self, "_profile_intervals", {})
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:

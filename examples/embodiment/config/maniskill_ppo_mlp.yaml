@@ -26,7 +26,11 @@ runner:
     experiment_name: "maniskill_ppo_mlp"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  enable_timeline_profile: False
+  enable_fine_grained_profile: True  # Enable pipeline bubble chart profiling
+  fine_grained_profile_interval: 1  # Profile every N steps (0 = only first step)
+
+  max_epochs: 2
   max_steps: -1
 
   only_eval: False

@@ -26,11 +26,16 @@ runner:
     experiment_name: "maniskill_ppo_openpi_pi05"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 2
   max_steps: -1
   only_eval: False
   val_check_interval: 10
   save_interval: 50
+  enable_timeline_profile: False  # Enable fine-grained timeline profiling
+  
+  # Fine-grained pipeline profiling for bubble chart visualization
+  enable_fine_grained_profile: True  # Enable pipeline bubble chart profiling
+  fine_grained_profile_interval: 10  # Profile every N steps (0 = only first step)
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -120,7 +125,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-ManiSkill-25Main-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-ManiSkill-25Main-SFT
+    model_path: "/mnt/public/zhouyiming/model/RLinf-Pi05-ManiSkill-25Main-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-ManiSkill-25Main-SFT
     precision: ${actor.model.precision}
 actor:
   group_name: "ActorGroup"
@@ -131,7 +136,7 @@ actor:
   enable_offload: False
   # Override the default values in model/pi0_5
   model:
-    model_path: "/path/to/model/RLinf-Pi05-ManiSkill-25Main-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-ManiSkill-25Main-SFT
+    model_path: "/mnt/public/zhouyiming/model/RLinf-Pi05-ManiSkill-25Main-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-ManiSkill-25Main-SFT
     model_type: "openpi"
     add_value_head: True
     num_action_chunks: 5 # interface for the env

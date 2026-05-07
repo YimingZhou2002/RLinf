@@ -948,6 +948,9 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
+        from rlinf.utils.fine_grained_profiler import get_profiler, is_profiling_enabled
+        profiler = get_profiler()
+        
         self.rollout_results: list[EmbodiedRolloutResult] = [
             EmbodiedRolloutResult(
                 max_episode_length=self.cfg.env.train.max_episode_steps,
@@ -1019,9 +1022,16 @@ class EnvWorker(Worker):
                             rollout_result.save_flags
                         )
 
-                    env_output, env_info = self.env_interact_step(
-                        rollout_result.actions, stage_id
-                    )
+                    # Record env_interact_step timing
+                    if is_profiling_enabled():
+                        with profiler.record_iteration("env_step", chunk_step_idx, stage_id, epoch):
+                            env_output, env_info = self.env_interact_step(
+                                rollout_result.actions, stage_id
+                            )
+                    else:
+                        env_output, env_info = self.env_interact_step(
+                            rollout_result.actions, stage_id
+                        )
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
                         rollout_channel,
@@ -1098,9 +1108,21 @@ class EnvWorker(Worker):
         self,
         input_channel: Channel,
         rollout_channel: Channel,
-        reward_channel: Channel | None,
+        reward_channel: Channel | None = None,
         actor_channel: Channel | None = None,
     ):
+        from rlinf.utils.fine_grained_profiler import get_profiler, enable_profiling
+        
+        # Enable profiling in this worker process if configured
+        # Use .get() with default to handle missing config keys
+        runner_cfg = self.cfg.get("runner", {})
+        enable_profile = runner_cfg.get("enable_fine_grained_profile", False)
+        
+        profiler = get_profiler()
+        if enable_profile:
+            enable_profiling()
+            profiler.start_session("env", self._rank)
+        
         env_metrics = await self._run_interact_once(
             input_channel,
             rollout_channel,
@@ -1112,8 +1134,19 @@ class EnvWorker(Worker):
         for env in self.env_list:
             if self.enable_offload and hasattr(env, "offload"):
                 env.offload()
-
+        
+        # Store profiling intervals in instance variable (not in return value)
+        if enable_profile:
+            self._profile_intervals = profiler.get_intervals_as_dict()
+            profiler.clear()
+        
         return env_metrics
+    
+    def get_profile_intervals(self) -> dict:
+        """Get the profiling intervals from the last interact call.
+        This is called separately by runner to avoid polluting the return value.
+        """
+        return getattr(self, "_profile_intervals", {})
 
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)

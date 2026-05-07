@@ -30,6 +30,14 @@ from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
 from rlinf.utils.runner_utils import check_progress
 from rlinf.utils.timers import Timer
+from rlinf.utils.integrated_profiler import IntegratedProfiler
+from rlinf.utils.fine_grained_profiler import (
+    enable_profiling,
+    disable_profiling,
+    is_profiling_enabled,
+    TimelineAggregator,
+)
+from rlinf.utils.pipeline_visualizer import PipelineVisualizer
 
 logger = logging.getLogger(__name__)
 
@@ -271,57 +279,156 @@ class EmbodiedRunner:
     def run(self):
         start_step = self.global_step
         start_time = time.time()
+
+        # Initialize integrated profiler
+        enable_timeline_profile = self.cfg.runner.get("enable_timeline_profile", False)
+        profile_output_dir = os.path.join(self.cfg.runner.logger.log_path, "profile")
+        profiler = IntegratedProfiler.get_instance()
+        if enable_timeline_profile:
+            profiler._enabled = True
+            profiler._output_dir = profile_output_dir
+
+        # Initialize fine-grained profiler for pipeline bubble chart
+        enable_fine_grained_profile = self.cfg.runner.get(
+            "enable_fine_grained_profile", False
+        )
+        fine_grained_profile_interval = self.cfg.runner.get(
+            "fine_grained_profile_interval", 10
+        )  # Profile every N steps
+        fine_grained_profile_output_dir = os.path.join(
+            self.cfg.runner.logger.log_path, "fine_grained_profile"
+        )
+        if enable_fine_grained_profile:
+            os.makedirs(fine_grained_profile_output_dir, exist_ok=True)
+            enable_profiling()
+            self.logger.info(
+                f"Fine-grained profiling enabled. Output dir: {fine_grained_profile_output_dir}"
+            )
+
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
 
+            # Start profiling for this step
+            if enable_timeline_profile:
+                profiler.start_step()
+
             with self.timer("step"):
                 with self.timer("sync_weights"):
                     if _step % self.weight_sync_interval == 0:
-                        self.update_rollout_weights()
+                        if enable_timeline_profile:
+                            with profiler.record("sync_weights", "runner"):
+                                self.update_rollout_weights()
+                        else:
+                            self.update_rollout_weights()
+
                 with self.timer("generate_rollouts"):
-                    env_handle: Handle = self.env.interact(
-                        input_channel=self.env_channel,
-                        rollout_channel=self.rollout_channel,
-                        reward_channel=self.reward_channel,
-                        actor_channel=self.actor_channel,
-                    )
-                    rollout_handle: Handle = self.rollout.generate(
-                        input_channel=self.rollout_channel,
-                        output_channel=self.env_channel,
-                    )
-                    if self.reward is not None:
-                        reward_handle: Handle = self.reward.compute_rewards(
-                            input_channel=self.reward_channel,
+                    if enable_timeline_profile:
+                        # env_interact includes the wait time
+                        with profiler.record("env_interact", "env"):
+                            env_handle: Handle = self.env.interact(
+                                input_channel=self.env_channel,
+                                rollout_channel=self.rollout_channel,
+                                reward_channel=self.reward_channel,
+                                actor_channel=self.actor_channel,
+                            )
+                        # rollout_generate includes the wait time
+                        with profiler.record("rollout_generate", "rollout"):
+                            rollout_handle: Handle = self.rollout.generate(
+                                input_channel=self.rollout_channel,
+                                output_channel=self.env_channel,
+                            )
+                        if self.reward is not None:
+                            with profiler.record("reward_compute", "reward"):
+                                reward_handle: Handle = self.reward.compute_rewards(
+                                    input_channel=self.reward_channel,
+                                    output_channel=self.env_channel,
+                                )
+                        # recv_trajectories - this waits for data transfer
+                        with profiler.record("recv_trajectories", "runner"):
+                            self.actor.recv_rollout_trajectories(
+                                input_channel=self.actor_channel
+                            ).wait()
+                        # Wait for env and rollout to complete
+                        with profiler.record("env_wait", "env"):
+                            env_results = env_handle.wait()
+                        with profiler.record("rollout_wait", "rollout"):
+                            rollout_results = rollout_handle.wait()
+                        if self.reward is not None:
+                            with profiler.record("reward_wait", "reward"):
+                                reward_handle.wait()
+                    else:
+                        env_handle: Handle = self.env.interact(
+                            input_channel=self.env_channel,
+                            rollout_channel=self.rollout_channel,
+                            reward_channel=self.reward_channel,
+                            actor_channel=self.actor_channel,
+                        )
+                        rollout_handle: Handle = self.rollout.generate(
+                            input_channel=self.rollout_channel,
                             output_channel=self.env_channel,
                         )
-                    self.actor.recv_rollout_trajectories(
-                        input_channel=self.actor_channel
-                    ).wait()
-                    rollout_handle.wait()
-                    if self.reward is not None:
-                        reward_handle.wait()
+                        if self.reward is not None:
+                            reward_handle: Handle = self.reward.compute_rewards(
+                                input_channel=self.reward_channel,
+                                output_channel=self.env_channel,
+                            )
+                        self.actor.recv_rollout_trajectories(
+                            input_channel=self.actor_channel
+                        ).wait()
+                        env_results = env_handle.wait()
+                        rollout_results = rollout_handle.wait()
+                        if self.reward is not None:
+                            reward_handle.wait()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
-                    actor_rollout_metrics = (
-                        self.actor.compute_advantages_and_returns().wait()
-                    )
+                    if enable_timeline_profile:
+                        with profiler.record("compute_advantages", "runner"):
+                            actor_rollout_metrics = (
+                                self.actor.compute_advantages_and_returns().wait()
+                            )
+                    else:
+                        actor_rollout_metrics = (
+                            self.actor.compute_advantages_and_returns().wait()
+                        )
 
                 # actor training.
-                actor_training_handle: Handle = self.actor.run_training()
+                if enable_timeline_profile:
+                    with profiler.record("actor_training_submit", "runner"):
+                        actor_training_handle: Handle = self.actor.run_training()
+                else:
+                    actor_training_handle: Handle = self.actor.run_training()
                 env_bootstrap_handle: Handle | None = None
                 if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                     env_bootstrap_handle = self.env.prefetch_train_bootstrap(
                         rollout_channel=self.rollout_channel
                     )
 
-                actor_training_metrics = actor_training_handle.wait()
+                if enable_timeline_profile:
+                    with profiler.record("actor_training_wait", "actor"):
+                        actor_training_metrics = actor_training_handle.wait()
+                else:
+                    actor_training_metrics = actor_training_handle.wait()
                 if env_bootstrap_handle is not None:
                     env_bootstrap_handle.wait()
 
                 self.global_step += 1
+
+                # End profiling and save for this step
+                if enable_timeline_profile:
+                    profiler.end_step()
+                    profiler.save_all(prefix=f"step_{_step}")
+                    profiler.clear()
+
+                # Collect fine-grained profiling intervals and visualize
+                # Get profile intervals through separate method calls (not from return values)
+                if enable_fine_grained_profile and _step % fine_grained_profile_interval == 0:
+                    self._collect_and_visualize_fine_grained_profile(
+                        _step,
+                        fine_grained_profile_output_dir,
+                    )
 
                 run_val, save_model, is_train_end = check_progress(
                     self.global_step,
@@ -481,6 +588,89 @@ class EmbodiedRunner:
 
         if (max_steps := self.cfg.runner.get("max_steps", -1)) >= 0:
             self.max_steps = min(self.max_steps, max_steps)
+
+    def _collect_and_visualize_fine_grained_profile(
+        self,
+        step: int,
+        output_dir: str,
+    ):
+        """Collect fine-grained profiling intervals from workers via separate calls and visualize."""
+        try:
+            aggregator = TimelineAggregator()
+
+            # Get intervals from env workers through separate method call
+            import ray
+            # WorkerGroup has _workers attribute which is list[WorkerRank]
+            # Each WorkerRank has 'worker' (Ray actor) and 'rank' attributes
+            if hasattr(self.env, "_workers") and self.env._workers:
+                for worker_rank in self.env._workers:
+                    try:
+                        worker = worker_rank.worker  # Ray actor
+                        rank = worker_rank.rank
+                        # Ray remote call returns ObjectRef, need to get the actual value
+                        intervals_ref = worker.get_profile_intervals.remote()
+                        intervals = ray.get(intervals_ref)
+                        if intervals:
+                            aggregator.add_worker_intervals(f"env_rank{rank}", intervals)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to get env worker {worker_rank.rank} intervals: {e}")
+
+            # Get intervals from rollout workers through separate method call
+            if hasattr(self.rollout, "_workers") and self.rollout._workers:
+                for worker_rank in self.rollout._workers:
+                    try:
+                        worker = worker_rank.worker  # Ray actor
+                        rank = worker_rank.rank
+                        # Ray remote call returns ObjectRef, need to get the actual value
+                        intervals_ref = worker.get_profile_intervals.remote()
+                        intervals = ray.get(intervals_ref)
+                        if intervals:
+                            aggregator.add_worker_intervals(f"rollout_rank{rank}", intervals)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to get rollout worker {worker_rank.rank} intervals: {e}")
+
+            # Check if we have any intervals
+            if not aggregator._intervals_by_worker:
+                self.logger.warning("No intervals collected from workers.")
+                return
+
+            # Normalize timeline (align timestamps)
+            aggregator.normalize_timeline()
+
+            # Generate visualizations
+            visualizer = PipelineVisualizer(figsize=(16, 10), dpi=100)
+
+            # Save pipeline bubble chart
+            bubble_chart_path = os.path.join(
+                output_dir, f"pipeline_bubble_chart_step_{step}.png"
+            )
+            visualizer.plot(
+                aggregator,
+                save_path=bubble_chart_path,
+                title=f"Pipeline Execution Timeline - Step {step}",
+            )
+
+            # Save efficiency analysis
+            efficiency_path = os.path.join(
+                output_dir, f"pipeline_efficiency_step_{step}.png"
+            )
+            visualizer.plot_pipeline_efficiency(
+                aggregator, save_path=efficiency_path
+            )
+
+            # Save Chrome trace format for interactive viewing
+            chrome_trace_path = os.path.join(
+                output_dir, f"timeline_step_{step}.json"
+            )
+            aggregator.save_chrome_trace(chrome_trace_path)
+
+            self.logger.info(
+                f"Fine-grained profile saved for step {step}: "
+                f"{bubble_chart_path}, {efficiency_path}, {chrome_trace_path}"
+            )
+
+        except Exception as e:
+            self.logger.warning(f"Failed to collect fine-grained profile: {e}")
 
     @property
     def epoch(self):
