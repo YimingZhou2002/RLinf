@@ -4,6 +4,7 @@ defaults:
   - model/openvla@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
+  # - profile/default@cluster.profiling
   - override hydra/job_logging: stdout
 
 hydra:
@@ -15,6 +16,12 @@ hydra:
 
 cluster:
   num_nodes: 1
+  # profiling:
+  #   backend: nsight
+  #   enabled: false
+  #   options:
+  #     t: cuda,nvtx             
+  #     cudabacktrace: none
   component_placement:
     actor: 0-7
     env: 0-3
@@ -28,7 +35,7 @@ runner:
     experiment_name: "maniskill_ppo_openvla"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 1
   max_steps: -1
 
   only_eval: False
@@ -70,7 +77,7 @@ env:
   # Override the default values in env/maniskill_put_on_plate_in_scene_25_main and env/maniskill_ood_template
   train:
     rollout_epoch: 1
-    total_num_envs: 128
+    total_num_envs: 8
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 80 # max episode steps for truncation
@@ -107,7 +114,7 @@ rollout:
   pipeline_stage_num: 2
 
   model:
-    model_path: "/path/to/model/rl4vla/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
+    model_path: "/mnt/public2/zhouyiming/RLinf_autotest_pr/model/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
     precision: ${actor.model.precision}
 
 actor:
@@ -120,7 +127,7 @@ actor:
 
   # Override the default values in model/openvla
   model:
-    model_path: "/path/to/model/rl4vla/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
+    model_path: "/mnt/public2/zhouyiming/RLinf_autotest_pr/model/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
     model_type: "openvla"
     add_value_head: True
     is_lora: True
