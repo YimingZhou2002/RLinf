@@ -44,29 +44,30 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 ## MUTABLE SECTION
 <!-- Update each round with justification for changes -->
 
-### Plan Version: 1 (Updated: Round 0)
+### Plan Version: 1 (Updated: Round 1)
 
 #### Plan Evolution Log
 <!-- Document any changes to the plan with justification -->
 | Round | Change | Reason | Impact on AC |
 |-------|--------|--------|--------------|
 | 0 | Initial plan | gen-plan + refine-plan output | - |
+| 1 | None — pure implementation of queued tasks | - | - |
 
 #### Active Tasks
 <!-- Mainline tasks only: each task must directly advance the current round objective and carry routing metadata -->
 | Task | Target AC | Status | Tag | Owner | Notes |
 |------|-----------|--------|-----|-------|-------|
-| [mainline] task1: `schema.py` (KnobSchema dataclass + pinned-knob markers + tests) | AC-1 | completed (pending verification) | coding | claude | 21 unit tests pass |
-| [mainline] task4: `placement_enum.py` (legal placement enumeration for 8 GPUs + tests) | AC-4 | completed (pending verification) | coding | claude | 25 unit tests pass |
-| [mainline] task2: `override_wrapper.py` (Hydra-override shim + LOG_DIR capture + tests) | AC-2 | completed (pending verification) | coding | claude | 16 unit tests pass; Hydra precedence verified |
-| [mainline] task3: `preflight.py` (Hydra compose + targeted divisibility + placement legality, no GPU) + tests | AC-3 | completed (pending verification) | coding | claude | 14 unit tests pass; no Ray started |
-| [queued] task5: `runner.py` (trial runner with timeout + scoped cleanup + profiler env exports) | AC-5 | pending | coding | claude | Round 1+ — Milestone B |
-| [queued] task6: `parser.py` (log/timeline parser + objective + best-config + timeline summary) | AC-6 | pending | coding | claude | Round 1+ — Milestone B |
-| [queued] task7: `critic.py` (prompt + rationale schema + dual-source validator + fake_critic) | AC-7 | pending | coding | claude | Round 1+ — Milestone C |
-| [queued] task8: `scheduler.py` (loop + budget + plateau + critic-stagnation) | AC-8 | pending | coding | claude | Round 1+ — Milestone C |
-| [queued] task9: `ledger.py` (append-only JSONL + SHA-256 + critic_rationale persistence) | AC-9 | pending | coding | claude | Round 1+ — Milestone C |
-| [queued] task10: `__main__.py` (CLI + shim launcher) | AC-10 | pending | coding | claude | Round 1+ — Milestone D |
-| [queued] task11: end-to-end smoke test + bundled import-boundary AST walker | AC-11 | pending | coding | claude | Round 1+ — Milestone D |
+| [mainline] task1: `schema.py` (KnobSchema dataclass + pinned-knob markers + tests) | AC-1 | completed (pending verification) | coding | claude | Round 0, 21 unit tests |
+| [mainline] task4: `placement_enum.py` (legal placement enumeration for 8 GPUs + tests) | AC-4 | completed (pending verification) | coding | claude | Round 0, 25 unit tests |
+| [mainline] task2: `override_wrapper.py` (Hydra-override shim + LOG_DIR capture + tests) | AC-2 | completed (pending verification) | coding | claude | Round 0, 16 unit tests |
+| [mainline] task3: `preflight.py` (Hydra compose + targeted divisibility + placement legality, no GPU) + tests | AC-3 | completed (pending verification) | coding | claude | Round 0, 14 unit tests |
+| [mainline] task5: `runner.py` (trial runner: timeout, SIGTERM→SIGKILL, ray-stop hook, scoped pgrep cleanup, profiler env exports) + tests | AC-5 | completed (pending verification) | coding | claude | Round 1, 15 unit tests; hermetic (no real RLinf launch) |
+| [mainline] task6: `parser.py` (metrics.log + timeline JSONL parser, (Status, FailureMode), objective + best-config, timeline summary) + tests | AC-6 | completed (pending verification) | coding | claude | Round 1, 24 unit tests; validated against live `logs/20260629-07:25:33-*` |
+| [queued] task7: `critic.py` (prompt + rationale schema + dual-source validator + fake_critic) | AC-7 | pending | coding | claude | Round 2+ — Milestone C |
+| [queued] task8: `scheduler.py` (loop + budget + plateau + critic-stagnation) | AC-8 | pending | coding | claude | Round 2+ — Milestone C |
+| [queued] task9: `ledger.py` (append-only JSONL + SHA-256 + critic_rationale persistence) | AC-9 | pending | coding | claude | Round 2+ — Milestone C |
+| [queued] task10: `__main__.py` (CLI + shim launcher) | AC-10 | pending | coding | claude | Round 2+ — Milestone D |
+| [queued] task11: end-to-end smoke test + bundled import-boundary AST walker | AC-11 | pending | coding | claude | Round 2+ — Milestone D |
 
 ### Blocking Side Issues
 <!-- Only issues that directly block current mainline progress belong here -->
@@ -77,9 +78,11 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 <!-- Non-blocking issues stay queued and must NOT replace the round objective -->
 | Issue | Discovered Round | Why Not Blocking | Revisit Trigger |
 |-------|-----------------|------------------|-----------------|
-| `validate_embodied_cfg` instantiates `Cluster()` at `rlinf/config.py:922`, which calls `ray.init` (`rlinf/scheduler/cluster/cluster.py:332`) — preflight cannot call it directly. **Resolved in Round 0** by re-implementing the targeted divisibility checks locally (mirrors `rlinf/config.py:962/965/980/1363-1368`); resolved. | 0 | Resolved in Round 0 | Codex review may surface deeper RLinf rules not covered by our local checks |
-| Embodied baselines reference `${oc.env:EMBODIED_PATH}` in `hydra.searchpath`. **Resolved in Round 0** by setting `EMBODIED_PATH`/`REPO_PATH` in `_compose_cfg` before invoking Hydra compose. | 0 | Resolved in Round 0 | None |
-| `RLinf/toolkits/` is excluded from `[tool.setuptools.packages.find]` in `pyproject.toml`, so the new toolkit is not pip-installable. Tests still run via `pytest` from repo root with `PYTHONPATH=RLinf/` set. | 0 | Matches existing convention | Revisit only if pip-install becomes desired |
+| `validate_embodied_cfg` instantiates `Cluster()` (`rlinf/config.py:922`) which calls `ray.init` (`rlinf/scheduler/cluster/cluster.py:332`). **Resolved Round 0** by re-implementing targeted divisibility checks locally in `preflight.py`. | 0 | Resolved | Codex review may surface deeper RLinf rules not covered |
+| Embodied baselines reference `${oc.env:EMBODIED_PATH}` in `hydra.searchpath`. **Resolved Round 0** by setting `EMBODIED_PATH`/`REPO_PATH` in `_compose_cfg` before Hydra compose. | 0 | Resolved | None |
+| `RLinf/toolkits/` is excluded from `[tool.setuptools.packages.find]` — tests still run via `PYTHONPATH=.`. Matches existing convention used by `run_placement_autotune.sh`. | 0 | Matches convention | Revisit only if pip-install becomes desired |
+| Timeline JSONL tag names differ from the MetricTable per-component aggregates (e.g. `env_interact_step` (no slash) in events vs `env/interact` in the MetricTable). **Resolved Round 1** by setting `_HEADLINE_TAGS` in `parser.py` to the verified event-tag set. | 1 | Resolved | None |
+| `nvitop/` is absent from the current logs because `profiler/enable2.sh` leaves the NVITOP/NVML flags commented. **Round 1** runner now exports `RLINF_NVITOP=1`/`RLINF_NVML=1` by default; future trials launched via the tuner will populate `nvitop/`. Parser already reads `nvitop_summary.log` best-effort. | 1 | Future trials populate it; current logs don't have it | When task11 smoke test verifies a real trial dir |
 
 ### Completed and Verified
 <!-- Only move tasks here after Codex verification -->
