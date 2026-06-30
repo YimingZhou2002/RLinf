@@ -113,6 +113,73 @@ def test_parse_critic_output_requires_delta_and_rationale() -> None:
         parse_critic_output(json.dumps({"rationale": {"summary": ""}}))
 
 
+def test_parse_critic_output_rejects_string_citations() -> None:
+    """Codex Round-2 review: a bare string in a citation field would be
+    iterated char-by-char by the validator (escape hatch). Reject it.
+    """
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 64},
+            "rationale": {
+                "summary": "ok",
+                "metric_table_citations": "single string instead of list",
+                "timeline_citations": [],
+            },
+        }
+    )
+    with pytest.raises(CriticError) as exc:
+        parse_critic_output(text)
+    assert "metric_table_citations" in str(exc.value)
+    assert "bare string" in str(exc.value).lower()
+
+
+def test_parse_critic_output_rejects_non_list_citations() -> None:
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 64},
+            "rationale": {
+                "summary": "ok",
+                "metric_table_citations": 7,  # not a list at all
+                "timeline_citations": [],
+            },
+        }
+    )
+    with pytest.raises(CriticError) as exc:
+        parse_critic_output(text)
+    assert "metric_table_citations" in str(exc.value)
+
+
+def test_parse_critic_output_rejects_non_string_citation_elements() -> None:
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 64},
+            "rationale": {
+                "summary": "ok",
+                "metric_table_citations": ["env/interact=275", 12345],
+                "timeline_citations": [],
+            },
+        }
+    )
+    with pytest.raises(CriticError) as exc:
+        parse_critic_output(text)
+    assert "metric_table_citations" in str(exc.value)
+
+
+def test_parse_critic_output_accepts_missing_citation_fields() -> None:
+    """Missing citation fields are fine — the validator catches placement-delta
+    cases that require them; non-placement deltas only need a summary.
+    """
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 32},
+            "rationale": {"summary": "shrink mbs"},
+        }
+    )
+    out = parse_critic_output(text)
+    assert out.rationale.metric_table_citations == ()
+    assert out.rationale.timeline_citations == ()
+
+
 # ---------------------------------------------------------------------------
 # CriticOutputValidator
 # ---------------------------------------------------------------------------

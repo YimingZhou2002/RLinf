@@ -215,7 +215,9 @@ def parse_trial(
             (``CONFIG_INVALID``, ``LAUNCH_FAILURE``). Setting this short-
             circuits classification.
         stderr_path: Optional path to a captured stderr/stdout log used
-            for the OOM and worker-crash rubrics.
+            for the OOM and worker-crash rubrics. When ``None`` the
+            parser falls back to ``log_dir / "run_embodiment.log"`` (the
+            file the runner writes by default with merged stdout+stderr).
 
     Returns:
         A :class:`TrialResult`. Always returns; never raises on missing
@@ -248,6 +250,37 @@ def parse_trial(
     metrics_path = log_dir / "metrics.log"
     timeline_dir = log_dir / "timeline"
 
+    # Default stderr_path to the runner's merged stdout/stderr log so
+    # OOM and worker-crash rubrics fire even when the caller forgets to
+    # pass the path explicitly (per Round-2 Codex review).
+    effective_stderr_path: Path | str | None = stderr_path
+    if effective_stderr_path is None:
+        default_stdout = log_dir / "run_embodiment.log"
+        if default_stdout.is_file():
+            effective_stderr_path = default_stdout
+
+    # On nonzero return code we ALWAYS check the failure rubric first.
+    # Otherwise an OOM-killed trial that never wrote ``metrics.log`` would
+    # be classified as ``METRICS_MISSING`` instead of ``OOM`` — exactly
+    # the misclassification Codex flagged.
+    if returncode is not None and returncode != 0:
+        oom_mode = _classify_failure(effective_stderr_path)
+        if oom_mode is not None:
+            per_step_for_failure: tuple[MetricStep, ...] = ()
+            if metrics_path.is_file():
+                try:
+                    per_step_for_failure = parse_metrics_log(metrics_path)
+                except Exception:  # noqa: BLE001
+                    per_step_for_failure = ()
+            return TrialResult(
+                log_dir=log_dir,
+                status=Status.FAILED,
+                failure_mode=oom_mode,
+                reason=f"detected via {effective_stderr_path}",
+                returncode=returncode,
+                per_step=per_step_for_failure,
+            )
+
     per_step: tuple[MetricStep, ...]
     if not metrics_path.is_file():
         return TrialResult(
@@ -268,20 +301,11 @@ def parse_trial(
             returncode=returncode,
         )
 
-    # OOM / worker-crash rubric: only applies when the subprocess exited
-    # with a non-zero return code AND we have a stderr/stdout log to
-    # inspect. The classifier returns the first matching mode.
-    if returncode is not None and returncode != 0:
-        oom_mode = _classify_failure(stderr_path)
-        if oom_mode is not None:
-            return TrialResult(
-                log_dir=log_dir,
-                status=Status.FAILED,
-                failure_mode=oom_mode,
-                reason=f"detected via {stderr_path}",
-                returncode=returncode,
-                per_step=per_step,
-            )
+    # OOM / worker-crash rubric already ran above (before parsing
+    # metrics.log) to ensure OOM-killed trials are classified as OOM
+    # rather than METRICS_MISSING. By the time we reach this point a
+    # nonzero returncode means the rubric did NOT match, so fall through
+    # to the WORKER_CRASH branch later when we know more about the trial.
 
     # If no MetricTable blocks parsed, treat as METRICS_MISSING.
     if not per_step:

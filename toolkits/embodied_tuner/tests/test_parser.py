@@ -306,6 +306,43 @@ def test_parse_trial_missing_timeline_yields_metrics_partial(tmp_path: Path) -> 
     assert "timeline" in result.reason
 
 
+def test_parse_trial_oom_before_metrics_missing(tmp_path: Path) -> None:
+    """Codex Round-2 review: an OOM-killed trial that never wrote
+    metrics.log must be classified OOM, NOT METRICS_MISSING.
+    """
+    # No metrics.log written. stdout_path explicitly contains OOM text.
+    stdout = tmp_path / "run_embodiment.log"
+    stdout.write_text("torch.cuda.OutOfMemoryError: CUDA out of memory.\n")
+    result = parse_trial(tmp_path, returncode=1, stderr_path=stdout)
+    assert result.status is Status.FAILED
+    assert result.failure_mode is FailureMode.OOM
+    # Metrics weren't writeable but that's not the classification reason.
+    assert "metrics.log" not in result.reason
+
+
+def test_parse_trial_defaults_stderr_path_to_run_embodiment_log(tmp_path: Path) -> None:
+    """When the caller omits stderr_path, the parser falls back to
+    LOG_DIR/run_embodiment.log (the runner's merged stdout+stderr file).
+    """
+    (tmp_path / "run_embodiment.log").write_text(
+        "training started\n"
+        "...\n"
+        "torch.cuda.OutOfMemoryError: CUDA out of memory\n"
+    )
+    _write_metrics_log(tmp_path / "metrics.log", [(1, 3, 360.0, 18)])
+    result = parse_trial(tmp_path, returncode=1)  # NO stderr_path supplied
+    assert result.status is Status.FAILED
+    assert result.failure_mode is FailureMode.OOM
+
+
+def test_parse_trial_worker_crash_via_run_embodiment_log(tmp_path: Path) -> None:
+    (tmp_path / "run_embodiment.log").write_text("RayActorError: actor died unexpectedly\n")
+    _write_metrics_log(tmp_path / "metrics.log", [(1, 3, 360.0, 18)])
+    result = parse_trial(tmp_path, returncode=1)
+    assert result.status is Status.FAILED
+    assert result.failure_mode is FailureMode.WORKER_CRASH
+
+
 # ---------------------------------------------------------------------------
 # select_best
 # ---------------------------------------------------------------------------

@@ -332,22 +332,66 @@ def _default_ray_stop_hook() -> bool:
 
 
 def _default_pgrep_runner(pattern: str) -> list[int]:
-    """Return PIDs matching ``pattern`` via ``pgrep -f``; ``[]`` if absent."""
-    if shutil.which("pgrep") is None:
+    """Return PIDs whose environ OR argv contains ``pattern``.
+
+    The runner exports ``RLINF_TUNER_TRIAL_ID=<id>`` as an environment
+    variable, but ``pgrep -f`` only matches command-line arguments, not
+    environment. Ray workers don't typically expose tuner env vars in
+    their argv, so we scan ``/proc/<pid>/environ`` directly (POSIX
+    Linux). The legacy ``pgrep -f`` path is kept as a fallback so
+    callers that DO inject the pattern into argv still benefit from it.
+    """
+    pids: set[int] = set()
+    pids.update(_pids_with_env_match(pattern))
+    if shutil.which("pgrep") is not None:
+        try:
+            result = subprocess.run(  # noqa: S603, S607
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                timeout=10.0,
+                check=False,
+                text=True,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        else:
+            if result.returncode in (0, 1):
+                for line in result.stdout.split():
+                    if line.strip().isdigit():
+                        pids.add(int(line))
+    return sorted(pids)
+
+
+def _pids_with_env_match(pattern: str) -> list[int]:
+    """Scan ``/proc/<pid>/environ`` for processes whose env contains ``pattern``.
+
+    Returns an empty list on non-Linux hosts or when ``/proc`` is
+    unreadable. Skips processes we cannot read (typically owned by other
+    users) without complaint — orphan cleanup is best-effort.
+    """
+    proc_dir = Path("/proc")
+    if not proc_dir.is_dir():
         return []
+    pattern_bytes = pattern.encode("utf-8") if isinstance(pattern, str) else bytes(pattern)
+    matches: list[int] = []
     try:
-        result = subprocess.run(  # noqa: S603, S607
-            ["pgrep", "-f", pattern],
-            capture_output=True,
-            timeout=10.0,
-            check=False,
-            text=True,
-        )
-    except (subprocess.TimeoutExpired, OSError):
+        entries = list(proc_dir.iterdir())
+    except OSError:
         return []
-    if result.returncode not in (0, 1):  # 0=found, 1=none
-        return []
-    return [int(line) for line in result.stdout.split() if line.strip().isdigit()]
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        environ_path = entry / "environ"
+        try:
+            data = environ_path.read_bytes()
+        except OSError:
+            continue
+        if pattern_bytes in data:
+            try:
+                matches.append(int(entry.name))
+            except ValueError:
+                continue
+    return matches
 
 
 def _default_kill_runner(pids: list[int], sig: int) -> None:

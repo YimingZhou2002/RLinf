@@ -201,6 +201,21 @@ class Scheduler:
                 continue
             consecutive_stop_requests = 0
 
+            # Bail out cleanly if preflight rejected the delta on every
+            # retry. Per Codex review of Round 2, running the runner with
+            # a known-invalid config burns a trial slot for no benefit;
+            # instead we write a synthetic (FAILED, CONFIG_INVALID)
+            # ledger entry and stop the campaign with a dedicated reason.
+            if not preflight_outcome.ok:
+                self._record_preflight_exhausted(
+                    trial_idx=trial_idx,
+                    delta=critic_output.delta,
+                    preflight=preflight_outcome,
+                    rationale=critic_output.rationale,
+                    start=start,
+                )
+                return self._finish("preflight_exhausted", trial_idx, oom_count)
+
             # 2. Launch the trial via the runner (subprocess + cleanup).
             ts_start = _time.time()
             outcome = self.runner_fn(
@@ -251,13 +266,15 @@ class Scheduler:
         """Ask the critic, run preflight, retry on preflight failures.
 
         Per AC-8: preflight failures DO NOT count toward ``max_trials``.
-        The critic gets the rejection reason as feedback (via the next
-        prompt's ``feedback`` block) and re-proposes up to
-        ``preflight_retries`` times. After that, the most recent
-        critic-output is returned even if preflight failed, so callers
-        can decide whether to log the failure.
+        The critic gets the rejection reason as ``preflight_feedback`` on
+        the next prompt and re-proposes up to ``preflight_retries`` times.
+        After that, the most recent ``(critic_output, preflight_outcome)``
+        pair is returned with ``preflight_outcome.ok == False`` so the
+        caller can record a synthetic ``CONFIG_INVALID`` ledger entry and
+        terminate with the dedicated ``preflight_exhausted`` stop reason.
         """
         attempts = 0
+        preflight_feedback: str | None = None
         last_critic_output: CriticOutput | None = None
         last_preflight: PreflightOutcome | None = None
         while attempts <= self.budget.preflight_retries:
@@ -267,6 +284,7 @@ class Scheduler:
                 last_failure_mode=last_failure_mode,
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
+                preflight_feedback=preflight_feedback,
             )
             if critic_output.stop_requested:
                 return critic_output, PreflightOutcome(
@@ -282,7 +300,14 @@ class Scheduler:
             attempts += 1
             last_critic_output = critic_output
             last_preflight = preflight
-        # Exhausted retries: surface the last failure to the caller.
+            preflight_feedback = (
+                "Preflight rejected your previous delta with these errors:\n"
+                + "\n".join(f"  - {e}" for e in preflight.errors)
+            )
+        # Exhausted retries: surface the last failure so the scheduler can
+        # write a synthetic CONFIG_INVALID ledger entry and stop with
+        # ``preflight_exhausted`` (rather than burn a trial slot launching
+        # a known-invalid config — see Round-2 Codex review).
         if last_critic_output is None or last_preflight is None:
             raise CriticError("preflight retry loop produced no output")
         return last_critic_output, last_preflight
@@ -322,6 +347,40 @@ class Scheduler:
             ts_start=start,
             ts_end=_time.time(),
             cleanup_outcome="critic_failure",
+        )
+        self.ledger.append(entry)
+
+    def _record_preflight_exhausted(
+        self,
+        *,
+        trial_idx: int,
+        delta: Mapping[str, Any],
+        preflight: PreflightOutcome,
+        rationale: Rationale,
+        start: float,
+    ) -> None:
+        """Persist a synthetic ``CONFIG_INVALID`` ledger entry.
+
+        Used when the critic could not produce a preflight-passing delta
+        within ``preflight_retries``. The trial slot is NOT consumed
+        (``trial_idx`` is the slot that would have been used, but the
+        scheduler returns immediately afterwards with ``preflight_exhausted``).
+        """
+        entry = make_entry(
+            trial_idx=trial_idx,
+            delta=delta,
+            resolved_config_sha=preflight.resolved_config_sha,
+            log_dir=str(preflight.log_dir) if preflight.log_dir != Path("") else "",
+            returncode=None,
+            status=Status.FAILED.value,
+            failure_mode=FailureMode.CONFIG_INVALID.value,
+            objective=None,
+            step_time=None,
+            num_trajectories=None,
+            critic_rationale=rationale.to_dict(),
+            ts_start=start,
+            ts_end=_time.time(),
+            cleanup_outcome="preflight_exhausted: " + "; ".join(preflight.errors)[:200],
         )
         self.ledger.append(entry)
 

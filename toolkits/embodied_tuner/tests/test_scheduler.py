@@ -322,24 +322,54 @@ def test_preflight_failure_burns_critic_retry_not_trial_slot(tmp_path: Path) -> 
     assert len(factory.runner_calls) == 2
 
 
-def test_preflight_exhausted_retries_runs_failed_proposal_anyway(tmp_path: Path) -> None:
-    # All preflight calls reject. After preflight_retries, the scheduler
-    # currently surfaces the failure by still running the runner with the
-    # last critic_output (the runner stub doesn't care, so it returns a
-    # default outcome and we get a trial entry). This keeps the loop
-    # making forward progress.
+def test_preflight_exhausted_stops_loop_without_running_trial(tmp_path: Path) -> None:
+    """After preflight_retries exhausted, the scheduler stops with a
+    dedicated reason and DOES NOT launch the runner with a known-bad delta.
+
+    This is the Round-3 behaviour change driven by Codex review of Round 2.
+    """
     factory = _SchedulerFactory(
         tmp_path=tmp_path,
-        objectives=[100.0],
+        objectives=[],  # runner_fn must not be called at all
         preflight_results=[False, False, False, False],
     )
     critic = FakeCritic.from_deltas({}, {}, {}, {})
     scheduler = factory.build(
-        critic, BudgetConfig(max_trials=1, budget_seconds=999, max_oom=99, preflight_retries=3)
+        critic, BudgetConfig(max_trials=5, budget_seconds=999, max_oom=99, preflight_retries=3)
     )
     result = scheduler.run()
-    assert result.stop_reason == "max_trials_reached"
-    assert result.trial_count == 1
+    assert result.stop_reason == "preflight_exhausted"
+    assert result.trial_count == 0
+    assert factory.runner_calls == [], (
+        f"runner_fn must not be called after preflight exhaustion, but was: {factory.runner_calls}"
+    )
+    # The synthetic CONFIG_INVALID ledger entry is still recorded so the
+    # campaign report explains why the loop stopped.
+    loaded = Ledger(result.ledger_path, fsync_on_append=False).load()
+    assert len(loaded.entries) == 1
+    assert loaded.entries[0].status == "FAILED"
+    assert loaded.entries[0].failure_mode == "CONFIG_INVALID"
+
+
+def test_preflight_feedback_reaches_next_critic_call(tmp_path: Path) -> None:
+    """Codex Round-2 review: the critic must receive preflight rejection
+    reasons as feedback on the next prompt.
+    """
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[100.0],
+        preflight_results=[False, True],
+    )
+    critic = FakeCritic.from_deltas({}, {})
+    scheduler = factory.build(
+        critic, BudgetConfig(max_trials=1, budget_seconds=999, max_oom=99, preflight_retries=3)
+    )
+    scheduler.run()
+    # First propose: no preflight_feedback. Second propose: has it.
+    assert critic.calls[0][2] is None
+    assert critic.calls[1][2] is not None
+    assert "Preflight rejected" in critic.calls[1][2]
+    assert "stub rejection" in critic.calls[1][2]
 
 
 # ---------------------------------------------------------------------------

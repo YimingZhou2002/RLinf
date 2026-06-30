@@ -44,7 +44,7 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 ## MUTABLE SECTION
 <!-- Update each round with justification for changes -->
 
-### Plan Version: 1 (Updated: Round 2)
+### Plan Version: 1 (Updated: Round 3)
 
 #### Plan Evolution Log
 <!-- Document any changes to the plan with justification -->
@@ -53,6 +53,7 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 | 0 | Initial plan | gen-plan + refine-plan output | - |
 | 1 | None — pure implementation of queued tasks | - | - |
 | 2 | None — pure implementation of queued tasks | - | - |
+| 3 | Scheduler: added `preflight_exhausted` stop reason + synthetic CONFIG_INVALID ledger; preflight feedback now reaches the next critic prompt; OOM/crash classification scans `run_embodiment.log` by default and runs before METRICS_MISSING; citation arrays must be `list[str]`; orphan scan reads `/proc/<pid>/environ` not just `pgrep -f`. | Codex Round-2 review (READY_FOR_ROUND_3: yes-with-caveats). | Strengthens AC-7 (citation type validation), AC-6 (OOM rubric), AC-5 (orphan scan), AC-8 (preflight exhaustion). No new ACs. |
 
 #### Active Tasks
 <!-- Mainline tasks only: each task must directly advance the current round objective and carry routing metadata -->
@@ -62,13 +63,13 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 | [mainline] task4: `placement_enum.py` (legal placement enumeration for 8 GPUs + tests) | AC-4 | completed (pending verification) | coding | claude | Round 0, 25 unit tests |
 | [mainline] task2: `override_wrapper.py` (Hydra-override shim + LOG_DIR capture + tests) | AC-2 | completed (pending verification) | coding | claude | Round 0, 16 unit tests |
 | [mainline] task3: `preflight.py` (Hydra compose + targeted divisibility + placement legality, no GPU) + tests | AC-3 | completed (pending verification) | coding | claude | Round 0, 14 unit tests |
-| [mainline] task5: `runner.py` (trial runner: timeout, SIGTERM→SIGKILL, ray-stop hook, scoped pgrep cleanup, profiler env exports) + tests | AC-5 | completed (pending verification) | coding | claude | Round 1, 15 unit tests; hermetic (no real RLinf launch) |
-| [mainline] task6: `parser.py` (metrics.log + timeline JSONL parser, (Status, FailureMode), objective + best-config, timeline summary) + tests | AC-6 | completed (pending verification) | coding | claude | Round 1, 24 unit tests; validated against live `logs/20260629-07:25:33-*` |
-| [mainline] task9: `ledger.py` (append-only JSONL + SHA-256 + critic_rationale persistence) + tests | AC-9 | completed (pending verification) | coding | claude | Round 2, 13 unit tests; crash recovery + corruption tolerance verified |
-| [mainline] task7: `critic.py` + `fake_critic.py` (prompt + rationale schema + dual-source validator + Codex transport + retries) + tests | AC-7 | completed (pending verification) | coding | claude | Round 2, 26 unit tests; dual-source rule enforced |
-| [mainline] task8: `scheduler.py` (loop + budget + plateau + critic-stagnation + preflight-retries) + tests | AC-8 | completed (pending verification) | coding | claude | Round 2, 13 unit tests; all stopping rules verified |
-| [queued] task10: `__main__.py` (CLI + shim launcher) | AC-10 | pending | coding | claude | Round 3 — Milestone D |
-| [queued] task11: end-to-end smoke test + bundled import-boundary AST walker | AC-11 | pending | coding | claude | Round 3 — Milestone D |
+| [mainline] task5: `runner.py` (trial runner: timeout, SIGTERM→SIGKILL, ray-stop hook, scoped orphan cleanup via `/proc/<pid>/environ` + `pgrep -f`, profiler env exports) + tests | AC-5 | completed (pending verification) | coding | claude | Round 1, 15 unit tests; Round 3 strengthened orphan cleanup to scan `/proc/<pid>/environ` (env vars don't appear in `pgrep -f`) |
+| [mainline] task6: `parser.py` (metrics.log + timeline JSONL parser, (Status, FailureMode), objective + best-config, timeline summary, OOM-before-METRICS_MISSING precedence) + tests | AC-6 | completed (pending verification) | coding | claude | Round 1, 24 unit tests; Round 3 hardened OOM/crash classification to scan `run_embodiment.log` by default and run BEFORE METRICS_MISSING when returncode != 0 |
+| [mainline] task9: `ledger.py` (append-only JSONL + SHA-256 + critic_rationale persistence) + tests | AC-9 | completed (pending verification) | coding | claude | Round 2, 13 unit tests |
+| [mainline] task7: `critic.py` + `fake_critic.py` (prompt + rationale schema + dual-source validator + Codex transport + retries + preflight feedback) + tests | AC-7 | completed (pending verification) | coding | claude | Round 2, 26 unit tests + Round 3 added 4 citation-type-validation tests; preflight feedback now threaded into prompt |
+| [mainline] task8: `scheduler.py` (loop + budget + plateau + critic-stagnation + preflight-exhaustion) + tests | AC-8 | completed (pending verification) | coding | claude | Round 2, 13 unit tests + Round 3 added 2 preflight tests (exhaustion stops without launching; feedback reaches critic). Replaced old "run anyway" test |
+| [mainline] task10: `__main__.py` (CLI) + `examples/embodiment/run_embodied_tuner.sh` (shim) + tests | AC-10 | completed (pending verification) | coding | claude | Round 3, 12 unit tests; --dry-run-preflight composes the real baseline cleanly |
+| [mainline] task11: end-to-end smoke test (FakeCritic + mock runner/parser/preflight) + bundled AST-walker import-boundary sub-test | AC-11 | completed (pending verification) | coding | claude | Round 3, 10 unit tests; smoke covers clean run, OOM+parser-crash, no-eligible-trial; AST walker catches planted forbidden imports |
 
 ### Blocking Side Issues
 <!-- Only issues that directly block current mainline progress belong here -->
@@ -84,7 +85,10 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 | `RLinf/toolkits/` is excluded from `[tool.setuptools.packages.find]` — tests still run via `PYTHONPATH=.`. Matches existing convention used by `run_placement_autotune.sh`. | 0 | Matches convention | Revisit only if pip-install becomes desired |
 | Timeline JSONL tag names differ from the MetricTable aggregate keys. **Resolved Round 1** by setting `_HEADLINE_TAGS` in `parser.py` to the verified event-tag set. | 1 | Resolved | None |
 | `nvitop/` directory absent in current logs because `profiler/enable2.sh` leaves NVITOP/NVML flags commented. **Round 1** runner exports them by default. | 1 | Future trials populate it | When task11 smoke test verifies a real trial dir |
-| Preflight-retry exhaustion currently still calls the runner with the last-known-bad delta (rather than skipping the trial entirely). The runner's outcome plus parser will then likely classify as `(FAILED, *)`, which is recorded in the ledger. This behaviour keeps forward progress (the alternative would be the loop spinning on critic suggestions forever) but Codex may prefer a stricter "skip + mark CONFIG_INVALID" path. | 2 | Behaviour matches the AC-8 contract ("preflight failure does NOT count toward max_trials"); after retries are exhausted the trial DOES count. | Codex review may request the stricter path |
+| Preflight-retry exhaustion: previously ran the runner anyway. **Resolved Round 3** by adding `preflight_exhausted` stop reason + synthetic CONFIG_INVALID ledger entry; no runner call. | 2 | Resolved Round 3 | None |
+| Codex review of Rounds 0-2 (Round 3): non-placement memory-sensitive deltas (`enable_offload`, `total_num_envs`, `micro_batch_size`) could optionally require softer evidence. Codex marked SUGGESTION; left as future enhancement. | 3 | Suggestion; current dual-source rule covers placement only as the plan specifies | Revisit if operators want stricter evidence rule |
+| Codex review (Round 3): preflight could mirror more `validate_cfg` checks (group_size divisibility, eval-side divisibility, runner.task_type, supported model_type, actor_critic value-head). Left as future enhancement; current 4 targeted checks match what the plan explicitly tests. | 3 | Current checks match plan; broader coverage is a polish item | Revisit if a real trial leaks past preflight |
+| Codex review (Round 3): `ray stop --force` runs after every trial regardless of cleanup state. Suggested making it failure-only or opt-in. Left as default-on for safety. | 3 | Default-on is safer for shared hosts; opt-in flag can be added cheaply later | Revisit if shared-host operators complain |
 
 ### Completed and Verified
 <!-- Only move tasks here after Codex verification -->

@@ -65,13 +65,6 @@ _KnobValue = Any  # Knobs hold heterogeneous Python types (int, bool, str/dict).
 class KnobDomain:
     """Declared legal domain of a single knob.
 
-    The schema deliberately keeps domain semantics simple: integers carry
-    explicit ``min_value`` / ``max_value``; booleans rely on ``kind="bool"``;
-    placement strings/dicts are checked structurally by an external
-    placement-legality module (see ``placement_enum``). The schema does
-    not attempt to enforce cross-knob divisibility — that is preflight's
-    job (``preflight.compose_and_validate`` calls ``rlinf.config.validate_cfg``).
-
     Attributes:
         knob: Hydra dotted path identifying the knob.
         kind: One of ``"int"``, ``"bool"``, ``"placement"``.
@@ -79,6 +72,16 @@ class KnobDomain:
         min_value: Inclusive lower bound for ``kind="int"`` knobs.
         max_value: Inclusive upper bound for ``kind="int"`` knobs.
         notes: Free-form note used in error messages.
+
+    The schema deliberately keeps domain semantics simple: integers carry
+    explicit ``min_value`` / ``max_value``; booleans rely on ``kind="bool"``;
+    placement strings/dicts are checked structurally by an external
+    placement-legality module (see ``placement_enum``). The schema does
+    not attempt to enforce cross-knob divisibility — that is preflight's
+    job (``preflight.compose_and_validate`` re-implements the targeted
+    divisibility checks locally because ``rlinf.config.validate_cfg``
+    would otherwise instantiate ``Cluster()``/``ray.init`` and break the
+    "no GPU work" guarantee).
     """
 
     knob: str

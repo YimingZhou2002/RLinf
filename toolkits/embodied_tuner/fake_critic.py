@@ -43,12 +43,12 @@ class FakeCritic:
         outputs: Pre-programmed responses. ``propose`` returns the next
             one each time. Raise :class:`CriticError` when the list is
             exhausted (helps tests catch off-by-one scheduling bugs).
-        calls: Captured ``(history_length, current_knobs)`` tuples for
-            assertion in tests.
+        calls: Captured ``(history_length, current_knobs, preflight_feedback)``
+            tuples for assertion in tests.
     """
 
     outputs: list[CriticOutput]
-    calls: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
+    calls: list[tuple[int, dict[str, Any], str | None]] = field(default_factory=list)
 
     def propose(
         self,
@@ -59,9 +59,10 @@ class FakeCritic:
         last_failure_mode: str | None = None,
         last_metric_summary: Mapping[str, float] | None = None,
         last_timeline_summary: Mapping[str, Any] | None = None,
+        preflight_feedback: str | None = None,
     ) -> CriticOutput:
         del schema, last_failure_mode, last_metric_summary, last_timeline_summary
-        self.calls.append((len(history), dict(current_knobs)))
+        self.calls.append((len(history), dict(current_knobs), preflight_feedback))
         if not self.outputs:
             raise CriticError("FakeCritic.outputs exhausted")
         return self.outputs.pop(0)

@@ -184,6 +184,7 @@ def build_prompt(
     last_metric_summary: Mapping[str, float] | None,
     last_timeline_summary: Mapping[str, Any] | None,
     feedback: str | None = None,
+    preflight_feedback: str | None = None,
 ) -> CriticPrompt:
     """Assemble a :class:`CriticPrompt` from current scheduler state.
 
@@ -196,9 +197,22 @@ def build_prompt(
             successful trial (``env/interact``, ``actor/run_training``, etc.).
         last_timeline_summary: ``TimelineSummary``-shaped dict (per-rank
             stats + stall fractions) from the last successful trial.
-        feedback: Optional retry feedback (e.g. "previous response was
-            malformed JSON" or "placement delta missing timeline_citations").
+        feedback: Optional retry feedback for invalid critic OUTPUT
+            (malformed JSON or validator failure).
+        preflight_feedback: Optional retry feedback for valid critic
+            output that was REJECTED by preflight (e.g. divisibility
+            violation, placement legality). Surfaced as its own prompt
+            section so the critic can correct the proposed delta on its
+            next attempt.
     """
+    combined_feedback = ""
+    if feedback:
+        combined_feedback += f"## Feedback on previous response\n{feedback}\n"
+    if preflight_feedback:
+        combined_feedback += (
+            f"## Preflight rejected the previous delta\n{preflight_feedback}\n"
+            "Propose a different delta that does NOT violate the same constraints.\n"
+        )
     return CriticPrompt(
         history_block=_render_history(history),
         current_knobs_block=_render_current_knobs(current_knobs, schema),
@@ -207,7 +221,7 @@ def build_prompt(
         timeline_summary_block=_render_timeline_summary(
             last_metric_summary, last_timeline_summary
         ),
-        feedback_block=f"## Feedback on previous response\n{feedback}\n" if feedback else "",
+        feedback_block=combined_feedback,
     )
 
 
@@ -319,7 +333,11 @@ def parse_critic_output(text: str) -> CriticOutput:
 
     Raises:
         CriticError: when no JSON can be located OR the JSON does not
-            carry the required ``delta`` and ``rationale`` keys.
+            carry the required ``delta`` and ``rationale`` keys, OR when
+            the rationale's citation arrays are not lists of strings
+            (a single string would otherwise be iterated character-by-
+            character by the dual-source validator — exactly the escape
+            hatch the AC-7 spec forbids).
     """
     candidate = _extract_json_candidate(text)
     try:
@@ -334,13 +352,16 @@ def parse_critic_output(text: str) -> CriticOutput:
         raise CriticError("critic output missing required 'delta' object")
     if not isinstance(rationale_raw, Mapping):
         raise CriticError("critic output missing required 'rationale' object")
+
     rationale = Rationale(
         summary=str(rationale_raw.get("summary", "")),
-        metric_table_citations=tuple(
-            str(x) for x in rationale_raw.get("metric_table_citations") or ()
+        metric_table_citations=_coerce_citation_list(
+            rationale_raw.get("metric_table_citations"),
+            field_name="metric_table_citations",
         ),
-        timeline_citations=tuple(
-            str(x) for x in rationale_raw.get("timeline_citations") or ()
+        timeline_citations=_coerce_citation_list(
+            rationale_raw.get("timeline_citations"),
+            field_name="timeline_citations",
         ),
     )
     return CriticOutput(
@@ -348,6 +369,34 @@ def parse_critic_output(text: str) -> CriticOutput:
         rationale=rationale,
         stop_requested=bool(raw.get("stop_requested", False)),
     )
+
+
+def _coerce_citation_list(value: object, *, field_name: str) -> tuple[str, ...]:
+    """Validate that ``value`` is a (possibly missing) list of strings.
+
+    Returns an empty tuple when ``value`` is ``None`` (the dual-source
+    validator catches that for placement deltas). Raises :class:`CriticError`
+    when ``value`` is a bare string, a number, or a list containing
+    non-string elements — these are the silent escape hatches the
+    validator would otherwise miss.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raise CriticError(
+            f"{field_name} must be a JSON array of strings, got a bare string "
+            f"(this would be silently iterated char-by-char by the validator)"
+        )
+    if not isinstance(value, list):
+        raise CriticError(
+            f"{field_name} must be a JSON array of strings, got {type(value).__name__}"
+        )
+    for entry in value:
+        if not isinstance(entry, str):
+            raise CriticError(
+                f"{field_name} entries must be strings, got {type(entry).__name__}"
+            )
+    return tuple(value)
 
 
 def _extract_json_candidate(text: str) -> str:
@@ -429,6 +478,7 @@ class Critic(Protocol):
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        preflight_feedback: str | None = None,
     ) -> CriticOutput:
         ...
 
@@ -461,6 +511,7 @@ class CodexCritic:
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        preflight_feedback: str | None = None,
     ) -> CriticOutput:
         active_schema = schema or self.schema
         validator = CriticOutputValidator(active_schema)
@@ -476,6 +527,7 @@ class CodexCritic:
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
                 feedback=feedback,
+                preflight_feedback=preflight_feedback,
             )
             response = self._invoke_transport(str(prompt))
             try:
