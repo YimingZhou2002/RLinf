@@ -7,6 +7,9 @@ runs RLinf trials, parses `metrics.log` + `timeline/*.jsonl`, and converges on a
 config that minimises `step_time / num_trajectories` subject to memory and
 feasibility constraints.
 
+**See also:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) — internals, per-file
+reference, design decisions, extension points.
+
 ## Quick start
 
 From the RLinf repo root:
