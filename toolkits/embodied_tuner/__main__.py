@@ -182,8 +182,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Path to a JSON file of pre-programmed critic outputs. When set, the "
-            "real CodexCritic is bypassed (used by the smoke test)."
+            "Path to a JSON file used to bypass the real CodexCritic. The "
+            "file must contain a JSON array; each element is an object "
+            '{"delta": {<knob>: <value>, ...}, "stop_requested": <bool, optional>}. '
+            "Rationale fields are ignored (FakeCritic synthesises a minimal "
+            "summary). If ANY element has stop_requested=true, the loader "
+            "uses FakeCritic.stop_after so the final response signals "
+            "campaign termination. Used by the AC-11 smoke test."
         ),
     )
     parser.add_argument(
@@ -277,6 +282,21 @@ def main(argv: list[str] | None = None) -> int:
     return _run_campaign(args)
 
 
+def _campaign_id(ledger_dir: Path) -> str:
+    """Return a campaign-unique id derived from the ledger directory.
+
+    The orphan-cleanup tag (``RLINF_TUNER_TRIAL_ID=<campaign>-<trial>``)
+    MUST be unique across concurrent campaigns on a shared host, otherwise
+    one campaign's cleanup could kill another's Ray workers. We derive
+    the campaign id from the absolute ledger directory path because the
+    CLI guarantees a fresh timestamped ``ledger_dir`` per campaign.
+    """
+    import hashlib
+
+    digest = hashlib.sha1(str(ledger_dir.resolve()).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
 # ---------------------------------------------------------------------------
 # Sub-commands
 # ---------------------------------------------------------------------------
@@ -319,6 +339,8 @@ def _run_campaign(args: CLIArgs) -> int:
         patience=args.patience,
         epsilon=args.epsilon,
     )
+    campaign_id = _campaign_id(args.ledger_dir)
+    _LOGGER.info("embodied_tuner: campaign_id=%s", campaign_id)
 
     preflight_fn = functools.partial(
         _preflight_adapter,
@@ -333,6 +355,7 @@ def _run_campaign(args: CLIArgs) -> int:
         config_name=args.config,
         max_epochs=args.max_epochs,
         ledger_dir=args.ledger_dir,
+        campaign_id=campaign_id,
     )
     parser_fn = functools.partial(_parser_adapter)
 
@@ -373,8 +396,12 @@ def _preflight_adapter(
     result: ValidationResult = compose_and_validate(
         baseline, delta=delta, hydra_overrides=overrides
     )
+    # Use a hash that tolerates unhashable values (dict-valued placement
+    # deltas would otherwise raise ``TypeError: unhashable type: 'dict'``
+    # if we used ``hash(frozenset(delta.items()))``).
+    delta_token = _stable_delta_token(delta)
     stamp = _time.strftime("%Y%m%d-%H:%M:%S")
-    log_dir = ledger_dir / f"trial-{stamp}-{abs(hash(frozenset(delta.items()))) & 0xFFFF:04x}"
+    log_dir = ledger_dir / f"trial-{stamp}-{delta_token}"
     return PreflightOutcome(
         ok=result.ok,
         errors=result.errors,
@@ -382,6 +409,18 @@ def _preflight_adapter(
         log_dir=log_dir,
         delta=delta,
     )
+
+
+def _stable_delta_token(delta: Mapping[str, Any]) -> str:
+    """Return a short, stable token for ``delta`` usable in a log-dir name.
+
+    Tolerates unhashable values (e.g. dict-valued placement deltas) by
+    serialising via ``json.dumps`` with ``sort_keys=True``.
+    """
+    import hashlib
+
+    payload = json.dumps(dict(delta), sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
 
 
 def _runner_adapter(
@@ -394,16 +433,20 @@ def _runner_adapter(
     config_name: str,
     max_epochs: int,
     ledger_dir: Path,
+    campaign_id: str,
 ) -> TrialOutcome:
     overrides = [f"runner.max_epochs={max_epochs}"]
     for key, value in delta.items():
         overrides.append((key, value))
     log_dir = preflight.log_dir if preflight.log_dir != Path("") else ledger_dir / f"trial-{trial_idx}"
+    # Trial id MUST be unique across concurrent campaigns on a shared host,
+    # otherwise the orphan-cleanup pgrep/proc scan in TrialRunner could
+    # match Ray workers from another campaign and kill them.
     spec = wrapper.build_invocation(
         config_name,
         overrides=overrides,
         log_dir=log_dir,
-        trial_id=str(trial_idx),
+        trial_id=f"{campaign_id}-{trial_idx}",
     )
     return runner.launch(spec)
 
@@ -494,7 +537,10 @@ def _emit_best_artefacts(campaign: CampaignResult, args: CLIArgs) -> None:
 
     best = campaign.best_entry
     # Compose the best config via Hydra so the emitted YAML reflects
-    # everything the runner would have seen.
+    # everything the runner would have seen. The YAML is the
+    # Hydra-COMPOSED form (unresolved), so ``${oc.env:...}`` interpolations
+    # stay symbolic and the file is portable across hosts with different
+    # env-var settings.
     result = compose_and_validate(
         args.baseline,
         delta=dict(best.delta),

@@ -35,8 +35,11 @@ import pytest
 from toolkits.embodied_tuner.__main__ import (
     CLIArgs,
     CLIError,
+    _campaign_id,
     _emit_best_artefacts,
     _load_fake_critic,
+    _preflight_adapter,
+    _stable_delta_token,
     main,
     parse_cli_args,
 )
@@ -307,3 +310,60 @@ def test_shim_launcher_help(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "python -m toolkits.embodied_tuner" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Codex Round-3 review fixes
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_adapter_handles_dict_valued_placement_delta(tmp_path: Path) -> None:
+    """Regression: placement deltas are dict-valued; ``hash(frozenset(...))``
+    used to crash with ``TypeError: unhashable type: 'dict'``.
+    """
+    from toolkits.embodied_tuner.schema import KNOB_PLACEMENT
+
+    delta = {KNOB_PLACEMENT: {"actor": "0-7", "env": "0-3", "rollout": "4-7"}}
+    # Should NOT raise — pre-fix this called hash(frozenset(delta.items())).
+    outcome = _preflight_adapter(
+        delta,
+        baseline=BASELINE,
+        max_epochs=3,
+        ledger_dir=tmp_path,
+    )
+    assert outcome.ok is True
+    # The log_dir should still incorporate a delta-derived token so two
+    # different deltas land in different directories.
+    assert "trial-" in str(outcome.log_dir)
+
+
+def test_stable_delta_token_is_deterministic_and_handles_dicts() -> None:
+    """The token must be stable across calls and tolerate unhashable values."""
+    delta = {
+        "cluster.component_placement": {"actor": "0-7", "env": "0-3", "rollout": "4-7"},
+        "actor.micro_batch_size": 64,
+    }
+    a = _stable_delta_token(delta)
+    b = _stable_delta_token(delta)
+    assert a == b
+    assert len(a) == 8
+    # Different delta -> different token.
+    other = _stable_delta_token({"actor.micro_batch_size": 32})
+    assert other != a
+
+
+def test_campaign_id_is_unique_per_ledger_dir(tmp_path: Path) -> None:
+    """Two campaigns with different ledger dirs MUST get different ids
+    so their RLINF_TUNER_TRIAL_ID tags don't collide on a shared host.
+    """
+    a = _campaign_id(tmp_path / "campaign-a")
+    b = _campaign_id(tmp_path / "campaign-b")
+    assert a != b
+    # And re-derivation for the same path is stable.
+    assert _campaign_id(tmp_path / "campaign-a") == a
+
+
+def test_campaign_id_short_and_hex(tmp_path: Path) -> None:
+    cid = _campaign_id(tmp_path / "c")
+    assert len(cid) == 12
+    assert all(c in "0123456789abcdef" for c in cid)
