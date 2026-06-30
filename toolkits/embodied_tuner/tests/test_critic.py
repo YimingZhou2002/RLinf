@@ -1,0 +1,491 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for :mod:`toolkits.embodied_tuner.critic` and ``fake_critic``."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from toolkits.embodied_tuner.critic import (
+    CodexCritic,
+    CriticError,
+    CriticOutput,
+    CriticOutputValidator,
+    Rationale,
+    TrialHistoryEntry,
+    build_prompt,
+    parse_critic_output,
+)
+from toolkits.embodied_tuner.fake_critic import FakeCritic
+from toolkits.embodied_tuner.schema import (
+    KNOB_ACTOR_OFFLOAD,
+    KNOB_GLOBAL_BATCH_SIZE,
+    KNOB_MICRO_BATCH_SIZE,
+    KNOB_PLACEMENT,
+    KnobSchema,
+)
+
+
+# ---------------------------------------------------------------------------
+# parse_critic_output
+# ---------------------------------------------------------------------------
+
+
+def test_parse_critic_output_raw_json() -> None:
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 64},
+            "rationale": {"summary": "shrink mbs", "metric_table_citations": [], "timeline_citations": []},
+        }
+    )
+    out = parse_critic_output(text)
+    assert out.delta == {"actor.micro_batch_size": 64}
+    assert out.rationale.summary == "shrink mbs"
+    assert out.stop_requested is False
+
+
+def test_parse_critic_output_inside_markdown_fence() -> None:
+    text = (
+        "Here is the JSON:\n"
+        "```json\n"
+        '{"delta": {"actor.enable_offload": true}, '
+        '"rationale": {"summary": "offload actor", '
+        '"metric_table_citations": [], "timeline_citations": []}}\n'
+        "```\n"
+        "End of message.\n"
+    )
+    out = parse_critic_output(text)
+    assert out.delta == {"actor.enable_offload": True}
+    assert out.rationale.summary == "offload actor"
+
+
+def test_parse_critic_output_inside_unlabeled_fence() -> None:
+    text = '```\n{"delta": {"x": 1}, "rationale": {"summary": "s"}}\n```'
+    out = parse_critic_output(text)
+    assert out.delta == {"x": 1}
+
+
+def test_parse_critic_output_braces_only() -> None:
+    text = (
+        "Some preamble.\n"
+        '{"delta": {"x": 2}, "rationale": {"summary": "ok"}}\n'
+        "Some postamble."
+    )
+    out = parse_critic_output(text)
+    assert out.delta == {"x": 2}
+
+
+def test_parse_critic_output_propagates_stop_requested() -> None:
+    text = json.dumps(
+        {
+            "delta": {},
+            "rationale": {"summary": "no further improvement"},
+            "stop_requested": True,
+        }
+    )
+    out = parse_critic_output(text)
+    assert out.stop_requested is True
+
+
+def test_parse_critic_output_raises_on_malformed_json() -> None:
+    with pytest.raises(CriticError):
+        parse_critic_output("```json\n{not valid json\n```")
+
+
+def test_parse_critic_output_requires_delta_and_rationale() -> None:
+    with pytest.raises(CriticError):
+        parse_critic_output(json.dumps({"delta": {}}))
+    with pytest.raises(CriticError):
+        parse_critic_output(json.dumps({"rationale": {"summary": ""}}))
+
+
+# ---------------------------------------------------------------------------
+# CriticOutputValidator
+# ---------------------------------------------------------------------------
+
+
+def _placement_delta() -> dict[str, object]:
+    return {KNOB_PLACEMENT: {"actor": "0-7", "env": "0-3", "rollout": "4-7"}}
+
+
+def test_validator_accepts_placement_delta_with_dual_source() -> None:
+    schema = KnobSchema()
+    validator = CriticOutputValidator(schema)
+    output = CriticOutput(
+        delta=_placement_delta(),
+        rationale=Rationale(
+            summary="rebalance",
+            metric_table_citations=("env/interact=275.4",),
+            timeline_citations=("env rank0 env_interact_step median=15s, stall=0.4",),
+        ),
+    )
+    result = validator.validate(output)
+    assert result.ok, result.reason
+
+
+def test_validator_rejects_placement_delta_missing_metric_citation() -> None:
+    validator = CriticOutputValidator(KnobSchema())
+    output = CriticOutput(
+        delta=_placement_delta(),
+        rationale=Rationale(
+            summary="rebalance",
+            metric_table_citations=(),
+            timeline_citations=("env rank0 env_interact_step median=15s",),
+        ),
+    )
+    result = validator.validate(output)
+    assert not result.ok
+    assert "metric_table_citations" in result.reason
+
+
+def test_validator_rejects_placement_delta_missing_timeline_citation() -> None:
+    validator = CriticOutputValidator(KnobSchema())
+    output = CriticOutput(
+        delta=_placement_delta(),
+        rationale=Rationale(
+            summary="rebalance",
+            metric_table_citations=("env/interact=275.4",),
+            timeline_citations=(),
+        ),
+    )
+    result = validator.validate(output)
+    assert not result.ok
+    assert "timeline_citations" in result.reason
+
+
+def test_validator_rejects_empty_citations_for_placement_delta() -> None:
+    validator = CriticOutputValidator(KnobSchema())
+    output = CriticOutput(
+        delta=_placement_delta(),
+        rationale=Rationale(
+            summary="rebalance",
+            metric_table_citations=("   ", ""),  # all empty / whitespace
+            timeline_citations=("env rank0 ...",),
+        ),
+    )
+    result = validator.validate(output)
+    assert not result.ok
+
+
+def test_validator_accepts_non_placement_delta_with_summary_only() -> None:
+    validator = CriticOutputValidator(KnobSchema())
+    output = CriticOutput(
+        delta={KNOB_MICRO_BATCH_SIZE: 32},
+        rationale=Rationale(summary="shrink mbs"),
+    )
+    assert validator.validate(output).ok
+
+
+def test_validator_rejects_non_placement_delta_with_empty_summary() -> None:
+    validator = CriticOutputValidator(KnobSchema())
+    output = CriticOutput(
+        delta={KNOB_MICRO_BATCH_SIZE: 32},
+        rationale=Rationale(summary="   "),
+    )
+    assert not validator.validate(output).ok
+
+
+def test_validator_rejects_pinned_knob_via_schema() -> None:
+    validator = CriticOutputValidator(KnobSchema())
+    output = CriticOutput(
+        delta={KNOB_GLOBAL_BATCH_SIZE: 1024},
+        rationale=Rationale(summary="should be rejected by schema"),
+    )
+    result = validator.validate(output)
+    assert not result.ok
+    assert "schema" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# CodexCritic with injected transport
+# ---------------------------------------------------------------------------
+
+
+def _make_codex_response(delta: dict, summary: str, metric_cits=(), timeline_cits=()) -> str:
+    return json.dumps(
+        {
+            "delta": delta,
+            "rationale": {
+                "summary": summary,
+                "metric_table_citations": list(metric_cits),
+                "timeline_citations": list(timeline_cits),
+            },
+        }
+    )
+
+
+def test_codex_critic_returns_first_valid_output() -> None:
+    schema = KnobSchema()
+    response = _make_codex_response({KNOB_ACTOR_OFFLOAD: True}, "offload actor")
+    critic = CodexCritic(schema=schema, transport=lambda _p: response)
+    output = critic.propose(
+        history=[],
+        current_knobs={},
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert output.delta == {KNOB_ACTOR_OFFLOAD: True}
+
+
+def test_codex_critic_retries_after_malformed_json() -> None:
+    schema = KnobSchema()
+    responses = [
+        "this is not json at all",
+        _make_codex_response({KNOB_MICRO_BATCH_SIZE: 32}, "shrink"),
+    ]
+
+    def transport(_prompt: str) -> str:
+        return responses.pop(0)
+
+    critic = CodexCritic(schema=schema, transport=transport, max_retries=3)
+    output = critic.propose(
+        history=[],
+        current_knobs={KNOB_MICRO_BATCH_SIZE: 64},
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert output.delta == {KNOB_MICRO_BATCH_SIZE: 32}
+
+
+def test_codex_critic_retries_after_dual_source_failure() -> None:
+    schema = KnobSchema()
+    bad = _make_codex_response(
+        _placement_delta(),
+        "rebalance",
+        metric_cits=("env/interact=275.4",),
+        timeline_cits=(),  # missing timeline -> validator rejects
+    )
+    good = _make_codex_response(
+        _placement_delta(),
+        "rebalance",
+        metric_cits=("env/interact=275.4",),
+        timeline_cits=("env rank0 ...",),
+    )
+    responses = [bad, good]
+
+    def transport(prompt: str) -> str:
+        # The second call MUST include feedback about timeline_citations.
+        if not responses:
+            raise AssertionError("transport called more times than expected")
+        if len(responses) == 1:
+            assert "timeline_citations" in prompt or "validation" in prompt
+        return responses.pop(0)
+
+    critic = CodexCritic(schema=schema, transport=transport, max_retries=3)
+    output = critic.propose(
+        history=[],
+        current_knobs={},
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert KNOB_PLACEMENT in output.delta
+
+
+def test_codex_critic_gives_up_after_max_retries() -> None:
+    schema = KnobSchema()
+    # Always returns malformed JSON.
+    critic = CodexCritic(
+        schema=schema,
+        transport=lambda _p: "not json",
+        max_retries=2,
+    )
+    with pytest.raises(CriticError) as exc:
+        critic.propose(
+            history=[],
+            current_knobs={},
+            last_failure_mode=None,
+            last_metric_summary=None,
+            last_timeline_summary=None,
+        )
+    assert "attempts" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Prompt construction (snapshot-style assertions on section presence)
+# ---------------------------------------------------------------------------
+
+
+def test_build_prompt_contains_all_required_sections() -> None:
+    schema = KnobSchema()
+    prompt = build_prompt(
+        history=[],
+        current_knobs={KNOB_MICRO_BATCH_SIZE: 80},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    text = str(prompt)
+    assert "Bottleneck rubric" in text
+    assert "Trial History" in text  # "(none — first round)" branch
+    assert "Current knob values" in text
+    assert "Hard constraints" in text
+    assert "Required output JSON shape" in text
+
+
+def test_build_prompt_history_block_renders_each_trial() -> None:
+    schema = KnobSchema()
+    history = [
+        TrialHistoryEntry(
+            trial_idx=0,
+            delta={KNOB_MICRO_BATCH_SIZE: 80},
+            status="OK",
+            failure_mode="NONE",
+            objective=20.0,
+            step_time=360.0,
+            rationale_summary="baseline",
+        ),
+        TrialHistoryEntry(
+            trial_idx=1,
+            delta={KNOB_MICRO_BATCH_SIZE: 64},
+            status="OK",
+            failure_mode="NONE",
+            objective=18.0,
+            step_time=324.0,
+            rationale_summary="shrink",
+        ),
+    ]
+    prompt = build_prompt(
+        history=history,
+        current_knobs={KNOB_MICRO_BATCH_SIZE: 64},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    text = str(prompt)
+    assert "trial 0" in text and "trial 1" in text
+    assert "baseline" in text and "shrink" in text
+
+
+def test_build_prompt_memory_pressure_only_when_last_failure_was_oom() -> None:
+    schema = KnobSchema()
+    prompt_oom = build_prompt(
+        history=[],
+        current_knobs={},
+        schema=schema,
+        last_failure_mode="OOM",
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    prompt_ok = build_prompt(
+        history=[],
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert "Memory pressure" in str(prompt_oom)
+    assert "Memory pressure" not in str(prompt_ok)
+
+
+def test_build_prompt_timeline_summary_rendered_when_supplied() -> None:
+    schema = KnobSchema()
+    timeline = {
+        "stall_fraction_by_component": {"env": 0.4, "rollout": 0.1, "actor": 0.05},
+        "per_tag": [
+            {"component": "env", "rank": 0, "tag": "env_interact_step", "call_count": 12, "duration_median": 0.5},
+        ],
+    }
+    metric_summary = {"env/interact": 275.4, "actor/run_training": 21.3}
+    text = str(
+        build_prompt(
+            history=[],
+            current_knobs={},
+            schema=schema,
+            last_failure_mode=None,
+            last_metric_summary=metric_summary,
+            last_timeline_summary=timeline,
+        )
+    )
+    assert "env/interact=275.4" in text
+    assert "env_interact_step" in text
+    assert "env: 0.400" in text
+
+
+def test_build_prompt_feedback_block_appears_after_other_sections() -> None:
+    schema = KnobSchema()
+    text = str(
+        build_prompt(
+            history=[],
+            current_knobs={},
+            schema=schema,
+            last_failure_mode=None,
+            last_metric_summary=None,
+            last_timeline_summary=None,
+            feedback="please re-emit valid JSON",
+        )
+    )
+    assert "Feedback on previous response" in text
+    assert text.rfind("Feedback") > text.rfind("Required output JSON shape")
+
+
+# ---------------------------------------------------------------------------
+# FakeCritic
+# ---------------------------------------------------------------------------
+
+
+def test_fake_critic_replays_outputs_in_order() -> None:
+    critic = FakeCritic.from_deltas(
+        {KNOB_MICRO_BATCH_SIZE: 64},
+        {KNOB_MICRO_BATCH_SIZE: 32},
+    )
+    schema = KnobSchema()
+    out1 = critic.propose(
+        history=[],
+        current_knobs={KNOB_MICRO_BATCH_SIZE: 80},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    out2 = critic.propose(
+        history=[],
+        current_knobs={KNOB_MICRO_BATCH_SIZE: 64},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert out1.delta == {KNOB_MICRO_BATCH_SIZE: 64}
+    assert out2.delta == {KNOB_MICRO_BATCH_SIZE: 32}
+    assert len(critic.calls) == 2
+    assert critic.calls[1][1] == {KNOB_MICRO_BATCH_SIZE: 64}
+
+
+def test_fake_critic_raises_when_exhausted() -> None:
+    critic = FakeCritic.from_deltas({KNOB_MICRO_BATCH_SIZE: 32})
+    schema = KnobSchema()
+    critic.propose(history=[], current_knobs={}, schema=schema, last_failure_mode=None, last_metric_summary=None, last_timeline_summary=None)
+    with pytest.raises(CriticError):
+        critic.propose(history=[], current_knobs={}, schema=schema, last_failure_mode=None, last_metric_summary=None, last_timeline_summary=None)
+
+
+def test_fake_critic_stop_after_marks_final_output() -> None:
+    critic = FakeCritic.stop_after(
+        {KNOB_MICRO_BATCH_SIZE: 64},
+        {KNOB_MICRO_BATCH_SIZE: 32},
+    )
+    schema = KnobSchema()
+    o1 = critic.propose(history=[], current_knobs={}, schema=schema, last_failure_mode=None, last_metric_summary=None, last_timeline_summary=None)
+    o2 = critic.propose(history=[], current_knobs={}, schema=schema, last_failure_mode=None, last_metric_summary=None, last_timeline_summary=None)
+    assert o1.stop_requested is False
+    assert o2.stop_requested is True

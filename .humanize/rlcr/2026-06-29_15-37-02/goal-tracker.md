@@ -44,7 +44,7 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 ## MUTABLE SECTION
 <!-- Update each round with justification for changes -->
 
-### Plan Version: 1 (Updated: Round 1)
+### Plan Version: 1 (Updated: Round 2)
 
 #### Plan Evolution Log
 <!-- Document any changes to the plan with justification -->
@@ -52,6 +52,7 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 |-------|--------|--------|--------------|
 | 0 | Initial plan | gen-plan + refine-plan output | - |
 | 1 | None — pure implementation of queued tasks | - | - |
+| 2 | None — pure implementation of queued tasks | - | - |
 
 #### Active Tasks
 <!-- Mainline tasks only: each task must directly advance the current round objective and carry routing metadata -->
@@ -63,11 +64,11 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 | [mainline] task3: `preflight.py` (Hydra compose + targeted divisibility + placement legality, no GPU) + tests | AC-3 | completed (pending verification) | coding | claude | Round 0, 14 unit tests |
 | [mainline] task5: `runner.py` (trial runner: timeout, SIGTERM→SIGKILL, ray-stop hook, scoped pgrep cleanup, profiler env exports) + tests | AC-5 | completed (pending verification) | coding | claude | Round 1, 15 unit tests; hermetic (no real RLinf launch) |
 | [mainline] task6: `parser.py` (metrics.log + timeline JSONL parser, (Status, FailureMode), objective + best-config, timeline summary) + tests | AC-6 | completed (pending verification) | coding | claude | Round 1, 24 unit tests; validated against live `logs/20260629-07:25:33-*` |
-| [queued] task7: `critic.py` (prompt + rationale schema + dual-source validator + fake_critic) | AC-7 | pending | coding | claude | Round 2+ — Milestone C |
-| [queued] task8: `scheduler.py` (loop + budget + plateau + critic-stagnation) | AC-8 | pending | coding | claude | Round 2+ — Milestone C |
-| [queued] task9: `ledger.py` (append-only JSONL + SHA-256 + critic_rationale persistence) | AC-9 | pending | coding | claude | Round 2+ — Milestone C |
-| [queued] task10: `__main__.py` (CLI + shim launcher) | AC-10 | pending | coding | claude | Round 2+ — Milestone D |
-| [queued] task11: end-to-end smoke test + bundled import-boundary AST walker | AC-11 | pending | coding | claude | Round 2+ — Milestone D |
+| [mainline] task9: `ledger.py` (append-only JSONL + SHA-256 + critic_rationale persistence) + tests | AC-9 | completed (pending verification) | coding | claude | Round 2, 13 unit tests; crash recovery + corruption tolerance verified |
+| [mainline] task7: `critic.py` + `fake_critic.py` (prompt + rationale schema + dual-source validator + Codex transport + retries) + tests | AC-7 | completed (pending verification) | coding | claude | Round 2, 26 unit tests; dual-source rule enforced |
+| [mainline] task8: `scheduler.py` (loop + budget + plateau + critic-stagnation + preflight-retries) + tests | AC-8 | completed (pending verification) | coding | claude | Round 2, 13 unit tests; all stopping rules verified |
+| [queued] task10: `__main__.py` (CLI + shim launcher) | AC-10 | pending | coding | claude | Round 3 — Milestone D |
+| [queued] task11: end-to-end smoke test + bundled import-boundary AST walker | AC-11 | pending | coding | claude | Round 3 — Milestone D |
 
 ### Blocking Side Issues
 <!-- Only issues that directly block current mainline progress belong here -->
@@ -78,11 +79,12 @@ Every placement-optimization decision made by the LLM critic during the tuning l
 <!-- Non-blocking issues stay queued and must NOT replace the round objective -->
 | Issue | Discovered Round | Why Not Blocking | Revisit Trigger |
 |-------|-----------------|------------------|-----------------|
-| `validate_embodied_cfg` instantiates `Cluster()` (`rlinf/config.py:922`) which calls `ray.init` (`rlinf/scheduler/cluster/cluster.py:332`). **Resolved Round 0** by re-implementing targeted divisibility checks locally in `preflight.py`. | 0 | Resolved | Codex review may surface deeper RLinf rules not covered |
+| `validate_embodied_cfg` instantiates `Cluster()` (`rlinf/config.py:922`) which calls `ray.init`. **Resolved Round 0** by re-implementing targeted divisibility checks locally in `preflight.py`. | 0 | Resolved | Codex review may surface deeper RLinf rules not covered |
 | Embodied baselines reference `${oc.env:EMBODIED_PATH}` in `hydra.searchpath`. **Resolved Round 0** by setting `EMBODIED_PATH`/`REPO_PATH` in `_compose_cfg` before Hydra compose. | 0 | Resolved | None |
 | `RLinf/toolkits/` is excluded from `[tool.setuptools.packages.find]` — tests still run via `PYTHONPATH=.`. Matches existing convention used by `run_placement_autotune.sh`. | 0 | Matches convention | Revisit only if pip-install becomes desired |
-| Timeline JSONL tag names differ from the MetricTable per-component aggregates (e.g. `env_interact_step` (no slash) in events vs `env/interact` in the MetricTable). **Resolved Round 1** by setting `_HEADLINE_TAGS` in `parser.py` to the verified event-tag set. | 1 | Resolved | None |
-| `nvitop/` is absent from the current logs because `profiler/enable2.sh` leaves the NVITOP/NVML flags commented. **Round 1** runner now exports `RLINF_NVITOP=1`/`RLINF_NVML=1` by default; future trials launched via the tuner will populate `nvitop/`. Parser already reads `nvitop_summary.log` best-effort. | 1 | Future trials populate it; current logs don't have it | When task11 smoke test verifies a real trial dir |
+| Timeline JSONL tag names differ from the MetricTable aggregate keys. **Resolved Round 1** by setting `_HEADLINE_TAGS` in `parser.py` to the verified event-tag set. | 1 | Resolved | None |
+| `nvitop/` directory absent in current logs because `profiler/enable2.sh` leaves NVITOP/NVML flags commented. **Round 1** runner exports them by default. | 1 | Future trials populate it | When task11 smoke test verifies a real trial dir |
+| Preflight-retry exhaustion currently still calls the runner with the last-known-bad delta (rather than skipping the trial entirely). The runner's outcome plus parser will then likely classify as `(FAILED, *)`, which is recorded in the ledger. This behaviour keeps forward progress (the alternative would be the loop spinning on critic suggestions forever) but Codex may prefer a stricter "skip + mark CONFIG_INVALID" path. | 2 | Behaviour matches the AC-8 contract ("preflight failure does NOT count toward max_trials"); after retries are exhausted the trial DOES count. | Codex review may request the stricter path |
 
 ### Completed and Verified
 <!-- Only move tasks here after Codex verification -->
