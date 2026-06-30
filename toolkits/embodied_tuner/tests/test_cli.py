@@ -367,3 +367,16 @@ def test_campaign_id_short_and_hex(tmp_path: Path) -> None:
     cid = _campaign_id(tmp_path / "c")
     assert len(cid) == 12
     assert all(c in "0123456789abcdef" for c in cid)
+
+
+def test_default_ledger_dir_includes_random_nonce() -> None:
+    """Codex final review: two same-second same-config launches MUST
+    NOT share a default ledger_dir (would collide on campaign id).
+    """
+    a = parse_cli_args(["--config", "maniskill_ppo_openvla"])
+    b = parse_cli_args(["--config", "maniskill_ppo_openvla"])
+    # Even within the same wall-clock second, the random nonce makes
+    # the two ledger_dirs distinct.
+    assert a.ledger_dir != b.ledger_dir
+    # And their derived campaign ids are therefore distinct too.
+    assert _campaign_id(a.ledger_dir) != _campaign_id(b.ledger_dir)

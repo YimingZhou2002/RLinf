@@ -232,8 +232,17 @@ def parse_cli_args(argv: list[str] | None = None) -> CLIArgs:
 
     ledger_dir = ns.ledger_dir
     if ledger_dir is None:
+        # Append a short urandom suffix to the timestamp so two same-user
+        # same-config campaigns launched within the same second still get
+        # distinct ledger directories (and therefore distinct campaign
+        # ids and distinct RLINF_TUNER_TRIAL_ID prefixes). Without the
+        # nonce, the orphan-cleanup tag could match a sibling campaign's
+        # Ray workers and kill them.
+        import os as _os
+
         stamp = _time.strftime("%Y%m%d-%H:%M:%S")
-        ledger_dir = repo_root / "logs" / f"tuner-{stamp}-{ns.config}"
+        nonce = _os.urandom(3).hex()  # 6 hex chars
+        ledger_dir = repo_root / "logs" / f"tuner-{stamp}-{nonce}-{ns.config}"
     ledger_dir = Path(ledger_dir).expanduser()
 
     return CLIArgs(
