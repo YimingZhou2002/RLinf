@@ -122,6 +122,38 @@ already screens for the partial-overlap case; other unclassifiable
 patterns should not be reachable given the contiguity + full-equal-or-
 full-disjoint rules.
 
+### 2.6 Routing divisibility (`CommMapper.get_dst_ranks`)
+
+When env workers send bootstrap / trajectory data to rollout workers,
+the routing layer (`rlinf/scheduler/worker/routing.py:139`) asserts:
+
+- **`(env.train.total_num_envs // env_world_size) % rollout_world_size == 0`**
+
+  i.e. the per-env-rank batch size must be divisible by the rollout
+  world size. This is **not** mirrored by preflight or
+  `validate_embodied_cfg`, so a placement delta that passes all Tier 1
+  checks can still crash here.
+
+  Concrete example that crashed a campaign trial: with
+  `total_num_envs=128`, `env_world_size=2`, `rollout_world_size=6`:
+  per-rank batch = 128/2 = 64, and 64 % 6 ≠ 0 → `AssertionError:
+  batch_size (64) must be divisible by dst_world_size (6)` → Ray kills
+  the rollout and actor groups → trial exits with returncode 255.
+
+  The same assertion also applies in the reverse direction
+  (rollout→actor) with `src_world_size` = rollout world size and
+  `dst_world_size` = actor world size, so the full safe envelope is:
+
+  - `(total_num_envs // env_world_size) % rollout_world_size == 0`
+  - `(total_num_envs // env_world_size) % actor_world_size == 0`
+
+  When rebalancing GPUs between env and rollout, the critic must verify
+  that the new `rollout_world_size` divides `total_num_envs //
+  env_world_size`. For `total_num_envs=128` the legal rollout world
+  sizes are divisors of 128 (1, 2, 4, 8, …); 6 is not legal. If a
+  non-divisor rollout count is desired, `total_num_envs` must be
+  adjusted simultaneously so that the quotient is divisible.
+
 ## Placement dictionary shape
 
 Preflight reads `cluster.component_placement` as an OmegaConf DictConfig
@@ -146,7 +178,11 @@ preflight parser rejects unknown types (`preflight._placement_to_str_map`).
    also verify Tier 2.1 (per-rank-per-stage-per-group divisibility) —
    preflight will accept a violation of the group_size rule that
    crashes at runtime.
-4. If the delta enables env offload, note the overlap_env_bootstrap
+4. If the delta changes the env or rollout GPU range, also verify
+   Tier 2.6 (routing divisibility) — preflight does not check that
+   `(total_num_envs // env_world_size) % rollout_world_size == 0`, so
+   an otherwise-legal placement rebalance can crash the trial.
+5. If the delta enables env offload, note the overlap_env_bootstrap
    side effect (Tier 2.3) in the rationale.
 
 Missing citations to constraints do not cause validation to fail on
