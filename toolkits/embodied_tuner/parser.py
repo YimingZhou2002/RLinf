@@ -52,7 +52,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -140,12 +140,29 @@ class TimelineSummary:
         stall_fraction_by_component: For each component, the fraction of
             the observation window NOT covered by any of its events.
             Captures pipeline / channel waits.
+        critical_path: Per-``global_step`` summary of real-busy vs
+            blocked busy time per ``(component, rank)`` lane. Produced
+            by :func:`timeline_processor.compute_critical_path`. Empty
+            ``{}`` when no events carry a global_step.
+        outliers: Top-K longest events above per-tag P95 with an
+            optional ``knob_hint`` linking the stall to a knob the
+            critic can flip (e.g. ``env.enable_offload``).
+        per_gpu_bubble: GPU-by-GPU bubble breakdown under the trial's
+            ``cluster.component_placement``, plus env-side / rollout-side
+            averages. Empty ``{}`` when placement is not provided.
+        raw_excerpts: Top-K longest raw events copied verbatim from the
+            JSONL stream (runner-wrapper events excluded) so the critic
+            sees full call context (``qualname``, ``call_index``, etc.).
     """
 
     per_tag: tuple[TagStats, ...] = ()
     window_start: float | None = None
     window_end: float | None = None
     stall_fraction_by_component: dict[str, float] = field(default_factory=dict)
+    critical_path: dict[int, dict] = field(default_factory=dict)
+    outliers: tuple[dict, ...] = ()
+    per_gpu_bubble: dict[str, object] = field(default_factory=dict)
+    raw_excerpts: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -199,6 +216,8 @@ def parse_trial(
     timed_out: bool = False,
     failure_mode_override: FailureMode | None = None,
     stderr_path: Path | str | None = None,
+    placement: Mapping[str, object] | None = None,
+    enable_offload: Mapping[str, bool] | None = None,
 ) -> TrialResult:
     """Parse a trial directory and return a :class:`TrialResult`.
 
@@ -218,6 +237,13 @@ def parse_trial(
             for the OOM and worker-crash rubrics. When ``None`` the
             parser falls back to ``log_dir / "run_embodiment.log"`` (the
             file the runner writes by default with merged stdout+stderr).
+        placement: This trial's effective ``cluster.component_placement``
+            ({"actor": "0-7", ...} or {"actor": [0,...,7], ...}). Required
+            for the per-GPU bubble view; omit to fall back to the
+            stall-fraction signal alone.
+        enable_offload: This trial's effective offload knob state
+            ({"env": True, "rollout": False, "actor": True}). Used to
+            attach knob hints to outliers.
 
     Returns:
         A :class:`TrialResult`. Always returns; never raises on missing
@@ -327,7 +353,11 @@ def parse_trial(
     timeline_partial_reason: str | None = None
     if timeline_dir.is_dir():
         try:
-            timeline_summary = parse_timeline(timeline_dir)
+            timeline_summary = parse_timeline(
+                timeline_dir,
+                placement=placement,
+                enable_offload=enable_offload,
+            )
         except Exception as exc:  # noqa: BLE001
             timeline_partial_reason = f"timeline parse error: {exc}"
     else:
@@ -567,8 +597,31 @@ _HEADLINE_TAGS: tuple[str, ...] = (
 )
 
 
-def parse_timeline(timeline_dir: Path) -> TimelineSummary:
-    """Aggregate every ``*.jsonl`` file under ``timeline_dir``."""
+def parse_timeline(
+    timeline_dir: Path,
+    *,
+    placement: Mapping[str, object] | None = None,
+    enable_offload: Mapping[str, bool] | None = None,
+) -> TimelineSummary:
+    """Aggregate every ``*.jsonl`` file under ``timeline_dir``.
+
+    Args:
+        timeline_dir: directory containing ``*.jsonl`` per-component traces.
+        placement: this trial's ``cluster.component_placement``; when
+            provided, the per-GPU bubble view is populated.
+        enable_offload: per-component offload state; when provided,
+            outlier records carry a ``knob_hint`` linking the stall back
+            to ``env/rollout/actor.enable_offload``.
+    """
+    # Defer the import so the processor module's dependencies (e.g.
+    # placement_enum) don't bloat the parser's import surface.
+    from toolkits.embodied_tuner.timeline_processor import (
+        compute_critical_path,
+        compute_outliers,
+        compute_per_gpu_bubble,
+        extract_raw_excerpts,
+    )
+
     events: list[dict] = []
     for path in sorted(timeline_dir.glob("*.jsonl")):
         try:
@@ -591,6 +644,7 @@ def parse_timeline(timeline_dir: Path) -> TimelineSummary:
 
     grouped: dict[tuple[str, int, str], list[float]] = {}
     intervals_by_component: dict[str, list[tuple[float, float]]] = {}
+    enriched: list[dict] = []  # normalised events for the processor calls
     for event in events:
         tag = event.get("tag") or event.get("worker_timer")
         component = event.get("component")
@@ -602,9 +656,20 @@ def parse_timeline(timeline_dir: Path) -> TimelineSummary:
             t1 = float(event["t1"])
         except (KeyError, TypeError, ValueError):
             continue
+        if t1 < t0:
+            t0, t1 = t1, t0
         duration = max(t1 - t0, 0.0)
         grouped.setdefault((component, int(rank), tag), []).append(duration)
         intervals_by_component.setdefault(component, []).append((t0, t1))
+        enriched.append({
+            **event,
+            "tag": tag,
+            "component": component,
+            "rank": int(rank),
+            "t0": t0,
+            "t1": t1,
+            "dur": duration,
+        })
 
     per_tag: list[TagStats] = []
     for (component, rank, tag) in sorted(grouped):
@@ -633,11 +698,20 @@ def parse_timeline(timeline_dir: Path) -> TimelineSummary:
         for comp, intervals in intervals_by_component.items()
     }
 
+    critical_path = compute_critical_path(enriched)
+    outliers = compute_outliers(enriched, enable_offload=enable_offload)
+    per_gpu_bubble = compute_per_gpu_bubble(enriched, placement=placement)
+    raw_excerpts = extract_raw_excerpts(enriched)
+
     return TimelineSummary(
         per_tag=tuple(per_tag),
         window_start=window_start,
         window_end=window_end,
         stall_fraction_by_component=stall_fractions,
+        critical_path=critical_path,
+        outliers=outliers,
+        per_gpu_bubble=per_gpu_bubble,
+        raw_excerpts=raw_excerpts,
     )
 
 

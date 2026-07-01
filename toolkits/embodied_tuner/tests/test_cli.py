@@ -65,11 +65,12 @@ def test_parse_cli_args_defaults() -> None:
     assert args.baseline == BASELINE
     assert args.max_trials == 20
     assert args.budget_seconds == 43_200.0
+    assert args.trial_timeout_seconds == 2700.0
     assert args.max_oom == 5
     assert args.patience == 3
     assert args.epsilon == 0.02
     assert args.max_epochs == 3
-    assert args.collect_memory is True
+    assert args.collect_memory is False
     assert args.use_profiler is True
     assert args.dry_run_preflight is False
     assert args.fake_critic_path is None
@@ -85,6 +86,8 @@ def test_parse_cli_args_overrides() -> None:
             "5",
             "--budget-seconds",
             "60",
+            "--trial-timeout-seconds",
+            "120",
             "--max-oom",
             "1",
             "--patience",
@@ -99,6 +102,7 @@ def test_parse_cli_args_overrides() -> None:
     )
     assert args.max_trials == 5
     assert args.budget_seconds == 60.0
+    assert args.trial_timeout_seconds == 120.0
     assert args.max_oom == 1
     assert args.patience == 1
     assert args.epsilon == 0.1
@@ -182,6 +186,7 @@ def _stub_args(tmp_path: Path) -> CLIArgs:
         baseline=BASELINE,
         max_trials=3,
         budget_seconds=999.0,
+        trial_timeout_seconds=2700.0,
         max_oom=99,
         patience=3,
         epsilon=0.02,

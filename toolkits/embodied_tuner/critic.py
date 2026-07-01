@@ -58,13 +58,24 @@ from toolkits.embodied_tuner.schema import (
 
 _BOTTLENECK_RUBRIC = (
     "## Bottleneck rubric (Alt-2 in the design draft)\n"
-    "- If `actor/run_training` dominates step time: shrink `actor.micro_batch_size` "
-    "or grow actor GPU count.\n"
-    "- If `env/interact` or `env_interact_step` dominates: reduce `env.train.total_num_envs` "
-    "or grow env GPU count.\n"
-    "- If `rollout/generate_one_epoch` or `predict` dominates: grow rollout GPU count or "
-    "lower `rollout.pipeline_stage_num` (note: pipeline_stage_num is pinned in this loop).\n"
-    "- If memory_pressure flag is set, prefer enable_offload flips or shrink env/micro batch.\n"
+    "Read the timeline sections below in this order:\n"
+    "1. `per-GPU bubble`: side with higher bubble has slack; consider "
+    "moving GPUs away from it.\n"
+    "2. `critical path per global_step`: the lane with the largest `real_s` "
+    "is the one whose work limits step time. Lanes with large `blocked_s` "
+    "and small `real_s` are NOT bottlenecks — they are downstream consumers.\n"
+    "3. `outlier events`: any row with a `knob_hint` is a stall the critic "
+    "can directly fix by flipping the named knob.\n"
+    "4. `raw timeline excerpts`: cite specific events to ground a placement "
+    "delta (mandatory dual-source rule).\n"
+    "Knob-side heuristics:\n"
+    "- If `actor_forward` / `actor_backward` dominate REAL busy: shrink "
+    "`actor.micro_batch_size` or grow actor GPU count.\n"
+    "- If `env_interact_step` is the largest real lane: reduce "
+    "`env.train.total_num_envs` or grow env GPU range.\n"
+    "- If `predict` is the largest real lane: grow rollout GPU range.\n"
+    "- If memory_pressure flag is set, prefer enable_offload flips or "
+    "shrink env/micro batch.\n"
 )
 
 
@@ -310,9 +321,108 @@ def _render_timeline_summary(
                     f"count={stat['call_count']} median={stat['duration_median']:.3f}"
                 )
         sections.append("\n".join(lines))
+
+        critical_path = timeline_summary.get("critical_path") or {}
+        outliers = timeline_summary.get("outliers") or ()
+        per_gpu_bubble = timeline_summary.get("per_gpu_bubble") or {}
+        raw_excerpts = timeline_summary.get("raw_excerpts") or ()
+
+        if critical_path:
+            sections.append(_render_critical_path(critical_path))
+        if per_gpu_bubble:
+            sections.append(_render_per_gpu_bubble(per_gpu_bubble))
+        if outliers:
+            sections.append(_render_outliers(outliers))
+        if raw_excerpts:
+            sections.append(_render_raw_excerpts(raw_excerpts))
     if not sections:
         return ""
     return "\n\n".join(sections) + "\n"
+
+
+# Concept-explanation prefix the critic must see exactly once per prompt so
+# it interprets the A'/D' tables correctly. Without it the LLM will read
+# `actor/recv_traj=259s` as "actor is the bottleneck" when in fact actor
+# is idle waiting for rollout to finish producing trajectories.
+_BLOCKING_TAGS_EXPLAINER = (
+    "Note: in the hybrid placement the actor lives on every GPU but only "
+    "does real GPU work during sync_model_to_rollout / compute_adv / "
+    "forward / backward / optimizer_step. `actor/recv_traj` is a "
+    "blocking-wait on rollout+env producing trajectories — its duration "
+    "is the rollout/env cost, not actor work. The tables below split "
+    "'real' (actual GPU work) from 'blocked' (waiting on another "
+    "component)."
+)
+
+
+def _render_critical_path(critical_path: Mapping[Any, Mapping[str, Any]]) -> str:
+    """A' — per-step real-busy lane ranking with blocked context."""
+    lines = ["## Last trial — critical path per global_step", _BLOCKING_TAGS_EXPLAINER]
+    for raw_step in sorted(critical_path, key=lambda k: int(k)):
+        step = critical_path[raw_step]
+        lines.append(f"- step={raw_step}  step_span_s={step.get('step_span_s')}")
+        for lane in step.get("real_busy_top", ()):
+            lines.append(
+                f"    {lane['component']}/r{lane['rank']}: "
+                f"real={lane['real_s']}s  blocked={lane['blocked_s']}s  "
+                f"real_frac={lane['real_frac']}"
+            )
+    return "\n".join(lines)
+
+
+def _render_per_gpu_bubble(per_gpu_bubble: Mapping[str, Any]) -> str:
+    """D' — GPU-by-GPU bubble under the trial's placement."""
+    wall = per_gpu_bubble.get("wall_s")
+    env_avg = per_gpu_bubble.get("env_side_avg_bubble_s")
+    rollout_avg = per_gpu_bubble.get("rollout_side_avg_bubble_s")
+    lines = [
+        "## Last trial — per-GPU bubble under this trial's placement",
+        f"wall_s={wall}  env_side_avg_bubble_s={env_avg}  "
+        f"rollout_side_avg_bubble_s={rollout_avg}",
+        "Bubble = wall - union(real-busy intervals from components on this GPU). "
+        "Lower bubble = more useful work. The side with the larger bubble is "
+        "the one whose GPU budget can be reduced without hurting throughput.",
+    ]
+    per_gpu = per_gpu_bubble.get("per_gpu") or {}
+    for raw_gpu in sorted(per_gpu, key=lambda k: int(k)):
+        info = per_gpu[raw_gpu]
+        residents = "+".join(info.get("residents", []))
+        lines.append(
+            f"  - GPU{raw_gpu} ({residents}): busy_s={info.get('busy_s')} "
+            f"bubble_s={info.get('bubble_s')} bubble_frac={info.get('bubble_frac')}"
+        )
+    return "\n".join(lines)
+
+
+def _render_outliers(outliers: Sequence[Mapping[str, Any]]) -> str:
+    """C' — longest events above per-tag P95 with knob hint."""
+    lines = [
+        "## Last trial — outlier events (per-tag P95, >1s)",
+        "Each row: component / rank / tag / step / duration / knob hint (if any). "
+        "knob_hint links the stall back to a tunable knob the critic can flip.",
+    ]
+    for outlier in outliers:
+        hint = outlier.get("knob_hint")
+        lines.append(
+            f"  - {outlier.get('component')}/r{outlier.get('rank')} "
+            f"{outlier.get('tag')} step={outlier.get('global_step')} "
+            f"dur_s={outlier.get('dur_s')}"
+            + (f"  hint={hint}" if hint else "")
+        )
+    return "\n".join(lines)
+
+
+def _render_raw_excerpts(excerpts: Sequence[Mapping[str, Any]]) -> str:
+    """Top-K longest raw events copied as-is so the critic sees full context."""
+    lines = [
+        "## Last trial — raw timeline excerpts (top-K longest events, runner wrapper excluded)",
+        "These are verbatim JSONL events. Use the qualname / call_index / "
+        "configured_* fields to reason about cases the aggregated tables miss.",
+    ]
+    for excerpt in excerpts:
+        # One compact JSON line per event so the critic can cite it directly.
+        lines.append("  - " + json.dumps(excerpt, sort_keys=True))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

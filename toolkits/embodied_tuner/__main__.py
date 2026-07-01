@@ -92,6 +92,7 @@ class CLIArgs:
     baseline: Path
     max_trials: int
     budget_seconds: float
+    trial_timeout_seconds: float
     max_oom: int
     patience: int
     epsilon: float
@@ -139,6 +140,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=43_200.0,
         help="Wall-clock budget in seconds (default 12h).",
     )
+    parser.add_argument(
+        "--trial-timeout-seconds",
+        type=float,
+        default=2700.0,
+        help=(
+            "Per-trial wall-clock budget in seconds (default 2700 = 45min). "
+            "When a trial exceeds this, the runner escalates SIGTERM → SIGKILL "
+            "and the trial is classified (FAILED, TIMEOUT)."
+        ),
+    )
     parser.add_argument("--max-oom", type=int, default=5, help="Cumulative OOM tolerance (default 5).")
     parser.add_argument("--patience", type=int, default=3, help="Plateau patience window (default 3).")
     parser.add_argument(
@@ -158,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--collect-memory",
         dest="collect_memory",
         action="store_true",
-        default=True,
+        default=False,
         help="Export RLINF_NVITOP/RLINF_NVML (default).",
     )
     memory_group.add_argument(
@@ -250,6 +261,7 @@ def parse_cli_args(argv: list[str] | None = None) -> CLIArgs:
         baseline=baseline,
         max_trials=ns.max_trials,
         budget_seconds=ns.budget_seconds,
+        trial_timeout_seconds=ns.trial_timeout_seconds,
         max_oom=ns.max_oom,
         patience=ns.patience,
         epsilon=ns.epsilon,
@@ -336,6 +348,7 @@ def _run_campaign(args: CLIArgs) -> int:
     repo_root = _detect_repo_root()
     wrapper = OverrideWrapper.for_repo(repo_root)
     runner = TrialRunner(
+        timeout_seconds=args.trial_timeout_seconds,
         disable_profiler=not args.use_profiler,
         disable_memory_telemetry=not args.collect_memory,
     )
@@ -461,12 +474,54 @@ def _runner_adapter(
 
 
 def _parser_adapter(outcome: TrialOutcome) -> TrialResult:
+    placement, enable_offload = _extract_trial_context(outcome.log_dir)
     return parse_trial(
         outcome.log_dir,
         returncode=outcome.returncode,
         timed_out=outcome.timed_out,
         stderr_path=outcome.stdout_path,
+        placement=placement,
+        enable_offload=enable_offload,
     )
+
+
+def _extract_trial_context(
+    log_dir: Path,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, bool] | None]:
+    """Recover this trial's effective placement + offload knobs.
+
+    The embodied training entrypoint writes the resolved Hydra config
+    to ``<log_dir>/tensorboard/config.yaml`` (the file consumed by the
+    Tensorboard sidecar). We read it best-effort so the per-GPU bubble
+    view in :class:`TimelineSummary` reflects exactly the placement the
+    trial ran under, not the baseline. When the file is absent (e.g.
+    test fixtures, dry-runs) both values are ``None`` and the
+    timeline_processor falls back to the stall-fraction signal.
+    """
+    cfg_path = log_dir / "tensorboard" / "config.yaml"
+    if not cfg_path.is_file():
+        return None, None
+    try:
+        cfg = OmegaConf.load(cfg_path)
+    except Exception:  # noqa: BLE001 — best-effort
+        return None, None
+    placement_node = OmegaConf.select(cfg, "cluster.component_placement")
+    placement: Mapping[str, Any] | None = None
+    if placement_node is not None:
+        try:
+            placement = OmegaConf.to_container(placement_node, resolve=True)
+        except Exception:  # noqa: BLE001
+            placement = None
+    enable_offload: dict[str, bool] = {}
+    for component in ("env", "rollout", "actor"):
+        # env.train.enable_offload lives under env.train; rollout/actor at top.
+        if component == "env":
+            value = OmegaConf.select(cfg, "env.train.enable_offload")
+        else:
+            value = OmegaConf.select(cfg, f"{component}.enable_offload")
+        if value is not None:
+            enable_offload[component] = bool(value)
+    return placement, (enable_offload or None)
 
 
 # ---------------------------------------------------------------------------

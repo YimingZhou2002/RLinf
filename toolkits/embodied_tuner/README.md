@@ -28,6 +28,13 @@ bash examples/embodiment/run_embodied_tuner.sh \
     --config maniskill_ppo_openvla \
     --max-trials 20 \
     --budget-seconds 43200
+
+# Run a 20-trial / 12-hour / 1 epoch per trial tuning campaign on the maniskill baseline:
+bash examples/embodiment/run_embodied_tuner.sh \
+    --config maniskill_ppo_openvla \
+    --max-trials 20 \
+    --budget-seconds 43200 \
+    --max-epochs 1
 ```
 
 Direct module invocation (equivalent; the shim is just a PYTHONPATH wrapper):
@@ -93,6 +100,7 @@ need only a non-empty `summary`; citations are optional.
 | `--baseline PATH`             | `examples/embodiment/config/<config>.yaml` | Override the baseline YAML path.                                        |
 | `--max-trials N`              | `20`                                     | Stop after N completed trials.                                           |
 | `--budget-seconds SEC`        | `43200` (12h)                            | Wall-clock budget.                                                       |
+| `--trial-timeout-seconds SEC` | `2700` (45min)                           | Per-trial wall-clock budget. On timeout the runner escalates SIGTERM → SIGKILL and the trial is classified `(FAILED, TIMEOUT)`. |
 | `--max-oom N`                 | `5`                                      | Stop when cumulative OOM count exceeds N.                                |
 | `--patience N`                | `3`                                      | Plateau window: stop when last N non-failed trials improved <`epsilon`.   |
 | `--epsilon FRAC`              | `0.02`                                   | Plateau improvement threshold (relative).                                |

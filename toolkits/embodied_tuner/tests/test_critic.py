@@ -556,3 +556,116 @@ def test_fake_critic_stop_after_marks_final_output() -> None:
     o2 = critic.propose(history=[], current_knobs={}, schema=schema, last_failure_mode=None, last_metric_summary=None, last_timeline_summary=None)
     assert o1.stop_requested is False
     assert o2.stop_requested is True
+
+
+# ---------------------------------------------------------------------------
+# Timeline summary rendering (new sections from timeline_processor)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_renders_per_gpu_bubble_section() -> None:
+    schema = KnobSchema()
+    summary = {
+        "stall_fraction_by_component": {},
+        "per_tag": [],
+        "critical_path": {},
+        "outliers": [],
+        "per_gpu_bubble": {
+            "wall_s": 100.0,
+            "env_side_avg_bubble_s": 20.0,
+            "rollout_side_avg_bubble_s": 50.0,
+            "per_gpu": {
+                "0": {"residents": ["actor", "env"], "busy_s": 80.0,
+                      "bubble_s": 20.0, "bubble_frac": 0.2},
+                "4": {"residents": ["actor", "rollout"], "busy_s": 50.0,
+                      "bubble_s": 50.0, "bubble_frac": 0.5},
+            },
+        },
+        "raw_excerpts": [],
+    }
+    prompt = build_prompt(
+        history=(), current_knobs={}, schema=schema,
+        last_failure_mode=None, last_metric_summary=None,
+        last_timeline_summary=summary,
+    )
+    text = str(prompt)
+    assert "per-GPU bubble" in text
+    assert "env_side_avg_bubble_s=20.0" in text
+    assert "GPU0 (actor+env)" in text
+    assert "GPU4 (actor+rollout)" in text
+
+
+def test_prompt_renders_critical_path_with_blocking_explainer() -> None:
+    schema = KnobSchema()
+    summary = {
+        "stall_fraction_by_component": {},
+        "per_tag": [],
+        "critical_path": {
+            0: {"step_span_s": 100.0, "real_busy_top": [
+                {"component": "rollout", "rank": 0, "real_s": 90.0,
+                 "blocked_s": 0.0, "real_frac": 0.9},
+                {"component": "actor", "rank": 0, "real_s": 10.0,
+                 "blocked_s": 90.0, "real_frac": 0.1},
+            ]},
+        },
+        "outliers": [], "per_gpu_bubble": {}, "raw_excerpts": [],
+    }
+    prompt = build_prompt(
+        history=(), current_knobs={}, schema=schema,
+        last_failure_mode=None, last_metric_summary=None,
+        last_timeline_summary=summary,
+    )
+    text = str(prompt)
+    # The blocking-wait concept must be explained so the critic doesn't
+    # read recv_traj as actor work
+    assert "actor/recv_traj" in text
+    assert "blocking-wait" in text
+    assert "real=90.0s  blocked=0.0s" in text
+
+
+def test_prompt_renders_outliers_with_knob_hint() -> None:
+    schema = KnobSchema()
+    summary = {
+        "stall_fraction_by_component": {},
+        "per_tag": [],
+        "critical_path": {},
+        "outliers": [
+            {"tag": "env_interact_step", "component": "env", "rank": 0,
+             "global_step": None, "dur_s": 45.0,
+             "knob_hint": "env.enable_offload=True"},
+        ],
+        "per_gpu_bubble": {}, "raw_excerpts": [],
+    }
+    prompt = build_prompt(
+        history=(), current_knobs={}, schema=schema,
+        last_failure_mode=None, last_metric_summary=None,
+        last_timeline_summary=summary,
+    )
+    text = str(prompt)
+    assert "outlier events" in text
+    assert "env.enable_offload=True" in text
+
+
+def test_prompt_renders_raw_excerpts_as_jsonl() -> None:
+    schema = KnobSchema()
+    summary = {
+        "stall_fraction_by_component": {},
+        "per_tag": [],
+        "critical_path": {},
+        "outliers": [],
+        "per_gpu_bubble": {},
+        "raw_excerpts": [
+            {"component": "rollout", "rank": 0, "tag": "rollout/generate",
+             "global_step": 0, "dur_s": 273.6, "qualname": "MSR.generate",
+             "call_index": 0},
+        ],
+    }
+    prompt = build_prompt(
+        history=(), current_knobs={}, schema=schema,
+        last_failure_mode=None, last_metric_summary=None,
+        last_timeline_summary=summary,
+    )
+    text = str(prompt)
+    assert "raw timeline excerpts" in text
+    # Each excerpt rendered as a JSON line the critic can cite verbatim
+    assert '"qualname": "MSR.generate"' in text

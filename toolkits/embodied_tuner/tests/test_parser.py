@@ -399,3 +399,45 @@ def test_failed_with_none_failure_mode_is_invariant_violation() -> None:
             status=Status.FAILED,
             failure_mode=FailureMode.NONE,
         )
+
+
+# ---------------------------------------------------------------------------
+# Timeline processor integration on TimelineSummary
+# ---------------------------------------------------------------------------
+
+
+def test_parse_timeline_populates_new_fields(tmp_path):
+    timeline = tmp_path / "timeline"
+    timeline.mkdir()
+    (timeline / "env_rank0.jsonl").write_text(
+        json.dumps({"t0": 0.0, "t1": 30.0, "component": "env", "rank": 0,
+                    "tag": "env_interact_step", "global_step": 0}) + "\n"
+    )
+    (timeline / "rollout_rank0.jsonl").write_text(
+        json.dumps({"t0": 0.0, "t1": 50.0, "component": "rollout", "rank": 0,
+                    "tag": "predict", "global_step": 0}) + "\n"
+    )
+    ts = parse_timeline(
+        timeline,
+        placement={"actor": "0-7", "env": "0-3", "rollout": "4-7"},
+        enable_offload={"env": True},
+    )
+    # critical_path keyed by global_step
+    assert 0 in ts.critical_path
+    # per_gpu_bubble populated under hybrid placement
+    assert ts.per_gpu_bubble["wall_s"] == 50.0
+    # raw_excerpts top-K
+    assert len(ts.raw_excerpts) == 2
+
+
+def test_parse_timeline_skips_per_gpu_bubble_without_placement(tmp_path):
+    timeline = tmp_path / "timeline"
+    timeline.mkdir()
+    (timeline / "env_rank0.jsonl").write_text(
+        json.dumps({"t0": 0.0, "t1": 30.0, "component": "env", "rank": 0,
+                    "tag": "env_interact_step", "global_step": 0}) + "\n"
+    )
+    ts = parse_timeline(timeline)  # no placement
+    assert ts.per_gpu_bubble == {}
+    # Other fields still produced
+    assert 0 in ts.critical_path

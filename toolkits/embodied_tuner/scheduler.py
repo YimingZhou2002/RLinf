@@ -410,13 +410,16 @@ class Scheduler:
                         "rank": stat.rank,
                         "tag": stat.tag,
                         "call_count": stat.call_count,
-                        "duration_min": stat.duration_min,
                         "duration_median": stat.duration_median,
                         "duration_max": stat.duration_max,
                         "duration_total": stat.duration_total,
                     }
                     for stat in result.timeline_summary.per_tag
                 ],
+                "critical_path": dict(result.timeline_summary.critical_path),
+                "outliers": list(result.timeline_summary.outliers),
+                "per_gpu_bubble": dict(result.timeline_summary.per_gpu_bubble),
+                "raw_excerpts": list(result.timeline_summary.raw_excerpts),
             }
         per_component = (
             dict(result.per_step[-1].time_keys)
