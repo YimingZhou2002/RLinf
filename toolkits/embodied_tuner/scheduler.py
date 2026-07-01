@@ -34,6 +34,7 @@ Per the plan's AC-8 contract:
 
 from __future__ import annotations
 
+import logging
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -54,6 +55,9 @@ from toolkits.embodied_tuner.parser import (
     TrialResult,
 )
 from toolkits.embodied_tuner.runner import TrialOutcome
+
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -192,6 +196,12 @@ class Scheduler:
                 self._record_critic_failure(trial_idx, str(exc), start)
                 return self._finish("critic_failure", trial_idx, oom_count)
 
+            # Persist the critic's per-attempt prompt+response under the
+            # trial log dir so a human debugger can audit what Codex saw
+            # and returned for this round. Best-effort; a failure here
+            # must not abort the trial loop.
+            self._persist_critic_transactions(preflight_outcome.log_dir)
+
             if critic_output.stop_requested:
                 consecutive_stop_requests += 1
                 if consecutive_stop_requests >= 2:
@@ -329,6 +339,49 @@ class Scheduler:
             if rel >= self.budget.epsilon:
                 return False
         return True
+
+    def _persist_critic_transactions(self, log_dir: Path) -> None:
+        """Dump the critic's per-attempt prompt + response under ``log_dir``.
+
+        Reads ``self.critic.transaction_log`` (present on ``CodexCritic``
+        and any test critic that opts in). Silently skips when the
+        critic does not expose it, or when the log dir is empty (the
+        stop-requested branch supplies ``Path("")``). Any IO error is
+        swallowed with a log line — persisting the transcript is a
+        debugging convenience, not a correctness requirement.
+        """
+        log = getattr(self.critic, "transaction_log", None)
+        if not log:
+            return
+        if log_dir == Path(""):
+            return
+        try:
+            critic_dir = Path(log_dir) / "critic"
+            critic_dir.mkdir(parents=True, exist_ok=True)
+            for record in log:
+                attempt = record.get("attempt", 0)
+                prompt_path = critic_dir / f"attempt-{attempt:02d}-prompt.md"
+                response_path = critic_dir / f"attempt-{attempt:02d}-response.txt"
+                header_parts = [f"# Critic transaction — attempt {attempt}"]
+                if record.get("parse_error"):
+                    header_parts.append(f"parse_error: {record['parse_error']}")
+                else:
+                    header_parts.append(
+                        f"validation_ok: {record.get('validation_ok')}"
+                    )
+                    if record.get("validation_reason"):
+                        header_parts.append(
+                            f"validation_reason: {record['validation_reason']}"
+                        )
+                header = "\n".join(header_parts) + "\n\n"
+                prompt_path.write_text(
+                    header + record.get("prompt_debug", ""), encoding="utf-8"
+                )
+                response_path.write_text(
+                    record.get("response", ""), encoding="utf-8"
+                )
+        except OSError as exc:
+            _log.warning("failed to persist critic transactions to %s: %s", log_dir, exc)
 
     def _record_critic_failure(self, trial_idx: int, reason: str, start: float) -> None:
         """Persist a ledger entry capturing critic exhaustion."""

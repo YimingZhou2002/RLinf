@@ -47,6 +47,7 @@ import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from toolkits.embodied_tuner.schema import (
@@ -56,27 +57,55 @@ from toolkits.embodied_tuner.schema import (
 )
 
 
-_BOTTLENECK_RUBRIC = (
-    "## Bottleneck rubric (Alt-2 in the design draft)\n"
-    "Read the timeline sections below in this order:\n"
-    "1. `per-GPU bubble`: side with higher bubble has slack; consider "
-    "moving GPUs away from it.\n"
-    "2. `critical path per global_step`: the lane with the largest `real_s` "
-    "is the one whose work limits step time. Lanes with large `blocked_s` "
-    "and small `real_s` are NOT bottlenecks — they are downstream consumers.\n"
-    "3. `outlier events`: any row with a `knob_hint` is a stall the critic "
-    "can directly fix by flipping the named knob.\n"
-    "4. `raw timeline excerpts`: cite specific events to ground a placement "
-    "delta (mandatory dual-source rule).\n"
-    "Knob-side heuristics:\n"
-    "- If `actor_forward` / `actor_backward` dominate REAL busy: shrink "
-    "`actor.micro_batch_size` or grow actor GPU count.\n"
-    "- If `env_interact_step` is the largest real lane: reduce "
-    "`env.train.total_num_envs` or grow env GPU range.\n"
-    "- If `predict` is the largest real lane: grow rollout GPU range.\n"
-    "- If memory_pressure flag is set, prefer enable_offload flips or "
-    "shrink env/micro batch.\n"
+# --------------------------------------------------------------------------
+# Wiki loader — the bottleneck rubric and placement / optimization /
+# timeline context live in ``wiki/*.md`` alongside this module, NOT as
+# inline string constants. Editing markdown does not require touching
+# Python, and the same files are used as human documentation.
+# --------------------------------------------------------------------------
+
+_WIKI_DIR = Path(__file__).resolve().parent / "wiki"
+
+# Files pulled into the ``wiki_block`` section of the prompt, in this
+# order. The bottleneck rubric is kept separate so it can stay at the
+# top of the rendered prompt (see ``CriticPrompt.__str__``).
+_WIKI_CONTEXT_FILES: tuple[str, ...] = (
+    "placement-critical-paths.md",
+    "optimization-directions.md",
+    "timeline-signals.md",
+    "constraints.md",
 )
+
+_RUBRIC_FILE = "bottleneck-rubric.md"
+
+
+def _read_wiki_file(name: str) -> str:
+    """Return the contents of ``wiki/<name>``.
+
+    A missing wiki file is a build error, not a runtime warning: the
+    tuner cannot produce sensible critic prompts without them. Raising
+    at import time fails fast in tests and in real trials alike.
+    """
+    path = _WIKI_DIR / name
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"critic wiki file missing: {path}. The tuner requires the "
+            f"wiki/ directory to be shipped alongside critic.py."
+        )
+    return path.read_text(encoding="utf-8").rstrip() + "\n"
+
+
+def _load_rubric() -> str:
+    """Load the bottleneck rubric from ``wiki/bottleneck-rubric.md``."""
+    return _read_wiki_file(_RUBRIC_FILE)
+
+
+def _load_wiki_context() -> str:
+    """Concatenate the wiki context files behind a common header."""
+    sections = ["## Optimization context (from tuner wiki)"]
+    for name in _WIKI_CONTEXT_FILES:
+        sections.append(_read_wiki_file(name))
+    return "\n\n".join(s.rstrip() for s in sections) + "\n"
 
 
 _RATIONALE_SCHEMA_DOC = (
@@ -149,24 +178,48 @@ class TrialHistoryEntry:
 class CriticPrompt:
     """The fully rendered prompt sections."""
 
-    rubric: str = _BOTTLENECK_RUBRIC
+    rubric: str = field(default_factory=_load_rubric)
+    wiki_block: str = field(default_factory=_load_wiki_context)
     schema_doc: str = _RATIONALE_SCHEMA_DOC
     history_block: str = "## Trial History\n(none — first round)\n"
     current_knobs_block: str = ""
     constraints_block: str = ""
     memory_pressure_block: str = ""
-    timeline_summary_block: str = ""
+    metric_summary_block: str = ""  # compact: MetricTable time keys + stall fractions
+    timeline_verbose_block: str = ""  # verbose: critical path / bubble / outliers / raw excerpts
     feedback_block: str = ""  # appended on retries
 
     def __str__(self) -> str:
         sections = [
             self.rubric,
+            self.wiki_block,
             self.history_block,
             self.current_knobs_block,
             self.constraints_block,
             self.memory_pressure_block,
-            self.timeline_summary_block,
+            self.metric_summary_block,
+            self.timeline_verbose_block,
             self.schema_doc,
+        ]
+        if self.feedback_block:
+            sections.append(self.feedback_block)
+        return "\n".join(s.rstrip() for s in sections if s)
+
+    def to_debug_text(self) -> str:
+        """Render only the sections a human debugger needs.
+
+        Excludes the static rubric, the ~30KB wiki block, the schema
+        doc, and the verbose per-step timeline dump (critical path,
+        per-GPU bubble, outliers, raw JSONL excerpts). Keeps the
+        compact ``metric_summary_block`` because a debugger reading
+        the round's decision without those keys is missing the
+        primary signal the critic saw.
+        """
+        sections = [
+            self.history_block,
+            self.current_knobs_block,
+            self.memory_pressure_block,
+            self.metric_summary_block,
         ]
         if self.feedback_block:
             sections.append(self.feedback_block)
@@ -229,9 +282,10 @@ def build_prompt(
         current_knobs_block=_render_current_knobs(current_knobs, schema),
         constraints_block=_render_constraints(),
         memory_pressure_block=_render_memory_pressure(last_failure_mode),
-        timeline_summary_block=_render_timeline_summary(
+        metric_summary_block=_render_metric_summary_compact(
             last_metric_summary, last_timeline_summary
         ),
+        timeline_verbose_block=_render_timeline_verbose(last_timeline_summary),
         feedback_block=combined_feedback,
     )
 
@@ -295,10 +349,16 @@ def _render_memory_pressure(last_failure_mode: str | None) -> str:
     )
 
 
-def _render_timeline_summary(
+def _render_metric_summary_compact(
     metric_summary: Mapping[str, float] | None,
     timeline_summary: Mapping[str, Any] | None,
 ) -> str:
+    """Compact block: MetricTable time keys + per-component stall fractions.
+
+    This is the block that survives ``CriticPrompt.to_debug_text()`` — the
+    smallest possible summary of what the critic saw for last-trial
+    performance, useful for a human debugger reading the critic's decision.
+    """
     sections: list[str] = []
     if metric_summary:
         lines = ["## Last trial — MetricTable Time-section keys"]
@@ -306,35 +366,50 @@ def _render_timeline_summary(
             lines.append(f"- {key}={metric_summary[key]}")
         sections.append("\n".join(lines))
     if timeline_summary:
-        per_tag = timeline_summary.get("per_tag", ())
         stalls = timeline_summary.get("stall_fraction_by_component", {})
-        lines = ["## Last trial — per-component timeline summary"]
         if stalls:
-            lines.append("Stall fractions (idle / total window):")
+            lines = ["## Last trial — per-component stall fractions (idle / total window)"]
             for component in sorted(stalls):
                 lines.append(f"  - {component}: {stalls[component]:.3f}")
-        if per_tag:
-            lines.append("Headline tag stats (component / rank / tag / count / median):")
-            for stat in per_tag[:24]:  # keep the prompt compact
-                lines.append(
-                    f"  - {stat['component']} rank{stat['rank']} {stat['tag']} "
-                    f"count={stat['call_count']} median={stat['duration_median']:.3f}"
-                )
+            sections.append("\n".join(lines))
+    if not sections:
+        return ""
+    return "\n\n".join(sections) + "\n"
+
+
+def _render_timeline_verbose(
+    timeline_summary: Mapping[str, Any] | None,
+) -> str:
+    """Verbose block: per-tag stats, critical path, per-GPU bubble,
+    outliers, raw excerpts. Excluded from ``to_debug_text()``.
+    """
+    if not timeline_summary:
+        return ""
+    sections: list[str] = []
+
+    per_tag = timeline_summary.get("per_tag", ())
+    if per_tag:
+        lines = ["## Last trial — headline tag stats (component / rank / tag / count / median)"]
+        for stat in per_tag[:24]:  # keep the prompt compact
+            lines.append(
+                f"  - {stat['component']} rank{stat['rank']} {stat['tag']} "
+                f"count={stat['call_count']} median={stat['duration_median']:.3f}"
+            )
         sections.append("\n".join(lines))
 
-        critical_path = timeline_summary.get("critical_path") or {}
-        outliers = timeline_summary.get("outliers") or ()
-        per_gpu_bubble = timeline_summary.get("per_gpu_bubble") or {}
-        raw_excerpts = timeline_summary.get("raw_excerpts") or ()
+    critical_path = timeline_summary.get("critical_path") or {}
+    outliers = timeline_summary.get("outliers") or ()
+    per_gpu_bubble = timeline_summary.get("per_gpu_bubble") or {}
+    raw_excerpts = timeline_summary.get("raw_excerpts") or ()
 
-        if critical_path:
-            sections.append(_render_critical_path(critical_path))
-        if per_gpu_bubble:
-            sections.append(_render_per_gpu_bubble(per_gpu_bubble))
-        if outliers:
-            sections.append(_render_outliers(outliers))
-        if raw_excerpts:
-            sections.append(_render_raw_excerpts(raw_excerpts))
+    if critical_path:
+        sections.append(_render_critical_path(critical_path))
+    if per_gpu_bubble:
+        sections.append(_render_per_gpu_bubble(per_gpu_bubble))
+    if outliers:
+        sections.append(_render_outliers(outliers))
+    if raw_excerpts:
+        sections.append(_render_raw_excerpts(raw_excerpts))
     if not sections:
         return ""
     return "\n\n".join(sections) + "\n"
@@ -605,12 +680,23 @@ class CodexCritic:
         transport: Optional injection point. When set, called as
             ``transport(prompt) -> str``; otherwise the script is invoked
             via :func:`subprocess.run`.
+        transaction_log: Per-``propose`` capture of each transport
+            exchange, for the scheduler to persist under
+            ``<trial_log_dir>/critic/``. Reset at the start of each
+            ``propose`` call. Records carry the DEBUG view of the
+            prompt (see :meth:`CriticPrompt.to_debug_text`) so the
+            saved file is inspection-friendly rather than a 36 KB dump
+            of the wiki + rubric + verbose timeline. The field is a
+            mutable list; ``frozen=True`` still holds because dataclass
+            freezing only blocks ``__setattr__`` on the container, not
+            mutation of a list's contents.
     """
 
     schema: KnobSchema
     ask_codex_path: str = "/root/.claude/plugins/cache/PolyArch/humanize/1.17.0/scripts/ask-codex.sh"
     max_retries: int = 3
     transport: Callable[[str], str] | None = None
+    transaction_log: list[dict[str, Any]] = field(default_factory=list)
 
     def propose(
         self,
@@ -628,6 +714,9 @@ class CodexCritic:
         feedback: str | None = None
         last_error: str = ""
 
+        # Reset per-propose so each trial round's log stands alone.
+        self.transaction_log.clear()
+
         for attempt in range(self.max_retries + 1):
             prompt = build_prompt(
                 history=history,
@@ -639,17 +728,31 @@ class CodexCritic:
                 feedback=feedback,
                 preflight_feedback=preflight_feedback,
             )
+            debug_prompt = prompt.to_debug_text()
             response = self._invoke_transport(str(prompt))
+            record: dict[str, Any] = {
+                "attempt": attempt,
+                "prompt_debug": debug_prompt,
+                "response": response,
+                "parse_error": None,
+                "validation_ok": False,
+                "validation_reason": "",
+            }
             try:
                 output = parse_critic_output(response)
             except CriticError as exc:
                 last_error = str(exc)
+                record["parse_error"] = last_error
+                self.transaction_log.append(record)
                 feedback = (
                     f"Your previous response could not be parsed as the required JSON "
                     f"object: {exc}. Re-emit the JSON exactly per the schema above."
                 )
                 continue
             verdict = validator.validate(output)
+            record["validation_ok"] = verdict.ok
+            record["validation_reason"] = verdict.reason
+            self.transaction_log.append(record)
             if verdict.ok:
                 return output
             last_error = verdict.reason
