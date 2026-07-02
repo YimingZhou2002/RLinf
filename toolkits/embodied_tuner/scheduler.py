@@ -522,6 +522,11 @@ class Scheduler:
                 "outliers": list(result.timeline_summary.outliers),
                 "per_gpu_bubble": dict(result.timeline_summary.per_gpu_bubble),
                 "raw_excerpts": list(result.timeline_summary.raw_excerpts),
+                "raw_jsonl": dict(result.timeline_summary.raw_jsonl),
+                "plot_paths": {
+                    fmt: str(path)
+                    for fmt, path in result.timeline_summary.plot_paths.items()
+                },
             }
         per_component = (
             dict(result.per_step[-1].time_keys)

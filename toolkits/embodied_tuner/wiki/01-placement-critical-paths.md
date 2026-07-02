@@ -1,10 +1,11 @@
-# Placement critical paths
+# 01 Placement critical paths
 
 The single most important reasoning tool for the critic. Shortening a
 component only reduces `step_time` when that component sits on the
 critical path for the current placement AND the current runner mode.
 This file gives the closed-form critical path and its timeline
-signature.
+signature. Use these formulas as the numerator model; the tuner
+objective is still `step_time / num_trajectories`.
 
 Notation:
 
@@ -92,13 +93,14 @@ Consequences:
   shrinking `T_rol` does **not** help — env is the bottleneck. Cite
   `env/interact` in the MetricTable and env rank `stall_fraction ≈ 0`
   (env is busy) alongside a growing `predict.stall_fraction` on rollout
-  ranks. Remedies: reduce `env.train.total_num_envs`, offload env, or
-  reallocate GPUs from rollout to env.
+  ranks. Remedies: change `env.train.total_num_envs` only when
+  `step_time / num_trajectories` should improve, or reallocate GPUs
+  from rollout to env. Do not enable env offload as a throughput knob.
 - If `T_rol > T_env`, symmetric argument in reverse.
 - If `T_act` alone dominates `R * max(T_env, T_rol)`, the R-fold
-  parallel gain is wasted — reduce `micro_batch_size` (memory
-  permitting), or reduce R so the actor gets called more often on
-  smaller trajectories.
+  parallel gain is wasted — increase `actor.micro_batch_size` if memory
+  allows, shrink it only for OOM / high memory, or adjust R only when
+  `step_time / num_trajectories` improves.
 
 Timeline signature: on env ranks, `env_interact_step` bars overlap in
 wall time with `predict` bars on rollout ranks. Actor bars appear only
@@ -159,5 +161,7 @@ the bottleneck; the other two show `stall_fraction > 0`.
   MetricTable already shows `env/interact` is the smallest term of the
   three — you'll gain nothing but risk OOM.
 - Proposing a disaggregated placement under `run` (non-pipeline) mode
-  expecting a `max(...)` critical path — it stays additive. Cite the
-  runner mode in the rationale.
+  expecting actor training to overlap with interact. The path remains
+  `T_sync + R*max(T_env,T_rol) + T_act`, not
+  `T_sync + max(R*T_env, R*T_rol, T_act)`. Cite the runner mode in the
+  rationale.

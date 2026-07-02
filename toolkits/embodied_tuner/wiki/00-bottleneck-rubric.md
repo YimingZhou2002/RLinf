@@ -1,15 +1,16 @@
-# Bottleneck rubric
+# 00 Bottleneck rubric
 
 How to read the runtime data blocks the tuner injects into your prompt
 (`## Last trial — MetricTable ...`, `## Last trial — critical path per
 global_step`, `## Last trial — per-GPU bubble ...`, `## Last trial —
 outlier events ...`, `## Last trial — raw timeline excerpts ...`) and
-turn them into a delta whose expected effect on `step_time` is
-non-zero.
+turn them into a delta whose expected effect on `step_time /
+num_trajectories` is non-zero.
 
-The rubric assumes you have already read
-[`placement-critical-paths.md`](placement-critical-paths.md) — it names
-the formulas here but does not re-derive them.
+This document is read first and must be self-contained. Detailed
+definitions and edge cases appear later in `01 placement-critical-paths`,
+`02 optimization-directions`, `03 timeline-signals`, and
+`04 constraints`.
 
 ## Step 0 — Identify the runner mode and current placement
 
@@ -40,11 +41,13 @@ Read in this order:
    small `real_s` is a downstream consumer, not a bottleneck; do NOT
    propose to shrink it.
 
-    Common trap: `actor/recv_traj` is a **blocking wait** — its duration
-    reflects the interact-loop cost (env + rollout), not actor work.
-    Cite `run_training`, `forward_actor`, `actor/compute_adv`, or the
-    `actor_backward` sub-tags for actor bottleneck claims, never
-    `actor/recv_traj`.
+    Common trap: `actor/recv_traj` / `recv_rollout_trajectories` is a
+    **blocking wait** — its duration reflects the interact-loop cost
+    (env + rollout), not actor work. Cite `actor_forward`,
+    `actor_backward`, `actor_optimizer_step`, or
+    `compute_advantages_and_returns` for actor bottleneck claims. Use
+    `actor/run_training` only as MetricTable sanity-check evidence when
+    actor phase tags are missing; never cite recv tags as actor compute.
 
 3. **MetricTable time keys** (`## Last trial — MetricTable Time-section
    keys`). Sanity-check the `real_s` decision: `env/interact`,
@@ -80,22 +83,25 @@ critical path.
 
 ## Step 3 — Choose the knob
 
-Consult [`optimization-directions.md`](optimization-directions.md) for
+Consult [`02-optimization-directions.md`](02-optimization-directions.md) for
 knob-by-knob effects. Summary of first-line moves:
 
 | Bottleneck term (largest `real_s` on critical path) | First-line knob                    | Second-line knob                            |
 |-----------------------------------------------------|------------------------------------|---------------------------------------------|
-| `env_interact_step` on env ranks                    | `env.train.total_num_envs` down    | reallocate env GPUs (placement)             |
-| `predict` on rollout ranks                          | reallocate rollout GPUs (placement)| `env.train.rollout_epoch` down              |
-| `forward_actor`, `actor_backward`, `update_one_epoch` on actor ranks | `actor.micro_batch_size` up (if memory allows) or down (if OOM) | reallocate actor GPUs / `rollout_epoch` up  |
+| `env_interact_step` on env ranks                    | move `env.train.total_num_envs` only if normalized `step_time / num_trajectories` should improve | reallocate env GPUs (placement)             |
+| `predict` on rollout ranks                          | reallocate rollout GPUs (placement)| `env.train.rollout_epoch` down only if normalized objective improves |
+| `actor_forward`, `actor_backward`, `actor_optimizer_step` on actor ranks | `actor.micro_batch_size` up if memory allows; down only for OOM / high memory | reallocate actor GPUs / `rollout_epoch` up if normalized objective improves |
 | `actor/sync_model_to_rollout` (T_sync)              | (not tunable in this loop) — investigate `weight_sync_interval` in the baseline | flag as FUT                                 |
-| `actor/compute_adv`                                 | `env.train.rollout_epoch` down (smaller trajectory buffer) | flag if config regression |
+| `compute_advantages_and_returns`                    | `env.train.rollout_epoch` down only if normalized objective improves | flag if config regression |
 
 Rules of thumb:
 
 - Prefer knobs that touch a single component. Placement changes are
   the highest-variance moves — reserve them for when a component-local
   knob has plateaued.
+- Optimize `step_time / num_trajectories`, not raw `step_time`. A delta
+  that reduces `step_time` but reduces `num_trajectories` by the same or
+  larger fraction is not an improvement.
 - Under memory pressure (last trial `FailureMode=OOM`), the memory
   triage cascade is: `actor.micro_batch_size` down → `env.train.total_num_envs`
   down → `enable_offload=true` on the OOM component. Do NOT reach for

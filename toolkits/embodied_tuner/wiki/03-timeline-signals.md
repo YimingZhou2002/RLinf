@@ -1,4 +1,4 @@
-# Timeline signals — from raw events to conclusions
+# 03 Timeline signals — from raw events to conclusions
 
 The critic receives a `timeline_summary` derived from `timeline/*.jsonl`
 by `parser.TimelineSummary`. This file explains what each signal means,

@@ -71,13 +71,13 @@ _WIKI_DIR = Path(__file__).resolve().parent / "wiki"
 # order. The bottleneck rubric is kept separate so it can stay at the
 # top of the rendered prompt (see ``CriticPrompt.__str__``).
 _WIKI_CONTEXT_FILES: tuple[str, ...] = (
-    "placement-critical-paths.md",
-    "optimization-directions.md",
-    "timeline-signals.md",
-    "constraints.md",
+    "01-placement-critical-paths.md",
+    "02-optimization-directions.md",
+    "03-timeline-signals.md",
+    "04-constraints.md",
 )
 
-_RUBRIC_FILE = "bottleneck-rubric.md"
+_RUBRIC_FILE = "00-bottleneck-rubric.md"
 
 
 def _read_wiki_file(name: str) -> str:
@@ -97,7 +97,7 @@ def _read_wiki_file(name: str) -> str:
 
 
 def _load_rubric() -> str:
-    """Load the bottleneck rubric from ``wiki/bottleneck-rubric.md``."""
+    """Load the bottleneck rubric from ``wiki/00-bottleneck-rubric.md``."""
     return _read_wiki_file(_RUBRIC_FILE)
 
 
@@ -468,6 +468,8 @@ def _render_timeline_verbose(
     outliers = timeline_summary.get("outliers") or ()
     per_gpu_bubble = timeline_summary.get("per_gpu_bubble") or {}
     raw_excerpts = timeline_summary.get("raw_excerpts") or ()
+    raw_jsonl = timeline_summary.get("raw_jsonl") or {}
+    plot_paths = timeline_summary.get("plot_paths") or {}
 
     if critical_path:
         sections.append(_render_critical_path(critical_path))
@@ -477,9 +479,56 @@ def _render_timeline_verbose(
         sections.append(_render_outliers(outliers))
     if raw_excerpts:
         sections.append(_render_raw_excerpts(raw_excerpts))
+    if plot_paths:
+        sections.append(_render_plot_paths(plot_paths))
+    if raw_jsonl:
+        sections.append(_render_raw_jsonl(raw_jsonl))
     if not sections:
         return ""
     return "\n\n".join(sections) + "\n"
+
+
+def _render_plot_paths(plot_paths: Mapping[str, str]) -> str:
+    """Point the critic at the rendered Gantt file(s) sitting on disk.
+
+    We do not embed the image itself in the prompt (Codex's shell
+    transport is text-only). The path lets a human debugger open it,
+    and a future multimodal critic can lift it into an image content
+    block via ``plot_paths["png"]``.
+    """
+    lines = ["## Last trial — timeline Gantt renders"]
+    for fmt in sorted(plot_paths):
+        lines.append(f"  - {fmt}: {plot_paths[fmt]}")
+    return "\n".join(lines)
+
+
+def _render_raw_jsonl(raw_jsonl: Mapping[str, str]) -> str:
+    """Full-fidelity JSONL text block, one section per selected trace.
+
+    The selector on the parser side keeps this bounded (default: one
+    representative rank per component). Each section is fenced with the
+    file stem so the critic can cite events unambiguously
+    (e.g. ``env_rank3 line 47``). Files are emitted in insertion order,
+    which the selector chooses deliberately (e.g. actor / rollout / env).
+    """
+    lines = [
+        "## Last trial — raw timeline JSONL",
+        (
+            "Each fenced block below is the verbatim contents of one "
+            "`<component>_rank<N>.jsonl` file from `<log_dir>/timeline/`. "
+            "Every line is one event `{t0, t1, component, rank, tag, "
+            "global_step, ...}`. Cite specific lines by their file stem "
+            "and line number when the aggregated views above are not "
+            "enough to justify a delta."
+        ),
+    ]
+    for name in raw_jsonl:  # insertion-ordered
+        body = raw_jsonl[name].rstrip()
+        lines.append(f"\n### {name}")
+        lines.append("```jsonl")
+        lines.append(body)
+        lines.append("```")
+    return "\n".join(lines)
 
 
 # Concept-explanation prefix the critic must see exactly once per prompt so

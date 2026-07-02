@@ -1,4 +1,4 @@
-# Constraints and hard rules
+# 04 Constraints and hard rules
 
 Every rule the tuner will refuse a delta for. The critic should read
 this before proposing any delta so it does not waste retries on
@@ -166,24 +166,66 @@ be a JSON object with exactly the same keys, e.g.
 Do **not** emit list-of-dicts placements or add extra components — the
 preflight parser rejects unknown types (`preflight._placement_to_str_map`).
 
-## Recommended workflow when unsure
+## Required checklists
 
-1. Look up the current baseline values of `env_world_size` (size of env
-   range), `actor_world_size`, `pipeline_stage_num`, `group_size`,
-   `global_batch_size`, `num_action_chunks` from the current-knobs
-   block or the constants section of the prompt.
-2. Verify the proposed delta satisfies **every** rule in Tier 1 by
-   substituting the new values.
-3. If the delta touches `env.train.total_num_envs` or placement,
-   also verify Tier 2.1 (per-rank-per-stage-per-group divisibility) —
-   preflight will accept a violation of the group_size rule that
-   crashes at runtime.
-4. If the delta changes the env or rollout GPU range, also verify
-   Tier 2.6 (routing divisibility) — preflight does not check that
-   `(total_num_envs // env_world_size) % rollout_world_size == 0`, so
-   an otherwise-legal placement rebalance can crash the trial.
-5. If the delta enables env offload, note the overlap_env_bootstrap
-   side effect (Tier 2.3) in the rationale.
+Use the checklist matching every knob in the proposed delta. Substitute
+the **new** values after applying the delta, not the baseline values.
+
+### If delta touches `cluster.component_placement`
+
+1. Parse `actor_world_size`, `env_world_size`, and
+   `rollout_world_size` from the new ranges.
+2. Verify every range is contiguous, in `[0, num_gpus)`, non-empty, and
+   that env and rollout are either equal or fully disjoint.
+3. Verify `env.train.total_num_envs % env_world_size == 0`.
+4. Verify `(env.train.total_num_envs // env_world_size) %
+   rollout.pipeline_stage_num == 0`.
+5. Verify `(env.train.total_num_envs // env_world_size //
+   rollout.pipeline_stage_num) % env.train.group_size == 0`.
+6. Verify `actor.global_batch_size %
+   (actor.micro_batch_size * actor_world_size) == 0`.
+7. Verify actor and rollout world sizes are at least their tensor
+   parallel sizes.
+8. If env or rollout GPU ranges change, verify routing divisibility:
+   `(total_num_envs // env_world_size) % rollout_world_size == 0` and
+   `(total_num_envs // env_world_size) % actor_world_size == 0`.
+
+### If delta touches `env.train.total_num_envs`
+
+1. Verify it is in `[1, 4096]`.
+2. Verify `total_num_envs % env_world_size == 0`.
+3. Verify `(total_num_envs // env_world_size) %
+   rollout.pipeline_stage_num == 0`.
+4. Verify `(total_num_envs // env_world_size //
+   rollout.pipeline_stage_num) > 0`.
+5. Verify `(total_num_envs // env_world_size //
+   rollout.pipeline_stage_num) % env.train.group_size == 0`.
+6. If placement is hybrid or disaggregated, verify routing divisibility:
+   `(total_num_envs // env_world_size) % rollout_world_size == 0` and
+   `(total_num_envs // env_world_size) % actor_world_size == 0`.
+
+### If delta touches `actor.micro_batch_size` or actor GPU count
+
+1. Verify `actor.micro_batch_size` is in `[1, 4096]`.
+2. Verify `actor.global_batch_size %
+   (actor.micro_batch_size * actor_world_size) == 0`.
+3. If the actor GPU range shrinks, verify
+   `actor.model.tensor_model_parallel_size <= actor_world_size`.
+
+### If delta touches `env.train.rollout_epoch`
+
+1. Verify `env.train.rollout_epoch` is in `[1, 16]`.
+2. Remember the optimisation objective is `step_time /
+   num_trajectories`; changing rollout_epoch changes both numerator and
+   denominator.
+
+### If delta enables any `*.enable_offload`
+
+1. Use offload as a memory rescue knob, not a throughput knob.
+2. If enabling `env.train.enable_offload`, note that
+   `runner.overlap_env_bootstrap` is forced to `False`.
+3. Do not enable offload on the current critical-path component unless
+   the last trial failed or nearly failed from memory pressure.
 
 Missing citations to constraints do not cause validation to fail on
 their own, but every crash caused by a constraint the critic could have

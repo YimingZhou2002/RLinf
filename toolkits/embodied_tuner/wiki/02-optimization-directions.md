@@ -1,7 +1,7 @@
-# Optimization directions per knob
+# 02 Optimization directions per knob
 
 Each knob's effect on the three critical-path terms and the memory
-budget. Use this together with `placement-critical-paths.md` to decide
+budget. Use this together with `01-placement-critical-paths.md` to decide
 whether a proposed delta will actually reduce `step_time /
 num_trajectories`.
 
@@ -28,49 +28,50 @@ decomposes into the sub-tasks each knob targets.
 
 ## `env.train.total_num_envs`
 
-- **What it moves:** batches env stepping. Larger → fewer env kernel
-  launches per trajectory element, so `T_env` per collected sample
-  usually decreases; but GPU memory used by env increases linearly.
-- **When to grow:** env is the critical-path bottleneck AND env GPU
-  memory has headroom (nvml_total_used_gib well under the device cap).
-- **When to shrink:** OOM on the env process, or env memory has grown
-  past ~85% of the device cap.
+- **What it moves:** batches env stepping and changes both `step_time`
+  and `num_trajectories`. Larger usually increases raw `T_env` and GPU
+  memory, but may reduce `T_env / trajectory` if batching efficiency
+  improves.
+- **When to grow:** env is the critical-path bottleneck, env GPU memory
+  has headroom, and trial history or MetricTable normalisation suggests
+  `step_time / num_trajectories` will decrease.
+- **When to shrink:** env OOM, env memory has grown past ~85% of the
+  device cap, or recent trials show super-linear `T_env` growth such
+  that fewer envs should improve `step_time / num_trajectories`.
 - **Watch for:** `T_env` also depends on `group_size` and env-side
-  divisibility; preflight rejects splits that violate the env-worker
-  contract, so a shrink may fail preflight rather than the trial.
+  divisibility. Some violations fail preflight, while group-size and
+  routing violations may crash at runtime; apply the `04 constraints`
+  checklist before changing this knob.
 - **Divisibility interaction:** `total_num_envs` must divide by
   `env_world_size` (`rlinf/config.py:962` family). Ledger will show a
   `FAILED, CONFIG_INVALID` if this is violated.
-- **Scaling behaviour:** with placement held constant, `T_env` grows
-  roughly linearly with `total_num_envs` (i.e.
-  `T_env = a * env_num + b`), but beyond a certain env count the growth
-  becomes super-linear — doubling `env_num` may more than double `T_env`
-  (e.g. quadruple it) due to kernel scheduling contention and
-  memory-bandwidth saturation.
+- **Evidence gate:** treat linear / super-linear scaling as a hypothesis
+  unless trial history contains adjacent env counts, p90/median worsens,
+  or memory approaches the cap. Prefer the move whose expected
+  `step_time / num_trajectories` is lower.
 
 ## `env.train.rollout_epoch` (denoted `R` above)
 
-- **What it moves:** trades trajectory buffer size (favouring the actor's
-  gradient step efficiency) for env/rollout wall time. `step_time`
-  contains an `R * ...` term under every placement.
+- **What it moves:** changes the number of interact chunks and collected
+  trajectories per training step. `step_time` contains an `R * ...`
+  term under every placement, while `num_trajectories` also scales with
+  R.
 - **When to shrink:** critical path is dominated by the env/rollout
   chunk term (`R * max(T_env, T_rol)` under hybrid, or `R * T_env` /
-  `R * T_rol` under disaggregated). Halving R halves that term but
-  doubles the number of actor calls per unit of trajectory.
+  `R * T_rol` under disaggregated) AND the expected reduction in
+  `step_time` is larger than the reduction in `num_trajectories`.
 - **When to grow:** actor is the bottleneck under hybrid or
-  disaggregated (`T_act > R * max(T_env, T_rol)`) — larger R amortises
-  actor overhead over more collected samples.
+  disaggregated (`T_act > R * max(T_env, T_rol)`) AND larger R should
+  reduce actor cost per trajectory by amortising actor overhead over
+  more collected samples.
 - **Interaction with `num_trajectories`:** the objective normalises by
   `num_trajectories`, and `num_trajectories` scales linearly with R.
   A smaller R buys smaller `step_time` but also smaller
   `num_trajectories`; watch that `step_time / num_trajectories` actually
   improves.
-- **Scaling behaviour:** with placement held constant, `T_rol` grows
-  roughly linearly with total trajectory count (i.e.
-  `T_rol = a * traj_num + b`), but beyond a certain scale the growth
-  becomes super-linear — doubling trajectories may more than double
-  `T_rol` (e.g. quadruple it) due to KV-cache pressure and
-  memory-bandwidth saturation.
+- **Evidence gate:** treat rollout super-linear scaling as a hypothesis
+  unless trial history, p90/median, KV-cache pressure, or memory curves
+  support it. Optimise the normalised objective, not raw `step_time`.
 
 ## `actor.micro_batch_size`
 
@@ -81,18 +82,14 @@ decomposes into the sub-tasks each knob targets.
   arithmetic intensity, lower `T_act`.
 - **When to shrink:** actor OOM occurred, or `nvml_total_used_gib` on
   actor ranks is above ~85% of the device cap.
-- **Divisibility:** `global_batch_size % micro_batch_size == 0` is
-  required (`rlinf/config.py:965`, `1363-1368`). Preflight will reject a
-  non-divisor; propose a divisor instead of a nearby number.
+- **Divisibility:** `actor.global_batch_size %
+  (actor.micro_batch_size * actor_world_size) == 0` is required
+  (`rlinf/config.py:1363-1368`). Preflight will reject a non-divisor;
+  propose a divisor of `global_batch_size / actor_world_size` instead
+  of a nearby number.
 - **Note on pinned `global_batch_size`:** the schema pins
   `actor.global_batch_size` (FUT-5), so the critic can only move
   `micro_batch_size` within its divisors.
-- **Scaling behaviour:** with placement held constant, `T_act` grows
-  roughly linearly with total trajectory count (i.e.
-  `T_act = a * traj_num + b`), but beyond a certain scale the growth
-  becomes super-linear — doubling trajectories may more than double
-  `T_act` (e.g. quadruple it) due to memory-bandwidth contention and
-  cache pressure.
 - **Non-monotonic effect of mbs:** when GPU memory allows, increasing
   `micro_batch_size` first *decreases* `T_act` (fewer micro-batches,
   higher arithmetic intensity). However, once memory usage approaches
@@ -101,6 +98,10 @@ decomposes into the sub-tasks each knob targets.
   spilling, and scheduling overhead dominate. The optimal mbs is
   therefore not the largest divisor but the one at the inflection point
   before the super-linear slowdown.
+- **Evidence gate:** use the non-monotonic rule only when memory curves,
+  OOM history, or adjacent mbs trials support it. Without that evidence,
+  prefer increasing mbs for actor-bound throughput and decreasing it for
+  actor OOM / high memory.
 
 ## `env.train.enable_offload`
 

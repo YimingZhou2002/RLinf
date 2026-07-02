@@ -49,6 +49,7 @@ with a single step is measurable — its lone step_time is used directly.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import statistics
@@ -56,6 +57,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+from toolkits.embodied_tuner.timeline_feed import (
+    JsonlFeedMode,
+    collect_raw_jsonl,
+    render_default_plots,
+)
 
 
 class Status(str, Enum):
@@ -153,6 +160,17 @@ class TimelineSummary:
         raw_excerpts: Top-K longest raw events copied verbatim from the
             JSONL stream (runner-wrapper events excluded) so the critic
             sees full call context (``qualname``, ``call_index``, etc.).
+        raw_jsonl: Optional mapping ``{"<component>_rank<N>": <file text>}``
+            with unabridged JSONL contents. Populated by
+            :func:`~toolkits.embodied_tuner.timeline_feed.collect_raw_jsonl`
+            when a :class:`~toolkits.embodied_tuner.timeline_feed.JsonlFeedMode`
+            other than ``NONE`` is active. Empty ``{}`` when disabled or
+            when no JSONL files were selected.
+        plot_paths: Optional mapping ``{fmt: path}`` recording the Gantt
+            renders produced by
+            :func:`~toolkits.embodied_tuner.timeline_feed.render_default_plots`
+            (e.g. ``{"png": Path(".../timeline.png")}``). Empty ``{}`` when
+            plotting was skipped or every format failed.
     """
 
     per_tag: tuple[TagStats, ...] = ()
@@ -163,6 +181,8 @@ class TimelineSummary:
     outliers: tuple[dict, ...] = ()
     per_gpu_bubble: dict[str, object] = field(default_factory=dict)
     raw_excerpts: tuple[dict, ...] = ()
+    raw_jsonl: dict[str, str] = field(default_factory=dict)
+    plot_paths: dict[str, Path] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -218,6 +238,8 @@ def parse_trial(
     stderr_path: Path | str | None = None,
     placement: Mapping[str, object] | None = None,
     enable_offload: Mapping[str, bool] | None = None,
+    jsonl_feed_mode: JsonlFeedMode | None = None,
+    plot_formats: Iterable[str] = ("png",),
 ) -> TrialResult:
     """Parse a trial directory and return a :class:`TrialResult`.
 
@@ -244,6 +266,18 @@ def parse_trial(
         enable_offload: This trial's effective offload knob state
             ({"env": True, "rollout": False, "actor": True}). Used to
             attach knob hints to outliers.
+        jsonl_feed_mode: Which JSONL files to load into
+            ``TimelineSummary.raw_jsonl`` for the critic prompt. ``None``
+            (default) means ``PER_COMPONENT_LATEST`` — per-component pick
+            the rank whose events end latest. Set to ``NONE`` to skip
+            (keeps prior behaviour). ``ALL`` dumps every file (may be
+            hundreds of KB per trial — only viable for long-context
+            critics).
+        plot_formats: Which Gantt formats to render alongside the trial
+            via :func:`profiler.plot_timeline`. Defaults to ``("png",)``
+            because that is what critics can attach as an image. Pass
+            ``("png", "html")`` to also emit the interactive plot for
+            human debugging, or ``()`` to skip plotting entirely.
 
     Returns:
         A :class:`TrialResult`. Always returns; never raises on missing
@@ -362,6 +396,24 @@ def parse_trial(
             timeline_partial_reason = f"timeline parse error: {exc}"
     else:
         timeline_partial_reason = f"timeline/ directory absent at {timeline_dir}"
+
+    # Best-effort side-effects on the timeline dir: render the Gantt
+    # plot(s) and load raw JSONL text for the critic prompt. Both are
+    # additive to TimelineSummary and never affect trial classification.
+    if timeline_summary is not None and timeline_dir.is_dir():
+        active_mode = (
+            jsonl_feed_mode
+            if jsonl_feed_mode is not None
+            else JsonlFeedMode.PER_COMPONENT_LATEST
+        )
+        raw_jsonl = collect_raw_jsonl(timeline_dir, mode=active_mode)
+        plot_paths = render_default_plots(timeline_dir, formats=tuple(plot_formats))
+        # ``TimelineSummary`` is frozen; rebuild with the extra fields.
+        timeline_summary = dataclasses.replace(
+            timeline_summary,
+            raw_jsonl=raw_jsonl,
+            plot_paths=plot_paths,
+        )
 
     # Decide (Status, FailureMode).
     reasons: list[str] = []

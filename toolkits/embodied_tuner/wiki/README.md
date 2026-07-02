@@ -1,4 +1,4 @@
-# Tuner wiki — optimization context for the critic
+# Tuner wiki — ordered optimization context for the critic
 
 This directory holds natural-language context the LLM critic can cite when
 proposing knob deltas. It complements the mechanical inputs the critic
@@ -13,20 +13,24 @@ trial history) with:
 3. **A signal-to-conclusion decoder** for timeline events — which tag
    means what, and which tags are noisy wrappers to be ignored.
 
-## Files
+## Read order
 
-- [`bottleneck-rubric.md`](bottleneck-rubric.md) — reading order, when
+The critic sees `00-bottleneck-rubric` first, then the remaining context
+in the numbered order below. Keep cross-references consistent with this
+order; do not assume a later document has already been read.
+
+- `00` [`00-bottleneck-rubric.md`](00-bottleneck-rubric.md) — reading order, when
   to trust which block, and the term→knob decision table. This is the
   extracted-and-rewritten former `_BOTTLENECK_RUBRIC` constant from
   `critic.py`.
-- [`placement-critical-paths.md`](placement-critical-paths.md) — critical
+- `01` [`01-placement-critical-paths.md`](01-placement-critical-paths.md) — critical
   path per placement mode (collocated / hybrid / disaggregated) and per
   runner mode (`run` vs `run_pipeline`), with short-form formulas.
-- [`optimization-directions.md`](optimization-directions.md) — knob-by-knob
+- `02` [`02-optimization-directions.md`](02-optimization-directions.md) — knob-by-knob
   playbook: what each knob shifts, when to touch it, common OOM patterns.
-- [`timeline-signals.md`](timeline-signals.md) — what each timeline tag
+- `03` [`03-timeline-signals.md`](03-timeline-signals.md) — what each timeline tag
   means, how `stall_fraction` is defined, and which tags to ignore.
-- [`constraints.md`](constraints.md) — every rule that will refuse a
+- `04` [`04-constraints.md`](04-constraints.md) — every rule that will refuse a
   delta, split into preflight-enforced (fail fast, no trial) and
   runtime-enforced (crashes the trial). Consult before proposing any
   delta that touches divisibility-sensitive knobs or placement.
