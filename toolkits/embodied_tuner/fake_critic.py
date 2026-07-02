@@ -29,9 +29,11 @@ from typing import Any
 from toolkits.embodied_tuner.critic import (
     CriticError,
     CriticOutput,
+    ProposedLesson,
     Rationale,
     TrialHistoryEntry,
 )
+from toolkits.embodied_tuner.lessons import BitterLesson
 from toolkits.embodied_tuner.schema import KnobSchema
 
 
@@ -43,12 +45,15 @@ class FakeCritic:
         outputs: Pre-programmed responses. ``propose`` returns the next
             one each time. Raise :class:`CriticError` when the list is
             exhausted (helps tests catch off-by-one scheduling bugs).
-        calls: Captured ``(history_length, current_knobs, preflight_feedback)``
-            tuples for assertion in tests.
+        calls: Captured ``(history_length, current_knobs,
+            preflight_feedback, bitter_lesson_count)`` tuples for
+            assertion in tests.
     """
 
     outputs: list[CriticOutput]
-    calls: list[tuple[int, dict[str, Any], str | None]] = field(default_factory=list)
+    calls: list[tuple[int, dict[str, Any], str | None, int]] = field(
+        default_factory=list
+    )
 
     def propose(
         self,
@@ -59,10 +64,13 @@ class FakeCritic:
         last_failure_mode: str | None = None,
         last_metric_summary: Mapping[str, float] | None = None,
         last_timeline_summary: Mapping[str, Any] | None = None,
+        bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
     ) -> CriticOutput:
         del schema, last_failure_mode, last_metric_summary, last_timeline_summary
-        self.calls.append((len(history), dict(current_knobs), preflight_feedback))
+        self.calls.append(
+            (len(history), dict(current_knobs), preflight_feedback, len(bitter_lessons))
+        )
         if not self.outputs:
             raise CriticError("FakeCritic.outputs exhausted")
         return self.outputs.pop(0)
@@ -84,6 +92,16 @@ class FakeCritic:
         return cls(outputs=outputs)
 
     @classmethod
+    def from_outputs(cls, *outputs: CriticOutput) -> FakeCritic:
+        """Build a :class:`FakeCritic` from fully-formed outputs.
+
+        Prefer this when tests need to attach ``bitter_lesson`` payloads
+        or bespoke ``rationale`` shapes; :meth:`from_deltas` covers the
+        common placement-free / no-lesson case.
+        """
+        return cls(outputs=list(outputs))
+
+    @classmethod
     def stop_after(cls, *deltas: Mapping[str, Any]) -> FakeCritic:
         """Like :meth:`from_deltas`, but the final response sets
         ``stop_requested=True`` so the scheduler terminates after applying it.
@@ -103,3 +121,18 @@ class FakeCritic:
                 stop_requested=True,
             )
         return cls(outputs=outputs)
+
+
+def make_output_with_lesson(
+    delta: Mapping[str, Any],
+    *,
+    trigger: str,
+    rule: str,
+    summary: str = "fake critic deterministic delta",
+) -> CriticOutput:
+    """Convenience for tests that need an output carrying a ``bitter_lesson``."""
+    return CriticOutput(
+        delta=dict(delta),
+        rationale=Rationale(summary=summary),
+        bitter_lesson=ProposedLesson(trigger=trigger, rule=rule),
+    )

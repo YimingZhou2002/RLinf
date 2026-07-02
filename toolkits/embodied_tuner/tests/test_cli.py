@@ -242,7 +242,7 @@ def test_emit_best_artefacts_writes_yaml_and_json(tmp_path: Path) -> None:
     assert payload == {
         "objective": 18.5,
         "denominator_source": "num_trajectories (final MetricTable block)",
-        "step_range_used": "steps 2..3 (step 1 warmup)",
+        "step_range_used": "steps 1..3 (all blocks averaged)",
         "exclusion_reasons": [],
         "source_trial_idx": 2,
     }

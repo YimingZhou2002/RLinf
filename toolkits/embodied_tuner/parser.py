@@ -40,11 +40,11 @@ Outputs:
   per-step values, the timeline summary the critic prompt consumes
   (AC-7), and an optional ``peak_gpu_mem`` field (best-effort metadata).
 
-The objective is computed as ``mean(step_time[1:N]) / num_trajectories``
-where step indices are 0-based: step 0 (the first ``Global Step: 1/N``
-block) is dropped as warmup, the remainder is averaged, and
-``num_trajectories`` is taken from the FINAL MetricTable block — exactly
-the rule documented under AC-6 in the plan.
+The objective is computed as ``mean(step_time[0:N]) / num_trajectories``:
+every parsed MetricTable block contributes to the averaged step_time
+(including the first / ``Global Step: 1/N`` block), and
+``num_trajectories`` is taken from the FINAL MetricTable block. A trial
+with a single step is measurable — its lone step_time is used directly.
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ class TrialResult:
     status: Status
     failure_mode: FailureMode
     reason: str = ""
-    step_time_seconds: float | None = None  # averaged across steps 2..N
+    step_time_seconds: float | None = None  # averaged across all MetricTable blocks
     num_trajectories: int | None = None  # from the FINAL MetricTable block
     objective: float | None = None
     per_step: tuple[MetricStep, ...] = ()
@@ -344,7 +344,7 @@ def parse_trial(
             per_step=(),
         )
 
-    # Compute objective with warmup exclusion.
+    # Compute objective across all parsed MetricTable blocks.
     objective, avg_step_time, partial_reason = compute_objective(per_step)
     final_num_traj = per_step[-1].num_trajectories
 
@@ -549,19 +549,18 @@ def compute_objective(
     """Return ``(objective, avg_step_time_seconds, partial_reason)``.
 
     ``objective`` is ``avg_step_time / num_trajectories`` where the
-    average excludes step 1 (warmup). When fewer than 2 successful steps
-    exist, or ``num_trajectories`` is missing on the final block, the
-    objective is ``None`` and ``partial_reason`` explains why.
+    average is taken over every parsed MetricTable block (the first
+    block is not treated as warmup). When ``per_step`` is empty, or no
+    block reports ``step_time``, or ``num_trajectories`` is missing /
+    non-positive on the final block, the objective is ``None`` and
+    ``partial_reason`` explains why.
     """
-    if len(per_step) < 2:
-        return None, None, (
-            "fewer than 2 MetricTable blocks: warmup exclusion leaves zero data points"
-        )
-    tail = per_step[1:]
-    tail_times = [s.step_time_seconds for s in tail if s.step_time_seconds is not None]
-    if not tail_times:
-        return None, None, "no step_time values parsed from MetricTable blocks 2..N"
-    avg_step_time = sum(tail_times) / len(tail_times)
+    if not per_step:
+        return None, None, "no MetricTable blocks parsed"
+    times = [s.step_time_seconds for s in per_step if s.step_time_seconds is not None]
+    if not times:
+        return None, None, "no step_time values parsed from MetricTable blocks"
+    avg_step_time = sum(times) / len(times)
     final_num_traj = per_step[-1].num_trajectories
     if final_num_traj is None:
         return None, avg_step_time, (

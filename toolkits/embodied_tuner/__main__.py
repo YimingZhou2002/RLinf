@@ -162,7 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-epochs",
         type=int,
         default=3,
-        help="runner.max_epochs Hydra override per trial (default 3; step 1 used as warmup).",
+        help="runner.max_epochs Hydra override per trial (default 3; every step contributes to the averaged objective).",
     )
     memory_group = parser.add_mutually_exclusive_group()
     memory_group.add_argument(
@@ -587,7 +587,7 @@ def _emit_best_artefacts(campaign: CampaignResult, args: CLIArgs) -> None:
                 {
                     "objective": None,
                     "denominator_source": "num_trajectories (final MetricTable block)",
-                    "step_range_used": "steps 2..N (step 1 warmup)",
+                    "step_range_used": "steps 1..N (all blocks averaged)",
                     "exclusion_reasons": [
                         f"stop_reason={campaign.stop_reason}",
                         "no (OK, NONE) trial produced",
@@ -619,7 +619,7 @@ def _emit_best_artefacts(campaign: CampaignResult, args: CLIArgs) -> None:
             {
                 "objective": best.objective,
                 "denominator_source": "num_trajectories (final MetricTable block)",
-                "step_range_used": f"steps 2..{args.max_epochs} (step 1 warmup)",
+                "step_range_used": f"steps 1..{args.max_epochs} (all blocks averaged)",
                 "exclusion_reasons": [],
                 "source_trial_idx": best.trial_idx,
             },

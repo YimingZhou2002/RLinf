@@ -57,8 +57,9 @@ provide. We need a **cold-start auto-tuner** that:
   `/proc/<pid>/environ` for orphan workers tagged with a
   campaign-unique trial id.
 - A **log + timeline parser** classifies each trial with
-  `(Status, FailureMode)`, computes the objective with warmup
-  exclusion, and surfaces a per-component timeline summary the next
+  `(Status, FailureMode)`, computes the objective by averaging
+  `step_time` across every MetricTable block (single-step trials are
+  measurable), and surfaces a per-component timeline summary the next
   critic prompt consumes.
 - An **append-only JSONL ledger** persists every trial, including the
   structured `critic_rationale` payload — the **audit trail** that lets
@@ -352,8 +353,10 @@ dataclasses for clarity and immutability.
   - `stderr_path` defaults to `log_dir/run_embodiment.log` — the
     runner's merged stdout+stderr file — so callers don't have to
     remember to pass it.
-  - Objective averaging: drop step 1 as warmup; average step_time
-    across steps 2..N. With `--max-epochs=3` this is steps 2 and 3.
+  - Objective averaging: average `step_time` across every parsed
+    MetricTable block. Single-step trials are measurable (their lone
+    `step_time` is used directly); with `--max-epochs=3` all three
+    blocks are averaged.
   - `num_trajectories` comes from the **final** MetricTable block (no
     silent fallback denominator).
   - `select_best` requires `(OK, NONE)` strictly — `(OK,
@@ -758,8 +761,9 @@ Run with: `cd <RLinf root>; PYTHONPATH=. python -m pytest toolkits/embodied_tune
   go AFTER this baseline injection so Hydra precedence honours them.
 - `EmbodiedRunner.num_steps_per_epoch = 1` in
   `rlinf/runners/embodied_runner.py`, so `max_epochs=N` yields N
-  global steps. The `--max-epochs=3` default + warmup drop exists
-  because of this.
+  global steps. The `--max-epochs=3` default exists because of this;
+  parser averages `step_time` across all N blocks (single-step trials
+  are still measurable).
 - `profiler/enable2.sh` leaves `RLINF_NVITOP=1` / `RLINF_NVML=1`
   commented out by default. The tuner's runner sets them
   unconditionally so memory telemetry is present.

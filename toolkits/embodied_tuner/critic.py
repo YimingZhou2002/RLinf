@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from toolkits.embodied_tuner.lessons import BitterLesson
 from toolkits.embodied_tuner.schema import (
     KNOB_PLACEMENT,
     KnobSchema,
@@ -117,11 +118,24 @@ _RATIONALE_SCHEMA_DOC = (
     '    "metric_table_citations": ["<key=value snippet>", ...],\n'
     '    "timeline_citations": ["<component rank tag observation>", ...]\n'
     '  },\n'
-    '  "stop_requested": false\n'
+    '  "stop_requested": false,\n'
+    '  "bitter_lesson": {                       // required after any failed trial\n'
+    '    "trigger": "<one line describing what the failed trial did and how it failed>",\n'
+    '    "rule": "<durable directive for future rounds — what to avoid or require>"\n'
+    '  }\n'
     '}\n'
-    "Rule: when `delta` contains `cluster.component_placement`, both citation\n"
-    "arrays MUST contain at least one non-empty entry. The wrapper rejects\n"
-    "outputs that violate this rule and retries.\n"
+    "Rule (dual-source): when `delta` contains `cluster.component_placement`, both\n"
+    "citation arrays MUST contain at least one non-empty entry.\n"
+    "\n"
+    "Rule (bitter lesson): when the previous trial's failure_mode is one of\n"
+    "OOM, WORKER_CRASH, TIMEOUT, or CONFIG_INVALID, the response MUST include a\n"
+    "non-empty `bitter_lesson.trigger` and `bitter_lesson.rule`. The scheduler\n"
+    "persists it under `<ledger_dir>/bitter_lessons.jsonl` and prepends every\n"
+    "future prompt with the accumulated lessons so the same failing delta is\n"
+    "not re-proposed. Omit the field on a successful follow-up unless the trial\n"
+    "revealed a durable constraint worth persisting.\n"
+    "\n"
+    "The wrapper rejects outputs that violate either rule and retries.\n"
 )
 
 
@@ -151,12 +165,31 @@ class Rationale:
 
 
 @dataclass(frozen=True)
+class ProposedLesson:
+    """The critic's raw ``bitter_lesson`` payload before scheduler enrichment.
+
+    The critic writes ``trigger`` and ``rule`` only. The scheduler
+    attaches ``trial_idx``, ``failure_mode`` and ``delta_signature``
+    from the actual failed trial before handing the resulting
+    :class:`~toolkits.embodied_tuner.lessons.BitterLesson` to the
+    :class:`~toolkits.embodied_tuner.lessons.LessonBook`.
+    """
+
+    trigger: str
+    rule: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"trigger": self.trigger, "rule": self.rule}
+
+
+@dataclass(frozen=True)
 class CriticOutput:
     """The critic's structured proposal."""
 
     delta: Mapping[str, Any]
     rationale: Rationale
     stop_requested: bool = False
+    bitter_lesson: ProposedLesson | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +214,7 @@ class CriticPrompt:
     rubric: str = field(default_factory=_load_rubric)
     wiki_block: str = field(default_factory=_load_wiki_context)
     schema_doc: str = _RATIONALE_SCHEMA_DOC
+    bitter_lessons_block: str = ""  # permanent, cross-window failure memory
     history_block: str = "## Trial History\n(none — first round)\n"
     current_knobs_block: str = ""
     constraints_block: str = ""
@@ -193,6 +227,7 @@ class CriticPrompt:
         sections = [
             self.rubric,
             self.wiki_block,
+            self.bitter_lessons_block,
             self.history_block,
             self.current_knobs_block,
             self.constraints_block,
@@ -213,9 +248,12 @@ class CriticPrompt:
         per-GPU bubble, outliers, raw JSONL excerpts). Keeps the
         compact ``metric_summary_block`` because a debugger reading
         the round's decision without those keys is missing the
-        primary signal the critic saw.
+        primary signal the critic saw, and keeps
+        ``bitter_lessons_block`` because it is the permanent memory
+        the critic acts on.
         """
         sections = [
+            self.bitter_lessons_block,
             self.history_block,
             self.current_knobs_block,
             self.memory_pressure_block,
@@ -247,6 +285,7 @@ def build_prompt(
     last_failure_mode: str | None,
     last_metric_summary: Mapping[str, float] | None,
     last_timeline_summary: Mapping[str, Any] | None,
+    bitter_lessons: Sequence[BitterLesson] = (),
     feedback: str | None = None,
     preflight_feedback: str | None = None,
 ) -> CriticPrompt:
@@ -256,11 +295,16 @@ def build_prompt(
         history: Last K trials (caller decides K; AC-7 default is 8).
         current_knobs: Current value of every tunable knob.
         schema: Knob schema; used to render the legal-range block.
-        last_failure_mode: ``"OOM"`` triggers the memory-pressure flag.
+        last_failure_mode: ``"OOM"`` triggers the memory-pressure flag,
+            and (together with WORKER_CRASH / TIMEOUT / CONFIG_INVALID)
+            switches on the mandatory ``bitter_lesson`` output rule.
         last_metric_summary: ``MetricStep.time_keys`` from the last
             successful trial (``env/interact``, ``actor/run_training``, etc.).
         last_timeline_summary: ``TimelineSummary``-shaped dict (per-rank
             stats + stall fractions) from the last successful trial.
+        bitter_lessons: Full campaign lessons from
+            :class:`~toolkits.embodied_tuner.lessons.LessonBook`, rendered
+            above the rolling history so they survive the ``history_window``.
         feedback: Optional retry feedback for invalid critic OUTPUT
             (malformed JSON or validator failure).
         preflight_feedback: Optional retry feedback for valid critic
@@ -278,6 +322,7 @@ def build_prompt(
             "Propose a different delta that does NOT violate the same constraints.\n"
         )
     return CriticPrompt(
+        bitter_lessons_block=_render_bitter_lessons(bitter_lessons),
         history_block=_render_history(history),
         current_knobs_block=_render_current_knobs(current_knobs, schema),
         constraints_block=_render_constraints(),
@@ -288,6 +333,28 @@ def build_prompt(
         timeline_verbose_block=_render_timeline_verbose(last_timeline_summary),
         feedback_block=combined_feedback,
     )
+
+
+def _render_bitter_lessons(lessons: Sequence[BitterLesson]) -> str:
+    if not lessons:
+        return ""
+    lines = [
+        "## Bitter Lessons (permanent — do NOT repeat these mistakes)",
+        (
+            "Each lesson was written by an earlier round of this campaign after a "
+            "failed trial. They persist beyond the rolling trial history window. "
+            "Treat every rule below as a hard constraint on the next delta unless "
+            "you can point to concrete evidence (metric or timeline citation) that "
+            "the memory / feasibility envelope has changed since the failure."
+        ),
+    ]
+    for lesson in lessons:
+        lines.append(
+            f"- [trial {lesson.trial_idx}, {lesson.failure_mode}] "
+            f"trigger: {lesson.trigger}"
+        )
+        lines.append(f"    rule: {lesson.rule}")
+    return "\n".join(lines) + "\n"
 
 
 def _render_history(history: Sequence[TrialHistoryEntry]) -> str:
@@ -549,11 +616,47 @@ def parse_critic_output(text: str) -> CriticOutput:
             field_name="timeline_citations",
         ),
     )
+    bitter_lesson = _coerce_bitter_lesson(raw.get("bitter_lesson"))
     return CriticOutput(
         delta=dict(delta),
         rationale=rationale,
         stop_requested=bool(raw.get("stop_requested", False)),
+        bitter_lesson=bitter_lesson,
     )
+
+
+def _coerce_bitter_lesson(value: object) -> ProposedLesson | None:
+    """Validate an optional ``bitter_lesson`` object on a critic response.
+
+    Returns ``None`` when the field is absent, ``null``, or an empty
+    object. Raises :class:`CriticError` when the payload is malformed
+    (not a JSON object, or ``trigger`` / ``rule`` present but not a
+    string). Whether the field is REQUIRED for the current round is a
+    scheduler-level decision (see
+    :meth:`CriticOutputValidator.validate`); this helper only checks
+    shape.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise CriticError(
+            f"bitter_lesson must be a JSON object, got {type(value).__name__}"
+        )
+    if not value:
+        return None
+    trigger = value.get("trigger", "")
+    rule = value.get("rule", "")
+    if not isinstance(trigger, str):
+        raise CriticError(
+            f"bitter_lesson.trigger must be a string, got {type(trigger).__name__}"
+        )
+    if not isinstance(rule, str):
+        raise CriticError(
+            f"bitter_lesson.rule must be a string, got {type(rule).__name__}"
+        )
+    if not trigger.strip() and not rule.strip():
+        return None
+    return ProposedLesson(trigger=trigger, rule=rule)
 
 
 def _coerce_citation_list(value: object, *, field_name: str) -> tuple[str, ...]:
@@ -605,11 +708,17 @@ def _extract_json_candidate(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_LESSON_REQUIRED_FAILURE_MODES: frozenset[str] = frozenset(
+    {"OOM", "WORKER_CRASH", "TIMEOUT", "CONFIG_INVALID"}
+)
+
+
 @dataclass(frozen=True)
 class CriticOutputValidator:
     """Enforces the dual-source rationale rule and re-runs the knob schema."""
 
     schema: KnobSchema
+    last_failure_mode: str | None = None
 
     def validate(self, output: CriticOutput) -> ValidationResult:
         try:
@@ -639,7 +748,29 @@ class CriticOutputValidator:
                     ok=False,
                     reason="non-placement deltas require a non-empty rationale.summary",
                 )
+        if (
+            self.last_failure_mode in _LESSON_REQUIRED_FAILURE_MODES
+            and not _lesson_is_populated(output.bitter_lesson)
+            and not output.stop_requested
+        ):
+            return ValidationResult(
+                ok=False,
+                reason=(
+                    f"previous trial failed with failure_mode={self.last_failure_mode}; "
+                    "response must include a non-empty bitter_lesson.trigger AND "
+                    "bitter_lesson.rule so the failure is not forgotten after the "
+                    "history window rolls over"
+                ),
+            )
         return ValidationResult(ok=True)
+
+
+def _lesson_is_populated(lesson: ProposedLesson | None) -> bool:
+    return (
+        lesson is not None
+        and bool(lesson.trigger.strip())
+        and bool(lesson.rule.strip())
+    )
 
 
 def _has_non_empty(items: Sequence[str]) -> bool:
@@ -663,6 +794,7 @@ class Critic(Protocol):
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
     ) -> CriticOutput:
         ...
@@ -707,10 +839,13 @@ class CodexCritic:
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
     ) -> CriticOutput:
         active_schema = schema or self.schema
-        validator = CriticOutputValidator(active_schema)
+        validator = CriticOutputValidator(
+            schema=active_schema, last_failure_mode=last_failure_mode
+        )
         feedback: str | None = None
         last_error: str = ""
 
@@ -725,6 +860,7 @@ class CodexCritic:
                 last_failure_mode=last_failure_mode,
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
+                bitter_lessons=bitter_lessons,
                 feedback=feedback,
                 preflight_feedback=preflight_feedback,
             )

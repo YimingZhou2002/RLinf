@@ -59,7 +59,8 @@ PYTHONPATH=. python -m toolkits.embodied_tuner --config maniskill_ppo_openvla
 4. **Parser** reads `metrics.log` (the MetricTable) + `timeline/*.jsonl`
    (per-component events), classifies the trial with
    `(Status, FailureMode)`, computes the objective as
-   `step_time / num_trajectories` averaged over steps 2..N (step 1 = warmup),
+   `step_time / num_trajectories` averaged over every parsed MetricTable
+   block (single-step trials are measurable),
    and surfaces a per-component timeline summary the next critic prompt
    consumes.
 5. **Ledger** persists each trial as one JSONL line, including the structured
@@ -92,6 +93,47 @@ with the rejection reason as feedback.
 Non-placement deltas (e.g. `actor.micro_batch_size=64`, `env.train.enable_offload=true`)
 need only a non-empty `summary`; citations are optional.
 
+## Bitter lessons (persistent failure memory)
+
+The critic's rolling `history_window` (default 8) means a failed trial
+falls out of the prompt after 8 subsequent rounds. Without a longer-
+lived store the critic re-proposes the same failing delta again — the
+`maniskill_ppo_openvla` campaign hit the same `rollout.enable_offload=False`
+OOM three times for exactly this reason.
+
+Whenever the previous trial's `failure_mode` is one of `OOM`,
+`WORKER_CRASH`, `TIMEOUT`, or `CONFIG_INVALID`, the critic's response
+MUST include a `bitter_lesson` payload:
+
+```json
+{
+  "delta": {"actor.micro_batch_size": 20},
+  "rationale": {"summary": "..."},
+  "bitter_lesson": {
+    "trigger": "trial 2 OOMed immediately after rollout.enable_offload=False at total_num_envs=128",
+    "rule": "Do not disable rollout offload while total_num_envs >= 8 unless actor.micro_batch_size <= 20."
+  }
+}
+```
+
+The scheduler stamps the failed trial's `trial_idx`, `failure_mode` and
+canonical delta signature onto the lesson, deduplicates by
+`(failure_mode, delta_signature)`, and appends it to
+**`<ledger_dir>/bitter_lessons.jsonl`** with fsync-on-write. Every
+future critic prompt is prepended with a `## Bitter Lessons` section
+that lists the accumulated rules verbatim — permanent memory the LLM
+must respect unless it can cite concrete evidence that the memory or
+feasibility envelope has changed since the failure. The store is
+capped at `LessonBook.max_lessons` (default 30) via an LRU eviction
+that appends an audit marker line to the same file. A scheduler
+restart re-loads lessons from disk so a resumed campaign inherits its
+prior failures.
+
+`CriticOutputValidator` enforces the rule: a response after a failing
+trial that omits `bitter_lesson` (or leaves either field blank) is
+rejected and the critic retries with the reason as feedback, sharing
+the existing `max_retries` retry loop with dual-source violations.
+
 ## CLI flags
 
 | Flag                          | Default                                  | Purpose                                                                  |
@@ -104,7 +146,7 @@ need only a non-empty `summary`; citations are optional.
 | `--max-oom N`                 | `5`                                      | Stop when cumulative OOM count exceeds N.                                |
 | `--patience N`                | `3`                                      | Plateau window: stop when last N non-failed trials improved <`epsilon`.   |
 | `--epsilon FRAC`              | `0.02`                                   | Plateau improvement threshold (relative).                                |
-| `--max-epochs N`              | `3`                                      | Hydra override `runner.max_epochs=N`. Step 1 is dropped as warmup.       |
+| `--max-epochs N`              | `3`                                      | Hydra override `runner.max_epochs=N`. All steps contribute to the averaged objective.       |
 | `--collect-memory`            | on                                       | Export `RLINF_NVITOP=1`/`RLINF_NVML=1` per trial.                         |
 | `--no-collect-memory`         | —                                        | Skip the two memory-telemetry env vars.                                  |
 | `--no-profiler`               | off                                      | Skip all `RLINF_TIMELINE*` env vars. Resulting trials are flagged `(OK, METRICS_PARTIAL)` and ineligible for best-config selection. |
@@ -130,6 +172,9 @@ All written to `<ledger_dir>/`:
 - **`best_trial.json`** —
   `{objective, denominator_source, step_range_used, exclusion_reasons,
   source_trial_idx}`. Explains *why* the chosen trial won.
+- **`bitter_lessons.jsonl`** — append-only, deduplicated store of
+  `{trigger, rule, trial_idx, failure_mode, delta_signature}` records.
+  See "Bitter lessons" above.
 
 When no trial qualifies (`status=OK, failure_mode=NONE`), `best_trial.json`
 still gets written with `objective=null` and the campaign's stop reason in
@@ -197,9 +242,10 @@ preflight.py           compose_and_validate (Hydra compose + local divisibility 
 runner.py              TrialRunner.launch (subprocess + timeout + scoped cleanup + profiler env)
 parser.py              parse_trial → TrialResult; select_best; TimelineSummary
 ledger.py              Ledger.append/.load/.best — append-only JSONL with fsync
+lessons.py             LessonBook / BitterLesson — persistent failure memory
 scheduler.py           Scheduler.run → CampaignResult (orchestrates the loop)
 __main__.py            CLI entrypoint (python -m toolkits.embodied_tuner)
-tests/                 197 passing unit tests (Round 0..4)
+tests/                 unit tests
 ```
 
 The toolkit deliberately does **not** import `toolkits.auto_placement`

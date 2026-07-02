@@ -34,7 +34,7 @@ Component lanes in the current embodied stack:
 | `prefetch_train_bootstrap`   | env       | Startup cost. Ignore beyond step 1.                                                        |
 | `predict`                    | rollout   | One rollout forward pass. Sum over R ≈ per-step rollout cost.                              |
 | `generate`, `generate_one_epoch` | rollout | Wrapper timers, exclude by default.                                                       |
-| `recv_rollout_results`, `recv_rollout_trajectories` | actor | Waiting — high value here means actor is starved (rollout is slow or transfer stalled). |
+| `recv_rollout_results`, `recv_rollout_trajectories` | actor | Actor waiting for rollout/env data. Under **hybrid** (actor occupies all GPUs) ignore this value — the actor is simply idle while rollout and env interact on their own GPUs, so it is not "starved". Under **disaggregated**, a high value does indicate a starved actor (rollout slow or transfer stalled). |
 | `run_training`               | actor     | Full actor training step. Wrapper — excluded by default; per-phase tags below are truthful.|
 | `actor_forward`              | actor     | Model forward pass in training.                                                            |
 | `actor_policy_loss`          | actor     | Policy loss computation.                                                                   |

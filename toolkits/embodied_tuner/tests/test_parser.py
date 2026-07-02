@@ -133,23 +133,30 @@ def _make_steps(values: list[tuple[float, int | None]]) -> tuple[MetricStep, ...
     )
 
 
-def test_compute_objective_averages_steps_2_to_n() -> None:
+def test_compute_objective_averages_all_steps() -> None:
     steps = _make_steps([(360.0, 18), (200.0, 18), (210.0, 18)])
     obj, avg, reason = compute_objective(steps)
     assert reason is None
-    assert avg == pytest.approx(205.0)
-    assert obj == pytest.approx(205.0 / 18)
+    assert avg == pytest.approx((360.0 + 200.0 + 210.0) / 3)
+    assert obj == pytest.approx(avg / 18)
 
 
-def test_compute_objective_requires_at_least_2_steps() -> None:
+def test_compute_objective_accepts_single_step() -> None:
     obj, avg, reason = compute_objective(_make_steps([(360.0, 18)]))
-    assert obj is None and avg is None and "fewer than 2" in reason
+    assert reason is None
+    assert avg == pytest.approx(360.0)
+    assert obj == pytest.approx(360.0 / 18)
+
+
+def test_compute_objective_handles_empty_input() -> None:
+    obj, avg, reason = compute_objective(())
+    assert obj is None and avg is None and reason == "no MetricTable blocks parsed"
 
 
 def test_compute_objective_handles_missing_final_num_trajectories() -> None:
     obj, avg, reason = compute_objective(_make_steps([(360.0, 18), (200.0, None)]))
     assert obj is None
-    assert avg == pytest.approx(200.0)
+    assert avg == pytest.approx(280.0)
     assert "num_trajectories" in reason
 
 
@@ -212,13 +219,27 @@ def test_parse_trial_missing_metrics_log(tmp_path: Path) -> None:
     assert result.failure_mode is FailureMode.METRICS_MISSING
 
 
-def test_parse_trial_single_step_is_metrics_partial(tmp_path: Path) -> None:
+def test_parse_trial_single_step_computes_step_time(tmp_path: Path) -> None:
     _write_metrics_log(tmp_path / "metrics.log", [(1, 1, 360.0, 18)])
     result = parse_trial(tmp_path, returncode=0)
+    # timeline/ absent → METRICS_PARTIAL (objective is zeroed for
+    # best-config eligibility), but the single MetricTable block is
+    # measurable and step_time flows through.
     assert result.status is Status.OK
     assert result.failure_mode is FailureMode.METRICS_PARTIAL
+    assert result.step_time_seconds == pytest.approx(360.0)
     assert result.objective is None
-    assert "fewer than 2" in result.reason
+    assert "timeline" in result.reason
+
+
+def test_parse_trial_single_step_with_timeline_is_ok_none(tmp_path: Path) -> None:
+    _write_metrics_log(tmp_path / "metrics.log", [(1, 1, 360.0, 18)])
+    (tmp_path / "timeline").mkdir()
+    result = parse_trial(tmp_path, returncode=0)
+    assert result.status is Status.OK
+    assert result.failure_mode is FailureMode.NONE
+    assert result.step_time_seconds == pytest.approx(360.0)
+    assert result.objective == pytest.approx(360.0 / 18)
 
 
 def test_parse_trial_three_steps_with_timeline_is_ok_none(tmp_path: Path) -> None:
@@ -236,7 +257,7 @@ def test_parse_trial_three_steps_with_timeline_is_ok_none(tmp_path: Path) -> Non
     result = parse_trial(tmp_path, returncode=0)
     assert result.status is Status.OK
     assert result.failure_mode is FailureMode.NONE
-    assert result.objective == pytest.approx(205.0 / 18)
+    assert result.objective == pytest.approx((360.0 + 200.0 + 210.0) / 3 / 18)
     assert result.num_trajectories == 18
     assert result.timeline_summary is not None
 

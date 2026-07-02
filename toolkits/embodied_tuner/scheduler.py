@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import time as _time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,10 +45,16 @@ from toolkits.embodied_tuner.critic import (
     Critic,
     CriticError,
     CriticOutput,
+    ProposedLesson,
     Rationale,
     TrialHistoryEntry,
 )
 from toolkits.embodied_tuner.ledger import Ledger, LedgerEntry, make_entry
+from toolkits.embodied_tuner.lessons import (
+    BitterLesson,
+    LessonBook,
+    canonical_delta_signature,
+)
 from toolkits.embodied_tuner.parser import (
     FailureMode,
     Status,
@@ -157,6 +163,7 @@ class Scheduler:
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     baseline_knobs: dict[str, Any] = field(default_factory=dict)
     clock: Callable[[], float] = _time.monotonic
+    lesson_book: LessonBook | None = None
 
     # ----- Public API -----------------------------------------------------
 
@@ -171,6 +178,14 @@ class Scheduler:
         last_failure_mode: str | None = None
         last_metric_summary: Mapping[str, float] | None = None
         last_timeline_summary: Mapping[str, Any] | None = None
+        # Track the delta that produced last_failure_mode so a lesson
+        # emitted in the NEXT round can be attributed to the right
+        # trial and delta signature. Cleared once folded into a lesson.
+        last_failed_trial_idx: int | None = None
+        last_failed_delta: dict[str, Any] | None = None
+
+        lesson_book = self._resolve_lesson_book()
+        lessons: list[BitterLesson] = list(lesson_book.load())
 
         if self.budget.max_trials <= 0:
             return self._finish("no_trials_run", trial_idx, oom_count)
@@ -191,6 +206,7 @@ class Scheduler:
                     last_failure_mode=last_failure_mode,
                     last_metric_summary=last_metric_summary,
                     last_timeline_summary=last_timeline_summary,
+                    bitter_lessons=lessons,
                 )
             except CriticError as exc:
                 self._record_critic_failure(trial_idx, str(exc), start)
@@ -201,6 +217,31 @@ class Scheduler:
             # and returned for this round. Best-effort; a failure here
             # must not abort the trial loop.
             self._persist_critic_transactions(preflight_outcome.log_dir)
+
+            # Fold any proposed bitter_lesson into the persistent book
+            # BEFORE we run the new trial: the lesson describes the
+            # PREVIOUS failure, so waiting until after this trial would
+            # delay its influence by one extra round.
+            if (
+                critic_output.bitter_lesson is not None
+                and last_failed_trial_idx is not None
+                and last_failed_delta is not None
+                and last_failure_mode is not None
+            ):
+                inserted = self._record_bitter_lesson(
+                    lesson_book=lesson_book,
+                    lessons=lessons,
+                    proposed=critic_output.bitter_lesson,
+                    trial_idx=last_failed_trial_idx,
+                    failure_mode=last_failure_mode,
+                    delta=last_failed_delta,
+                )
+                if inserted:
+                    # A single failure yields one lesson at most; clear
+                    # the pointer so a re-emission on a later round
+                    # does not double-count.
+                    last_failed_trial_idx = None
+                    last_failed_delta = None
 
             if critic_output.stop_requested:
                 consecutive_stop_requests += 1
@@ -257,6 +298,12 @@ class Scheduler:
             last_failure_mode = entry.failure_mode
             last_metric_summary = entry.per_component_timings
             last_timeline_summary = entry.timeline_summary
+            if entry.failure_mode != FailureMode.NONE.value:
+                last_failed_trial_idx = entry.trial_idx
+                last_failed_delta = dict(entry.delta)
+            else:
+                last_failed_trial_idx = None
+                last_failed_delta = None
 
             # 5. Stopping-rule checks that depend on freshly written history.
             if self._is_plateaued(history):
@@ -272,6 +319,7 @@ class Scheduler:
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        bitter_lessons: Sequence[BitterLesson] = (),
     ) -> tuple[CriticOutput, PreflightOutcome]:
         """Ask the critic, run preflight, retry on preflight failures.
 
@@ -294,6 +342,7 @@ class Scheduler:
                 last_failure_mode=last_failure_mode,
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
+                bitter_lessons=bitter_lessons,
                 preflight_feedback=preflight_feedback,
             )
             if critic_output.stop_requested:
@@ -519,6 +568,57 @@ class Scheduler:
         merged = dict(knobs)
         merged.update(delta)
         return merged
+
+    def _resolve_lesson_book(self) -> LessonBook:
+        """Return the campaign :class:`LessonBook`, defaulting alongside the ledger.
+
+        Persistence lives next to ``tuner_ledger.jsonl`` (i.e. the ledger
+        directory the CLI writes into) so an operator can inspect
+        ``<ledger_dir>/bitter_lessons.jsonl`` without hunting for it.
+        """
+        if self.lesson_book is not None:
+            return self.lesson_book
+        book = LessonBook(path=self.ledger.path.parent / "bitter_lessons.jsonl")
+        self.lesson_book = book
+        return book
+
+    def _record_bitter_lesson(
+        self,
+        *,
+        lesson_book: LessonBook,
+        lessons: list[BitterLesson],
+        proposed: ProposedLesson,
+        trial_idx: int,
+        failure_mode: str,
+        delta: Mapping[str, Any],
+    ) -> bool:
+        """Attach scheduler-owned attribution to a critic-proposed lesson.
+
+        The critic emits ``trigger`` and ``rule``; the scheduler stamps
+        the actual failed trial's index, failure mode, and delta
+        signature before handing the assembled :class:`BitterLesson` to
+        :meth:`LessonBook.add`. Returns whether a new lesson was
+        persisted (``False`` when the delta signature had already been
+        recorded under the same failure mode).
+        """
+        lesson = BitterLesson(
+            trigger=proposed.trigger.strip(),
+            rule=proposed.rule.strip(),
+            trial_idx=trial_idx,
+            failure_mode=failure_mode,
+            delta_signature=canonical_delta_signature(delta),
+        )
+        if not lesson.trigger or not lesson.rule:
+            return False
+        inserted = lesson_book.add(lesson)
+        if inserted:
+            lessons.append(lesson)
+            # LessonBook may have evicted the oldest entry to enforce
+            # the cap; re-sync the caller's in-memory copy from the
+            # authoritative store so the next prompt reflects that.
+            del lessons[:]
+            lessons.extend(lesson_book.all())
+        return inserted
 
     def _finish(self, reason: str, trial_count: int, oom_count: int) -> CampaignResult:
         return CampaignResult(

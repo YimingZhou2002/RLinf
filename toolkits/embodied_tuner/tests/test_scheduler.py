@@ -421,3 +421,168 @@ def test_critic_exhaustion_terminates_loop(tmp_path: Path) -> None:
     result = scheduler.run()
     assert result.stop_reason == "critic_failure"
     assert result.trial_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Bitter-lesson integration
+# ---------------------------------------------------------------------------
+
+
+def _output_with_lesson(delta, trigger, rule):
+    from toolkits.embodied_tuner.critic import ProposedLesson
+
+    return CriticOutput(
+        delta=dict(delta),
+        rationale=Rationale(summary="fake"),
+        bitter_lesson=ProposedLesson(trigger=trigger, rule=rule),
+    )
+
+
+def test_scheduler_records_lesson_after_oom(tmp_path: Path) -> None:
+    from toolkits.embodied_tuner.lessons import LessonBook, canonical_delta_signature
+
+    # Trial 0: OOM on rollout.enable_offload=False. Trial 1's response
+    # writes the lesson explaining what to avoid; trial 2 is a normal
+    # recovery move.
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[None, 50.0, 40.0],
+        failure_modes=[FailureMode.OOM, FailureMode.NONE, FailureMode.NONE],
+        statuses=[Status.FAILED, Status.OK, Status.OK],
+    )
+    critic = FakeCritic.from_outputs(
+        CriticOutput(delta={"rollout.enable_offload": False}, rationale=Rationale(summary="try")),
+        _output_with_lesson(
+            {"actor.micro_batch_size": 20},
+            trigger="trial 0 OOM after rollout.enable_offload=False",
+            rule="do not disable rollout offload while envs=8",
+        ),
+        CriticOutput(delta={"actor.micro_batch_size": 10}, rationale=Rationale(summary="ok")),
+    )
+    scheduler = factory.build(critic, BudgetConfig(max_trials=3, budget_seconds=999, max_oom=99))
+    scheduler.run()
+
+    # Lesson persisted alongside ledger.
+    book = LessonBook(path=tmp_path / "bitter_lessons.jsonl")
+    lessons = book.load()
+    assert len(lessons) == 1
+    assert lessons[0].trial_idx == 0
+    assert lessons[0].failure_mode == "OOM"
+    assert lessons[0].delta_signature == canonical_delta_signature(
+        {"rollout.enable_offload": False}
+    )
+    assert "rollout offload" in lessons[0].rule
+
+
+def test_scheduler_deduplicates_repeated_oom_lesson(tmp_path: Path) -> None:
+    from toolkits.embodied_tuner.lessons import LessonBook
+
+    # Same failing delta OOMs twice. The critic writes the same rule
+    # both times — but the book keeps only one entry.
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[None, None, None, 50.0],
+        failure_modes=[
+            FailureMode.OOM,
+            FailureMode.NONE,   # recovery
+            FailureMode.OOM,    # same delta again
+            FailureMode.NONE,   # recovery
+        ],
+        statuses=[Status.FAILED, Status.OK, Status.FAILED, Status.OK],
+    )
+    critic = FakeCritic.from_outputs(
+        CriticOutput(delta={"rollout.enable_offload": False}, rationale=Rationale(summary="try")),
+        _output_with_lesson({"actor.micro_batch_size": 20},
+                            trigger="OOM again", rule="avoid the offload flip"),
+        CriticOutput(delta={"rollout.enable_offload": False}, rationale=Rationale(summary="retry")),
+        _output_with_lesson({"actor.micro_batch_size": 10},
+                            trigger="OOM once more", rule="avoid the offload flip"),
+    )
+    scheduler = factory.build(critic, BudgetConfig(max_trials=4, budget_seconds=999, max_oom=99))
+    scheduler.run()
+
+    book = LessonBook(path=tmp_path / "bitter_lessons.jsonl")
+    assert len(book.load()) == 1
+
+
+def test_scheduler_passes_growing_lessons_to_critic(tmp_path: Path) -> None:
+    """After a lesson is recorded, it appears in the critic's bitter_lessons arg
+    on every subsequent propose() call — even past the history_window."""
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[None, 50.0, 40.0, 30.0],
+        failure_modes=[FailureMode.OOM] + [FailureMode.NONE] * 3,
+        statuses=[Status.FAILED] + [Status.OK] * 3,
+    )
+    critic = FakeCritic.from_outputs(
+        CriticOutput(delta={"rollout.enable_offload": False}, rationale=Rationale(summary="try")),
+        _output_with_lesson({"actor.micro_batch_size": 20},
+                            trigger="oom", rule="do not X"),
+        CriticOutput(delta={"actor.micro_batch_size": 10}, rationale=Rationale(summary="ok")),
+        CriticOutput(delta={"actor.micro_batch_size": 5}, rationale=Rationale(summary="ok")),
+    )
+    scheduler = factory.build(
+        critic,
+        BudgetConfig(max_trials=4, budget_seconds=999, max_oom=99, history_window=1),
+    )
+    scheduler.run()
+
+    # calls tuples: (history_len, knobs, preflight_feedback, lesson_count)
+    lesson_counts = [call[3] for call in critic.calls]
+    # Round 0: no lessons yet. Round 1: still none (critic is about to
+    # write one now). Round 2 and 3: one lesson each — persisting past
+    # history_window=1.
+    assert lesson_counts == [0, 0, 1, 1]
+
+
+def test_scheduler_recovers_lessons_from_disk_on_restart(tmp_path: Path) -> None:
+    from toolkits.embodied_tuner.lessons import LessonBook, BitterLesson, canonical_delta_signature
+
+    book = LessonBook(path=tmp_path / "bitter_lessons.jsonl")
+    book.add(
+        BitterLesson(
+            trigger="prior run OOM",
+            rule="do not flip rollout offload",
+            trial_idx=7,
+            failure_mode="OOM",
+            delta_signature=canonical_delta_signature({"rollout.enable_offload": False}),
+        )
+    )
+
+    # Fresh scheduler on the same ledger dir: it should see the prior
+    # lesson on the very first propose() call.
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[50.0],
+        failure_modes=[FailureMode.NONE],
+        statuses=[Status.OK],
+    )
+    critic = FakeCritic.from_deltas({"actor.micro_batch_size": 20})
+    scheduler = factory.build(critic, BudgetConfig(max_trials=1, budget_seconds=999, max_oom=99))
+    scheduler.run()
+
+    assert critic.calls[0][3] == 1  # one lesson visible on first prompt
+
+
+def test_scheduler_ignores_lesson_when_last_trial_was_ok(tmp_path: Path) -> None:
+    """A critic that emits a bitter_lesson after a successful trial
+    contributes nothing to the persistent store — there is no failure
+    to attribute it to."""
+    from toolkits.embodied_tuner.lessons import LessonBook
+
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[50.0, 40.0],
+        failure_modes=[FailureMode.NONE, FailureMode.NONE],
+        statuses=[Status.OK, Status.OK],
+    )
+    critic = FakeCritic.from_outputs(
+        CriticOutput(delta={"actor.micro_batch_size": 20}, rationale=Rationale(summary="ok")),
+        _output_with_lesson({"actor.micro_batch_size": 10},
+                            trigger="nothing failed", rule="ignore me"),
+    )
+    scheduler = factory.build(critic, BudgetConfig(max_trials=2, budget_seconds=999, max_oom=99))
+    scheduler.run()
+
+    book = LessonBook(path=tmp_path / "bitter_lessons.jsonl")
+    assert book.load() == ()

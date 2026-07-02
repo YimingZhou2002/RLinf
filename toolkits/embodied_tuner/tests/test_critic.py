@@ -25,12 +25,14 @@ from toolkits.embodied_tuner.critic import (
     CriticError,
     CriticOutput,
     CriticOutputValidator,
+    ProposedLesson,
     Rationale,
     TrialHistoryEntry,
     build_prompt,
     parse_critic_output,
 )
 from toolkits.embodied_tuner.fake_critic import FakeCritic
+from toolkits.embodied_tuner.lessons import BitterLesson, canonical_delta_signature
 from toolkits.embodied_tuner.schema import (
     KNOB_ACTOR_OFFLOAD,
     KNOB_GLOBAL_BATCH_SIZE,
@@ -669,3 +671,263 @@ def test_prompt_renders_raw_excerpts_as_jsonl() -> None:
     assert "raw timeline excerpts" in text
     # Each excerpt rendered as a JSON line the critic can cite verbatim
     assert '"qualname": "MSR.generate"' in text
+
+
+# ---------------------------------------------------------------------------
+# bitter_lesson: parse + validate + prompt rendering
+# ---------------------------------------------------------------------------
+
+
+def _make_lesson(idx: int = 3, mode: str = "OOM") -> BitterLesson:
+    return BitterLesson(
+        trigger=f"trial {idx} OOMed after rollout.enable_offload=False",
+        rule="do not disable rollout offload while total_num_envs >= 8",
+        trial_idx=idx,
+        failure_mode=mode,
+        delta_signature=canonical_delta_signature({"rollout.enable_offload": False}),
+    )
+
+
+def test_parse_critic_output_accepts_bitter_lesson() -> None:
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 20},
+            "rationale": {"summary": "shrink mbs"},
+            "bitter_lesson": {
+                "trigger": "trial 2 OOMed",
+                "rule": "avoid rollout.enable_offload=False under total_num_envs>=8",
+            },
+        }
+    )
+    out = parse_critic_output(text)
+    assert out.bitter_lesson is not None
+    assert out.bitter_lesson.trigger == "trial 2 OOMed"
+    assert "rollout.enable_offload" in out.bitter_lesson.rule
+
+
+def test_parse_critic_output_accepts_missing_bitter_lesson() -> None:
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 20},
+            "rationale": {"summary": "shrink mbs"},
+        }
+    )
+    assert parse_critic_output(text).bitter_lesson is None
+
+
+def test_parse_critic_output_treats_empty_bitter_lesson_as_absent() -> None:
+    text = json.dumps(
+        {
+            "delta": {"actor.micro_batch_size": 20},
+            "rationale": {"summary": "shrink mbs"},
+            "bitter_lesson": {"trigger": "", "rule": ""},
+        }
+    )
+    assert parse_critic_output(text).bitter_lesson is None
+
+
+def test_parse_critic_output_rejects_non_object_bitter_lesson() -> None:
+    text = json.dumps(
+        {
+            "delta": {"x": 1},
+            "rationale": {"summary": "s"},
+            "bitter_lesson": "not an object",
+        }
+    )
+    with pytest.raises(CriticError):
+        parse_critic_output(text)
+
+
+def test_parse_critic_output_rejects_non_string_lesson_fields() -> None:
+    text = json.dumps(
+        {
+            "delta": {"x": 1},
+            "rationale": {"summary": "s"},
+            "bitter_lesson": {"trigger": 42, "rule": "r"},
+        }
+    )
+    with pytest.raises(CriticError):
+        parse_critic_output(text)
+
+
+def test_validator_requires_lesson_after_oom() -> None:
+    schema = KnobSchema()
+    validator = CriticOutputValidator(schema=schema, last_failure_mode="OOM")
+    output = CriticOutput(
+        delta={"actor.micro_batch_size": 20},
+        rationale=Rationale(summary="ok"),
+    )
+    result = validator.validate(output)
+    assert result.ok is False
+    assert "bitter_lesson" in result.reason
+
+
+def test_validator_accepts_lesson_after_oom() -> None:
+    schema = KnobSchema()
+    validator = CriticOutputValidator(schema=schema, last_failure_mode="OOM")
+    output = CriticOutput(
+        delta={"actor.micro_batch_size": 20},
+        rationale=Rationale(summary="ok"),
+        bitter_lesson=ProposedLesson(
+            trigger="trial 2 OOMed", rule="avoid rollout offload disable"
+        ),
+    )
+    assert validator.validate(output).ok is True
+
+
+def test_validator_does_not_require_lesson_after_ok_trial() -> None:
+    schema = KnobSchema()
+    validator = CriticOutputValidator(schema=schema, last_failure_mode="NONE")
+    output = CriticOutput(
+        delta={"actor.micro_batch_size": 20},
+        rationale=Rationale(summary="ok"),
+    )
+    assert validator.validate(output).ok is True
+
+
+def test_validator_does_not_require_lesson_when_first_round() -> None:
+    schema = KnobSchema()
+    validator = CriticOutputValidator(schema=schema, last_failure_mode=None)
+    output = CriticOutput(
+        delta={"actor.micro_batch_size": 20},
+        rationale=Rationale(summary="ok"),
+    )
+    assert validator.validate(output).ok is True
+
+
+def test_validator_allows_stop_requested_without_lesson_after_failure() -> None:
+    """A critic that concedes the campaign is over shouldn't be blocked."""
+    schema = KnobSchema()
+    validator = CriticOutputValidator(schema=schema, last_failure_mode="OOM")
+    output = CriticOutput(
+        delta={},
+        rationale=Rationale(summary="no more moves"),
+        stop_requested=True,
+    )
+    assert validator.validate(output).ok is True
+
+
+def test_validator_rejects_lesson_with_blank_trigger() -> None:
+    schema = KnobSchema()
+    validator = CriticOutputValidator(schema=schema, last_failure_mode="OOM")
+    output = CriticOutput(
+        delta={"actor.micro_batch_size": 20},
+        rationale=Rationale(summary="ok"),
+        bitter_lesson=ProposedLesson(trigger="   ", rule="do not X"),
+    )
+    assert validator.validate(output).ok is False
+
+
+def test_validator_requires_lesson_for_config_invalid_failure() -> None:
+    schema = KnobSchema()
+    validator = CriticOutputValidator(
+        schema=schema, last_failure_mode="CONFIG_INVALID"
+    )
+    output = CriticOutput(
+        delta={"actor.micro_batch_size": 20},
+        rationale=Rationale(summary="ok"),
+    )
+    assert validator.validate(output).ok is False
+
+
+def test_build_prompt_renders_bitter_lessons_before_history() -> None:
+    schema = KnobSchema()
+    lessons = [_make_lesson(2), _make_lesson(6, mode="WORKER_CRASH")]
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        bitter_lessons=lessons,
+    )
+    text = str(prompt)
+    assert "Bitter Lessons" in text
+    assert "[trial 2, OOM]" in text
+    assert "[trial 6, WORKER_CRASH]" in text
+    # Lessons section should appear before trial history.
+    assert text.index("Bitter Lessons") < text.index("Trial History")
+
+
+def test_build_prompt_omits_bitter_lessons_block_when_empty() -> None:
+    schema = KnobSchema()
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        bitter_lessons=(),
+    )
+    assert "Bitter Lessons" not in str(prompt)
+
+
+def test_debug_text_includes_bitter_lessons_block() -> None:
+    schema = KnobSchema()
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        bitter_lessons=(_make_lesson(2),),
+    )
+    assert "Bitter Lessons" in prompt.to_debug_text()
+
+
+def test_codex_critic_retries_when_lesson_missing_after_failure() -> None:
+    """First response omits bitter_lesson after an OOM; validator rejects,
+    critic retries with feedback, second response includes it and is accepted."""
+    schema = KnobSchema()
+    responses = [
+        json.dumps(
+            {
+                "delta": {"actor.micro_batch_size": 20},
+                "rationale": {"summary": "shrink mbs"},
+            }
+        ),
+        json.dumps(
+            {
+                "delta": {"actor.micro_batch_size": 20},
+                "rationale": {"summary": "shrink mbs"},
+                "bitter_lesson": {
+                    "trigger": "trial 2 OOM after rollout.enable_offload=False",
+                    "rule": "do not disable rollout offload at total_num_envs>=8",
+                },
+            }
+        ),
+    ]
+    prompts_seen: list[str] = []
+
+    def transport(prompt: str) -> str:
+        prompts_seen.append(prompt)
+        return responses.pop(0)
+
+    critic = CodexCritic(schema=schema, transport=transport)
+    out = critic.propose(
+        history=[],
+        current_knobs={},
+        last_failure_mode="OOM",
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert out.bitter_lesson is not None
+    assert out.bitter_lesson.trigger.startswith("trial 2 OOM")
+    # Second prompt carries the retry feedback quoting the validator reason.
+    assert "bitter_lesson" in prompts_seen[1]
+
+
+def test_build_prompt_forwards_bitter_lessons_arg_default_is_empty() -> None:
+    schema = KnobSchema()
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert prompt.bitter_lessons_block == ""
