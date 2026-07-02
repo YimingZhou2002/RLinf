@@ -19,9 +19,9 @@ Two tiers:
 All line numbers below reference RLinf source at the current HEAD
 (`rlinf/config.py`, `rlinf/utils/placement.py`).
 
-## Tier 1 — Preflight-enforced (fail fast, no trial launched)
+## 04.1 Tier 1 — Preflight-enforced (fail fast, no trial launched)
 
-### 1.1 Knob schema (`schema.py`)
+## 04.1.1 Knob schema (`schema.py`)
 
 - Only knobs listed in `KnobSchema` may appear in `delta`. Others raise
   `UnknownKnobError`.
@@ -37,7 +37,7 @@ All line numbers below reference RLinf source at the current HEAD
 - Boolean knobs must be JSON `true` / `false`; the schema rejects
   strings or ints for booleans.
 
-### 1.2 Placement structure (`placement_enum.is_legal_placement`)
+## 04.1.2 Placement structure (`placement_enum.is_legal_placement`)
 
 - Every component GPU range must be **contiguous**. `[0, 1, 3]` is
   rejected. RLinf enforces this at `rlinf/utils/placement.py:138-143`.
@@ -48,7 +48,7 @@ All line numbers below reference RLinf source at the current HEAD
   embodied semantics).
 - No component may have an empty range.
 
-### 1.3 Divisibility (mirrors `rlinf/config.py`)
+## 04.1.3 Divisibility (mirrors `rlinf/config.py`)
 
 Preflight computes `env_world_size` = size of env GPU range,
 `actor_world_size` = size of actor GPU range from the composed
@@ -65,13 +65,13 @@ placement.
   moving `micro_batch_size` must land on a divisor of
   `global_batch_size / actor_world_size`.
 
-## Tier 2 — Runtime-enforced (crashes the trial if violated)
+## 04.2 Tier 2 — Runtime-enforced (crashes the trial if violated)
 
 Preflight does not (yet) mirror these. If the critic's delta touches a
 knob or placement affected by them, cite this section in the rationale
 so the delta stays inside the safe envelope.
 
-### 2.1 Additional divisibility (`validate_embodied_cfg`)
+## 04.2.1 Additional divisibility (`validate_embodied_cfg`)
 
 - **`(env.train.total_num_envs // env_world_size // pipeline_stage_num) > 0`**
   — line 968. Together with 1.3, per-rank per-stage env count must be
@@ -87,12 +87,12 @@ so the delta stays inside the safe envelope.
   training-side knobs must not accidentally invalidate the eval-side
   divisibility.
 
-### 2.2 Weight-sync interval (`validate_embodied_cfg`)
+## 04.2.2 Weight-sync interval (`validate_embodied_cfg`)
 
 - **`runner.weight_sync_interval > 0`** — line 988. Not a tunable knob;
   do not attempt to set it to `0`.
 
-### 2.3 Overlap-env-bootstrap gate (`validate_embodied_cfg`)
+## 04.2.3 Overlap-env-bootstrap gate (`validate_embodied_cfg`)
 
 - **`runner.overlap_env_bootstrap` is silently forced to `False` when
   `env.train.enable_offload=true`** — lines 994-996. Consequence: turning
@@ -100,7 +100,7 @@ so the delta stays inside the safe envelope.
   optimisation. Under hybrid this can widen the actor's serial gap.
   Do not enable env offload as a throughput knob.
 
-### 2.4 Placement runtime rules (`ModelParallelComponentPlacement`)
+## 04.2.4 Placement runtime rules (`ModelParallelComponentPlacement`)
 
 - All the contiguity checks preflight already runs (see 1.2) — cited
   at `rlinf/utils/placement.py:138-143`.
@@ -112,7 +112,7 @@ so the delta stays inside the safe envelope.
 - **`padded_vocab_size % actor_tp_size == 0`** (Megatron branch, line
   1353-1358). Not applicable to the FSDP-based embodied baselines.
 
-### 2.5 Placement mode discovery (`ModelParallelComponentPlacement._is_collocated` / `_is_disaggregated`)
+## 04.2.5 Placement mode discovery (`ModelParallelComponentPlacement._is_collocated` / `_is_disaggregated`)
 
 RLinf classifies every legal placement as EXACTLY one of collocated /
 disaggregated (with a hybrid third path only for embodied
@@ -122,7 +122,7 @@ already screens for the partial-overlap case; other unclassifiable
 patterns should not be reachable given the contiguity + full-equal-or-
 full-disjoint rules.
 
-### 2.6 Routing divisibility (`CommMapper.get_dst_ranks`)
+## 04.2.6 Routing divisibility (`CommMapper.get_dst_ranks`)
 
 When env workers send bootstrap / trajectory data to rollout workers,
 the routing layer (`rlinf/scheduler/worker/routing.py:139`) asserts:
@@ -154,7 +154,7 @@ the routing layer (`rlinf/scheduler/worker/routing.py:139`) asserts:
   non-divisor rollout count is desired, `total_num_envs` must be
   adjusted simultaneously so that the quotient is divisible.
 
-## Placement dictionary shape
+## 04.3 Placement dictionary shape
 
 Preflight reads `cluster.component_placement` as an OmegaConf DictConfig
 with keys `actor`, `env`, `rollout`. Each value is a range string
@@ -166,12 +166,12 @@ be a JSON object with exactly the same keys, e.g.
 Do **not** emit list-of-dicts placements or add extra components — the
 preflight parser rejects unknown types (`preflight._placement_to_str_map`).
 
-## Required checklists
+## 04.4 Required checklists
 
 Use the checklist matching every knob in the proposed delta. Substitute
 the **new** values after applying the delta, not the baseline values.
 
-### If delta touches `cluster.component_placement`
+## 04.4.1 If delta touches `cluster.component_placement`
 
 1. Parse `actor_world_size`, `env_world_size`, and
    `rollout_world_size` from the new ranges.
@@ -190,7 +190,7 @@ the **new** values after applying the delta, not the baseline values.
    `(total_num_envs // env_world_size) % rollout_world_size == 0` and
    `(total_num_envs // env_world_size) % actor_world_size == 0`.
 
-### If delta touches `env.train.total_num_envs`
+## 04.4.2 If delta touches `env.train.total_num_envs`
 
 1. Verify it is in `[1, 4096]`.
 2. Verify `total_num_envs % env_world_size == 0`.
@@ -204,7 +204,7 @@ the **new** values after applying the delta, not the baseline values.
    `(total_num_envs // env_world_size) % rollout_world_size == 0` and
    `(total_num_envs // env_world_size) % actor_world_size == 0`.
 
-### If delta touches `actor.micro_batch_size` or actor GPU count
+## 04.4.3 If delta touches `actor.micro_batch_size` or actor GPU count
 
 1. Verify `actor.micro_batch_size` is in `[1, 4096]`.
 2. Verify `actor.global_batch_size %
@@ -212,14 +212,14 @@ the **new** values after applying the delta, not the baseline values.
 3. If the actor GPU range shrinks, verify
    `actor.model.tensor_model_parallel_size <= actor_world_size`.
 
-### If delta touches `env.train.rollout_epoch`
+## 04.4.4 If delta touches `env.train.rollout_epoch`
 
 1. Verify `env.train.rollout_epoch` is in `[1, 16]`.
 2. Remember the optimisation objective is `step_time /
    num_trajectories`; changing rollout_epoch changes both numerator and
    denominator.
 
-### If delta enables any `*.enable_offload`
+## 04.4.5 If delta enables any `*.enable_offload`
 
 1. Use offload as a memory rescue knob, not a throughput knob.
 2. If enabling `env.train.enable_offload`, note that

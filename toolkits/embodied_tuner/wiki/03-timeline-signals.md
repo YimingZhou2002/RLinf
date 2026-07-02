@@ -5,7 +5,7 @@ by `parser.TimelineSummary`. This file explains what each signal means,
 so citations in `rationale.timeline_citations` translate to concrete
 remediations.
 
-## Files and lanes
+## 03.1 Files and lanes
 
 Every worker process writes one JSONL file:
 
@@ -24,7 +24,7 @@ Component lanes in the current embodied stack:
 - `actor` — FSDP actor training (forward, policy loss, backward,
   optimizer step) when `RLINF_TIMELINE_ACTOR_TRAINING=1`.
 
-## Tag reference (embodied)
+## 03.2 Tag reference (embodied)
 
 | Tag                          | Component | Interpretation                                                                              |
 |------------------------------|-----------|---------------------------------------------------------------------------------------------|
@@ -46,7 +46,7 @@ The plotter and worker-timer sidecar both exclude the wrapper tags by
 default. When the parser emits a `timeline_citations` recommendation, it
 means the tag was not wrapper-suppressed.
 
-## Derived statistics per tag
+## 03.3 Derived statistics per tag
 
 For each `(component, rank, tag)` triple the parser reports:
 
@@ -61,7 +61,7 @@ For each `(component, rank, tag)` triple the parser reports:
 - `count` — event count; sanity-check against `R` and the number of
   training steps.
 
-## Bottleneck decision tree
+## 03.4 Bottleneck decision tree
 
 1. **Ignore wrapper tags** (`interact`, `run_interact_once`, `generate`,
    `generate_one_epoch`, `run_training`, `recv_rollout_*`, `runner:run`)
@@ -82,7 +82,7 @@ For each `(component, rank, tag)` triple the parser reports:
    other two show `stall_fraction > 0` on their consumer-side tags
    (`recv_rollout_*` on actor, or the interact waits).
 
-## When timeline data is missing
+## 03.5 When timeline data is missing
 
 - `--no-profiler` disables all `RLINF_TIMELINE*` env vars and the trial
   is classified `(OK, METRICS_PARTIAL)`. It cannot win best-config.
@@ -95,7 +95,7 @@ For each `(component, rank, tag)` triple the parser reports:
   checking `stderr` / `run_embodiment.log` — this is usually a
   worker-crash or OOM masquerading as METRICS_PARTIAL.
 
-## Do not
+## 03.6 Do not
 
 - Do not cite wrapper tags as bottlenecks — they include wait time and
   will mislead the critic.

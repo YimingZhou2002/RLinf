@@ -27,7 +27,7 @@ The three components' contributions to a single training step are:
   step), interleaved with env chunks via channels.
 - **Actor training** — runs once per step, on the R accumulated chunks.
 
-## Runner mode matters
+## 01.1 Runner mode matters
 
 The runner exposes two loop shapes (see `rlinf/runners/embodied_runner.py`):
 
@@ -45,7 +45,7 @@ The runner exposes two loop shapes (see `rlinf/runners/embodied_runner.py`):
 The tuner does **not** currently flip `use_training_pipeline` — treat
 whatever the baseline sets as fixed.
 
-## 1. Collocated (all components share the same GPU set)
+## 01.2 Collocated (all components share the same GPU set)
 
 Every worker time-slices on the same GPUs, so nothing overlaps.
 
@@ -63,7 +63,7 @@ time on any rank. The lane sequence per step is
 Typical `component_placement`: `{actor: all, env: all, rollout: all}`
 or `{actor: 0-7, env: 0-7, rollout: 0-7}`.
 
-## 2. Hybrid — env and rollout on disjoint GPU subsets, actor spans both
+## 01.3 Hybrid — env and rollout on disjoint GPU subsets, actor spans both
 
 Canonical embodied hybrid: `actor: 0-7`, `env: 0-3`, `rollout: 4-7`. Env
 and rollout run on disjoint GPU subsets so they can execute concurrently
@@ -106,7 +106,7 @@ Timeline signature: on env ranks, `env_interact_step` bars overlap in
 wall time with `predict` bars on rollout ranks. Actor bars appear only
 after the R-th chunk completes on both subsets.
 
-## 3. Disaggregated — actor, env, rollout on three disjoint GPU subsets
+## 01.4 Disaggregated — actor, env, rollout on three disjoint GPU subsets
 
 Example: `actor: 0-3`, `env: 4-5`, `rollout: 6-7`. All three GPU sets
 are disjoint, so env, rollout, and actor **can** run concurrently.
@@ -139,7 +139,7 @@ all show overlapping bars in the same wall-time window. `stall_fraction`
 is the primary signal: whichever component has `stall_fraction ≈ 0` is
 the bottleneck; the other two show `stall_fraction > 0`.
 
-## Quick reference
+## 01.5 Quick reference
 
 | Placement                               | Critical path per step                    | What shrinking a non-bottleneck buys |
 |-----------------------------------------|-------------------------------------------|--------------------------------------|
@@ -148,7 +148,7 @@ the bottleneck; the other two show `stall_fraction > 0`.
 | Disaggregated + `run`                   | `T_sync + R*max(T_env,T_rol) + T_act`     | zero for the shorter of env / rol; actor GPUs also idle during interact |
 | Disaggregated + `run_pipeline`          | `T_sync + max(R*T_env, R*T_rol, T_act)`   | zero for non-max components          |
 
-## Anti-patterns
+## 01.6 Anti-patterns
 
 - Proposing `env.train.enable_offload=true` when the timeline shows
   env is already the fastest of the three under hybrid — this trades

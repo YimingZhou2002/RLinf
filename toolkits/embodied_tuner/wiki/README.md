@@ -1,4 +1,4 @@
-# Tuner wiki — ordered optimization context for the critic
+# README.0 Tuner wiki — ordered optimization context for the critic
 
 This directory holds natural-language context the LLM critic can cite when
 proposing knob deltas. It complements the mechanical inputs the critic
@@ -13,7 +13,7 @@ trial history) with:
 3. **A signal-to-conclusion decoder** for timeline events — which tag
    means what, and which tags are noisy wrappers to be ignored.
 
-## Read order
+## README.1 Read order
 
 The critic reads the numbered files below as one wiki block in ascending
 order. Keep cross-references consistent with this order; do not assume a
@@ -35,7 +35,7 @@ later document has already been read.
   runtime-enforced (crashes the trial). Consult before proposing any
   delta that touches divisibility-sensitive knobs or placement.
 
-## For the critic prompt builder
+## README.2 For the critic prompt builder
 
 Every file is intended to be consumed **verbatim** by
 `critic.build_prompt`. Keep them short, declarative, and free of

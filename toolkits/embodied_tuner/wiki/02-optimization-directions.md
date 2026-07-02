@@ -10,7 +10,7 @@ into reducing the per-trajectory time of each component on the critical
 path (`T_env / traj`, `T_rol / traj`, `T_act / traj`), which in turn
 decomposes into the sub-tasks each knob targets.
 
-## `cluster.component_placement`
+## 02.1 `cluster.component_placement`
 
 - **What it moves:** reshapes the critical path itself.
 - **When to touch:**
@@ -26,7 +26,7 @@ decomposes into the sub-tasks each knob targets.
 - **Dual-source rationale required** (see the README): any placement
   delta must cite one MetricTable line AND one timeline observation.
 
-## `env.train.total_num_envs`
+## 02.2 `env.train.total_num_envs`
 
 - **What it moves:** batches env stepping and changes both `step_time`
   and `num_trajectories`. Larger usually increases raw `T_env` and GPU
@@ -50,7 +50,7 @@ decomposes into the sub-tasks each knob targets.
   or memory approaches the cap. Prefer the move whose expected
   `step_time / num_trajectories` is lower.
 
-## `env.train.rollout_epoch` (denoted `R` above)
+## 02.3 `env.train.rollout_epoch` (denoted `R` above)
 
 - **What it moves:** changes the number of interact chunks and collected
   trajectories per training step. `step_time` contains an `R * ...`
@@ -73,7 +73,7 @@ decomposes into the sub-tasks each knob targets.
   unless trial history, p90/median, KV-cache pressure, or memory curves
   support it. Optimise the normalised objective, not raw `step_time`.
 
-## `actor.micro_batch_size`
+## 02.4 `actor.micro_batch_size`
 
 - **What it moves:** memory footprint of one actor forward+backward pass,
   and the number of micro-batches per `global_batch_size`.
@@ -103,7 +103,7 @@ decomposes into the sub-tasks each knob targets.
   prefer increasing mbs for actor-bound throughput and decreasing it for
   actor OOM / high memory.
 
-## `env.train.enable_offload`
+## 02.5 `env.train.enable_offload`
 
 - **What it moves:** moves env-side state between GPU and CPU/host
   between phases. Cuts env GPU memory at the cost of extra transfer
@@ -114,7 +114,7 @@ decomposes into the sub-tasks each knob targets.
 - **When to disable:** env is the critical-path bottleneck; the offload
   overhead widens `T_env` and worsens the objective.
 
-## `rollout.enable_offload`
+## 02.6 `rollout.enable_offload`
 
 - **What it moves:** symmetric to env offload but for rollout weights and
   KV cache. Rollout offload is expensive in wall time (moves a large
@@ -125,7 +125,7 @@ decomposes into the sub-tasks each knob targets.
 - **When to disable:** rollout is bottleneck and enough memory exists to
   keep the model resident.
 
-## `actor.enable_offload`
+## 02.7 `actor.enable_offload`
 
 - **What it moves:** offloads actor optimiser state / weights between
   training steps. Big memory saving, big wall-time cost.
@@ -134,7 +134,7 @@ decomposes into the sub-tasks each knob targets.
   large downward-then-upward memory swings around each `run_training`
   call, which is the offload signature.
 
-## Pinned in this loop (FUT-5)
+## 02.8 Pinned in this loop (FUT-5)
 
 These are declared in the schema but rejected by the validator with
 `KnobNotTunableError`. Do not propose them:
@@ -143,7 +143,7 @@ These are declared in the schema but rejected by the validator with
 - `rollout.pipeline_stage_num`
 - `actor.model.num_action_chunks`
 
-## Cross-knob patterns
+## 02.9 Cross-knob patterns
 
 - **Memory-triage cascade** on repeated OOM: `micro_batch_size` down →
   `total_num_envs` down → `enable_offload` on the OOM component. Prefer

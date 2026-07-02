@@ -12,20 +12,39 @@ definitions and edge cases appear later in `01 placement-critical-paths`,
 `02 optimization-directions`, `03 timeline-signals`, and
 `04 constraints`.
 
-## Step 0 — Identify the runner mode and current placement
+## 00.1 Identify the runner mode and current placement
 
 The critical-path formula changes between `run` (default) and
 `run_pipeline`, and between collocated / hybrid / disaggregated. The
 prompt's current knobs section shows `cluster.component_placement`
-directly. Runner mode is fixed by the baseline (`runner.use_training_pipeline`)
+directly.
+
+Runner mode is fixed by the baseline (`runner.use_training_pipeline`)
 and is NOT a tunable knob in this loop.
+
+Placement mode semantics (each mode uses **all** GPUs — the difference is
+how the three components share them):
+
+- **collocated**: env, rollout, and actor all occupy every GPU and
+  time-share the hardware. No two components run at the same time; the
+  three phases execute serially per rollout step.
+- **hybrid**: env and rollout are split onto disjoint GPU shards (their
+  shards together cover all GPUs) and run in parallel (pipeline) during
+  interact; the actor is collocated with one side (typically rollout)
+  and blocks while interact runs, then reclaims those GPUs for training.
+- **disaggregated**: env, rollout, and actor each own a disjoint GPU
+  shard (the three shards together cover all GPUs). With `run_pipeline`
+  all three run concurrently; with plain `run` the actor shard sits idle
+  during interact.
+
+Resulting critical-path formulas:
 
 - `run` + collocated:   `T_sync + R*(T_env + T_rol) + T_act`
 - `run` + hybrid:       `T_sync + R*max(T_env, T_rol) + T_act`
 - `run` + disaggregated:`T_sync + R*max(T_env, T_rol) + T_act`   (actor GPUs idle during interact — usually worse than hybrid)
 - `run_pipeline` + disaggregated: `T_sync + max(R*T_env, R*T_rol, T_act)`
 
-## Step 1 — Locate the bottleneck term
+## 00.2 Locate the bottleneck term
 
 Read in this order:
 
@@ -64,7 +83,7 @@ Read in this order:
    whenever the delta touches `cluster.component_placement` (dual-source
    rule).
 
-## Step 2 — Confirm the delta will move the critical-path term
+## 00.3 Confirm the delta will move the critical-path term
 
 Before proposing a knob, check that its target term is on the current
 critical path.
@@ -81,7 +100,7 @@ critical path.
 - Under collocated: every term contributes additively, so any shrink
   helps. Rank by magnitude and pick the largest.
 
-## Step 3 — Choose the knob
+## 00.4 Choose the knob
 
 Consult [`02-optimization-directions.md`](02-optimization-directions.md) for
 knob-by-knob effects. Summary of first-line moves:
@@ -111,7 +130,7 @@ Rules of thumb:
   because both are the response to the same OOM). Multi-knob deltas
   make the ledger harder to interpret and slow convergence.
 
-## Step 4 — Justify the delta with dual sources when placement moves
+## 00.5 Justify the delta with dual sources when placement moves
 
 When `delta` contains `cluster.component_placement`:
 
@@ -127,7 +146,7 @@ For non-placement deltas, only `rationale.summary` is required — but
 the summary should still name the specific term you are moving and
 where you read it.
 
-## What not to do
+## 00.6 What not to do
 
 - Do not cite `actor/recv_traj` as evidence of actor being slow. It is a
   wait on the interact loop; its duration is the env-rollout cost.
