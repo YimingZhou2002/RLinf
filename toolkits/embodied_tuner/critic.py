@@ -59,25 +59,23 @@ from toolkits.embodied_tuner.schema import (
 
 
 # --------------------------------------------------------------------------
-# Wiki loader — the bottleneck rubric and placement / optimization /
-# timeline context live in ``wiki/*.md`` alongside this module, NOT as
-# inline string constants. Editing markdown does not require touching
-# Python, and the same files are used as human documentation.
+# Wiki loader — optimization context lives in numbered ``wiki/*.md`` files
+# alongside this module, NOT as inline string constants. Editing markdown
+# does not require touching Python, and the same files are used as human
+# documentation.
 # --------------------------------------------------------------------------
 
 _WIKI_DIR = Path(__file__).resolve().parent / "wiki"
 
 # Files pulled into the ``wiki_block`` section of the prompt, in this
-# order. The bottleneck rubric is kept separate so it can stay at the
-# top of the rendered prompt (see ``CriticPrompt.__str__``).
+# order.
 _WIKI_CONTEXT_FILES: tuple[str, ...] = (
+    "00-bottleneck-rubric.md",
     "01-placement-critical-paths.md",
     "02-optimization-directions.md",
     "03-timeline-signals.md",
     "04-constraints.md",
 )
-
-_RUBRIC_FILE = "00-bottleneck-rubric.md"
 
 
 def _read_wiki_file(name: str) -> str:
@@ -94,11 +92,6 @@ def _read_wiki_file(name: str) -> str:
             f"wiki/ directory to be shipped alongside critic.py."
         )
     return path.read_text(encoding="utf-8").rstrip() + "\n"
-
-
-def _load_rubric() -> str:
-    """Load the bottleneck rubric from ``wiki/00-bottleneck-rubric.md``."""
-    return _read_wiki_file(_RUBRIC_FILE)
 
 
 def _load_wiki_context() -> str:
@@ -211,7 +204,6 @@ class TrialHistoryEntry:
 class CriticPrompt:
     """The fully rendered prompt sections."""
 
-    rubric: str = field(default_factory=_load_rubric)
     wiki_block: str = field(default_factory=_load_wiki_context)
     schema_doc: str = _RATIONALE_SCHEMA_DOC
     bitter_lessons_block: str = ""  # permanent, cross-window failure memory
@@ -225,7 +217,6 @@ class CriticPrompt:
 
     def __str__(self) -> str:
         sections = [
-            self.rubric,
             self.wiki_block,
             self.bitter_lessons_block,
             self.history_block,
@@ -243,8 +234,8 @@ class CriticPrompt:
     def to_debug_text(self) -> str:
         """Render only the sections a human debugger needs.
 
-        Excludes the static rubric, the ~30KB wiki block, the schema
-        doc, and the verbose per-step timeline dump (critical path,
+        Excludes the static wiki block, the schema doc, and the
+        verbose per-step timeline dump (critical path,
         per-GPU bubble, outliers, raw JSONL excerpts). Keeps the
         compact ``metric_summary_block`` because a debugger reading
         the round's decision without those keys is missing the
@@ -867,7 +858,7 @@ class CodexCritic:
             ``propose`` call. Records carry the DEBUG view of the
             prompt (see :meth:`CriticPrompt.to_debug_text`) so the
             saved file is inspection-friendly rather than a 36 KB dump
-            of the wiki + rubric + verbose timeline. The field is a
+            of the wiki + verbose timeline. The field is a
             mutable list; ``frozen=True`` still holds because dataclass
             freezing only blocks ``__setattr__`` on the container, not
             mutation of a list's contents.

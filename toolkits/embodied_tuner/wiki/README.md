@@ -15,9 +15,9 @@ trial history) with:
 
 ## Read order
 
-The critic sees `00-bottleneck-rubric` first, then the remaining context
-in the numbered order below. Keep cross-references consistent with this
-order; do not assume a later document has already been read.
+The critic reads the numbered files below as one wiki block in ascending
+order. Keep cross-references consistent with this order; do not assume a
+later document has already been read.
 
 - `00` [`00-bottleneck-rubric.md`](00-bottleneck-rubric.md) — reading order, when
   to trust which block, and the term→knob decision table. This is the
