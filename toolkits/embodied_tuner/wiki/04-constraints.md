@@ -25,7 +25,7 @@ All line numbers below reference RLinf source at the current HEAD
 
 - Only knobs listed in `KnobSchema` may appear in `delta`. Others raise
   `UnknownKnobError`.
-- Pinned knobs (FUT-5) always raise `KnobNotTunableError` regardless of
+- Pinned knobs always raise `KnobNotTunableError` regardless of
   value:
   - `actor.global_batch_size`
   - `rollout.pipeline_stage_num`

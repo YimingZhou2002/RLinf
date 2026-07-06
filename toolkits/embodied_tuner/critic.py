@@ -321,7 +321,9 @@ def build_prompt(
         metric_summary_block=_render_metric_summary_compact(
             last_metric_summary, last_timeline_summary
         ),
-        timeline_verbose_block=_render_timeline_verbose(last_timeline_summary),
+        # timeline_verbose_block=None,
+        # _render_timeline_verbose(last_timeline_summary),
+        timeline_verbose_block= _render_timeline_verbose(last_timeline_summary),
         feedback_block=combined_feedback,
     )
 
@@ -460,7 +462,6 @@ def _render_timeline_verbose(
     per_gpu_bubble = timeline_summary.get("per_gpu_bubble") or {}
     raw_excerpts = timeline_summary.get("raw_excerpts") or ()
     raw_jsonl = timeline_summary.get("raw_jsonl") or {}
-    plot_paths = timeline_summary.get("plot_paths") or {}
 
     if critical_path:
         sections.append(_render_critical_path(critical_path))
@@ -470,8 +471,6 @@ def _render_timeline_verbose(
         sections.append(_render_outliers(outliers))
     if raw_excerpts:
         sections.append(_render_raw_excerpts(raw_excerpts))
-    if plot_paths:
-        sections.append(_render_plot_paths(plot_paths))
     if raw_jsonl:
         sections.append(_render_raw_jsonl(raw_jsonl))
     if not sections:
@@ -865,7 +864,9 @@ class CodexCritic:
     """
 
     schema: KnobSchema
-    ask_codex_path: str = "/root/.claude/plugins/cache/PolyArch/humanize/1.17.0/scripts/ask-codex.sh"
+    ask_codex_path: str = str(
+        Path(__file__).resolve().parent / "scripts" / "ask-codex.sh"
+    )
     max_retries: int = 3
     transport: Callable[[str], str] | None = None
     transaction_log: list[dict[str, Any]] = field(default_factory=list)
@@ -948,7 +949,8 @@ class CodexCritic:
             return self.transport(prompt)
         try:
             result = subprocess.run(  # noqa: S603 — known argv
-                [self.ask_codex_path, prompt],
+                [self.ask_codex_path, "--stdin"],
+                input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=3600,

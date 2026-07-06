@@ -95,12 +95,24 @@ Consequences:
   (env is busy) alongside a growing `predict.stall_fraction` on rollout
   ranks. Remedies: change `env.train.total_num_envs` only when
   `step_time / num_trajectories` should improve, or reallocate GPUs
-  from rollout to env. Do not enable env offload as a throughput knob.
+  from rollout to env. Setting `env.train.enable_offload=false` is a
+  valid throughput lever here: it removes the per-chunk env onload cost
+  and can noticeably shrink `T_env` in the first few interact chunks of
+  each step (offload/onload dominates early-chunk time). Only use this
+  when the env GPUs have headroom — the trade-off is higher steady-state
+  env memory.
 - If `T_rol > T_env`, symmetric argument in reverse.
-- If `T_act` alone dominates `R * max(T_env, T_rol)`, the R-fold
-  parallel gain is wasted — increase `actor.micro_batch_size` if memory
-  allows, shrink it only for OOM / high memory, or adjust R only when
-  `step_time / num_trajectories` improves.
+- If `T_act` alone dominates the workflow, increase `actor.micro_batch_size` if memory
+  allows, shrink it only for OOM / high memory. Note the curve is not
+  monotone: past a certain point, larger `micro_batch_size` pushes
+  memory utilization high enough that `T_act / num_trajectories` starts
+  to *regress* — activation/optimizer-state pressure triggers
+  fragmentation, allocator retries, gradient-checkpointing recompute,
+  or NCCL slowdowns, and per-trajectory actor time grows. Watch the
+  `actor/run_training` term and the actor rank memory-usage lines in the
+  MetricTable: if `T_act / num_trajectories` worsened after the last
+  bump, roll `micro_batch_size` back one step rather than pushing
+  further.
 
 Timeline signature: on env ranks, `env_interact_step` bars overlap in
 wall time with `predict` bars on rollout ranks. Actor bars appear only
@@ -150,16 +162,14 @@ the bottleneck; the other two show `stall_fraction > 0`.
 
 ## 01.6 Anti-patterns
 
-- Proposing `env.train.enable_offload=true` when the timeline shows
-  env is already the fastest of the three under hybrid — this trades
-  T_env for a memory saving that does not help the objective.
-- Moving GPUs from actor to rollout under hybrid when `T_rol < T_env`
-  — hybrid critical path is `max(T_env, T_rol)`, so growing rollout's
-  GPU share cannot beat env, and shrinking actor slows the `T_act`
-  term on the same critical path.
-- Growing `env.train.total_num_envs` to reduce per-env stalls when the
-  MetricTable already shows `env/interact` is the smallest term of the
-  three — you'll gain nothing but risk OOM.
+- Proposing `env.train.enable_offload=true` outside the OOM branch —
+  env onload sits on the critical path (it adds to `T_env` at the start
+  of each interact chunk), so flipping offload on always inflates
+  `T_env`. It is a memory rescue knob only; propose it exclusively when
+  the last trial hit `FailureMode=OOM` on the env component and the
+  more effective memory rescues — enabling rollout offload
+  (`rollout.enable_offload=true`) and shrinking `env.train.total_num_envs`
+  — are already exhausted.
 - Proposing a disaggregated placement under `run` (non-pipeline) mode
   expecting actor training to overlap with interact. The path remains
   `T_sync + R*max(T_env,T_rol) + T_act`, not

@@ -48,12 +48,7 @@ Resulting critical-path formulas:
 
 Read in this order:
 
-1. **Per-GPU bubble** (`## Last trial — per-GPU bubble ...`). Bubble = wall
-   − union(real-busy intervals). A large bubble on GPUs assigned to one
-   side (env-side or rollout-side) is a strong indicator that the OTHER
-   side is the current chunk-level bottleneck. The `env_side_avg_bubble_s`
-   and `rollout_side_avg_bubble_s` summary lines are the fastest read.
-2. **Critical path per global_step** (`## Last trial — critical path per
+1. **Critical path per global_step** (`## Last trial — critical path per
    global_step`). Each lane row separates `real_s` (actual GPU work) from
    `blocked_s` (waiting on another component). **The bottleneck is the
    lane with the largest `real_s`.** A lane with big `blocked_s` and
@@ -67,7 +62,11 @@ Read in this order:
     `compute_advantages_and_returns` for actor bottleneck claims. Use
     `actor/run_training` only as MetricTable sanity-check evidence when
     actor phase tags are missing; never cite recv tags as actor compute.
-
+2. **Per-GPU bubble** (`## Last trial — per-GPU bubble ...`). Bubble = wall
+   − union(real-busy intervals). A large bubble on GPUs assigned to one
+   side (env-side or rollout-side) is a strong indicator that the OTHER
+   side is the current chunk-level bottleneck. The `env_side_avg_bubble_s`
+   and `rollout_side_avg_bubble_s` summary lines are the fastest read.
 3. **MetricTable time keys** (`## Last trial — MetricTable Time-section
    keys`). Sanity-check the `real_s` decision: `env/interact`,
    `rollout/generate`, and `actor/run_training` should agree with the
@@ -107,7 +106,7 @@ knob-by-knob effects. Summary of first-line moves:
 
 | Bottleneck term (largest `real_s` on critical path) | First-line knob                    | Second-line knob                            |
 |-----------------------------------------------------|------------------------------------|---------------------------------------------|
-| `env_interact_step` on env ranks                    | move `env.train.total_num_envs` only if normalized `step_time / num_trajectories` should improve | reallocate env GPUs (placement)             |
+| `env_interact_step` on env ranks                    | reallocate env GPUs (placement)    | move `env.train.total_num_envs` only if normalized `step_time / num_trajectories` should improve |
 | `predict` on rollout ranks                          | reallocate rollout GPUs (placement)| `env.train.rollout_epoch` down only if normalized objective improves |
 | `actor_forward`, `actor_backward`, `actor_optimizer_step` on actor ranks | `actor.micro_batch_size` up if memory allows; down only for OOM / high memory | reallocate actor GPUs / `rollout_epoch` up if normalized objective improves |
 | `actor/sync_model_to_rollout` (T_sync)              | (not tunable in this loop) — investigate `weight_sync_interval` in the baseline | flag as FUT                                 |
@@ -129,6 +128,14 @@ Rules of thumb:
   (e.g. shrinking `total_num_envs` while flipping `env.train.enable_offload`
   because both are the response to the same OOM). Multi-knob deltas
   make the ledger harder to interpret and slow convergence.
+- **If the last trial failed** (`FailureMode != None`, e.g. OOM / crash /
+  timeout), the one-knob-per-delta rule is relaxed: bundle the rollback
+  and the next move into a single delta. First revert the failed knob
+  to its previous known-good value, then apply the next adjustment on
+  top of that baseline in the same delta. This avoids spending a whole
+  trial re-establishing the prior baseline before making forward
+  progress. The ledger entry must name both moves (revert + new) in
+  `rationale.summary` so cause and effect stay attributable.
 
 ## 00.5 Justify the delta with dual sources when placement moves
 

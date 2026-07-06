@@ -212,11 +212,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--ask-codex-path",
-        default=(
-            "/root/.claude/plugins/cache/PolyArch/humanize/1.17.0/scripts/ask-codex.sh"
+        "--critic-backend",
+        choices=("codex", "claude"),
+        default="codex",
+        help=(
+            "Which vendored ask-*.sh backend to use for the LLM critic. "
+            "Only takes effect when --ask-codex-path is left at its default. "
+            "'codex' uses scripts/ask-codex.sh; 'claude' uses scripts/ask-claude.sh."
         ),
-        help="Override path to ask-codex.sh for the production critic.",
+    )
+    parser.add_argument(
+        "--ask-codex-path",
+        default=None,
+        help=(
+            "Override path to the critic transport script. When left unset the "
+            "path is derived from --critic-backend (scripts/ask-<backend>.sh "
+            "next to this module). The name is kept for backwards compatibility."
+        ),
     )
     return parser
 
@@ -256,6 +268,14 @@ def parse_cli_args(argv: list[str] | None = None) -> CLIArgs:
         ledger_dir = repo_root / "logs" / f"tuner-{stamp}-{nonce}-{ns.config}"
     ledger_dir = Path(ledger_dir).expanduser()
 
+    ask_script_path = ns.ask_codex_path
+    if ask_script_path is None:
+        ask_script_path = str(
+            Path(__file__).resolve().parent
+            / "scripts"
+            / f"ask-{ns.critic_backend}.sh"
+        )
+
     return CLIArgs(
         config=ns.config,
         baseline=baseline,
@@ -271,7 +291,7 @@ def parse_cli_args(argv: list[str] | None = None) -> CLIArgs:
         dry_run_preflight=ns.dry_run_preflight,
         fake_critic_path=ns.fake_critic,
         ledger_dir=ledger_dir,
-        ask_codex_path=ns.ask_codex_path,
+        ask_codex_path=ask_script_path,
     )
 
 
@@ -482,6 +502,7 @@ def _parser_adapter(outcome: TrialOutcome) -> TrialResult:
         stderr_path=outcome.stdout_path,
         placement=placement,
         enable_offload=enable_offload,
+        plot_formats=("png", "html"),
     )
 
 

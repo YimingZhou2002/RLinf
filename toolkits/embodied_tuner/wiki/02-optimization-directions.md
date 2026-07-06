@@ -10,6 +10,36 @@ into reducing the per-trajectory time of each component on the critical
 path (`T_env / traj`, `T_rol / traj`, `T_act / traj`), which in turn
 decomposes into the sub-tasks each knob targets.
 
+**Trajectory-scaling model.** All three components' wall times are
+functions of the total trajectories produced per step,
+`num_trajectories = env.train.total_num_envs * env.train.rollout_epoch *
+env.train.max_steps_per_rollout_epoch * group_size` (see
+`num_trajectories` in the MetricTable). The scaling shape differs by
+component and drives whether growing / shrinking those knobs helps the
+objective:
+
+- `T_env` and `T_rol`: roughly **linear** in `num_trajectories` — each
+  extra traj is one more env step and one more rollout inference of
+  fixed size (`T_env ≈ a_env * num_trajectories + b_env`, symmetric for
+  rollout). Doubling `total_num_envs` or `rollout_epoch` roughly doubles
+  each term.
+- `T_act`: **linear at first, then super-linear** past a threshold.
+  While the traj count fits comfortably in actor memory, more traj = more
+  micro-batches at fixed cost per batch. Once the accumulated activation
+  / optimizer-state footprint approaches the device cap, allocator
+  retries, fragmentation, and gradient-checkpointing recompute kick in
+  and per-traj actor time grows.
+
+Two consequences for the objective:
+
+- Growing a traj-generating knob (`total_num_envs`, `rollout_epoch`)
+  usually leaves `T_env / traj` and `T_rol / traj` unchanged, but only
+  reduces `T_act / traj` while actor is still in the linear regime; past
+  the inflection it *increases* `T_act / traj`.
+- Shrinking a traj-generating knob to escape actor's super-linear regime
+  is a valid throughput move even though `num_trajectories` drops — the
+  win is `T_act / traj` falling faster than `num_trajectories`.
+
 ## 02.1 `cluster.component_placement`
 
 - **What it moves:** reshapes the critical path itself.
@@ -20,6 +50,13 @@ decomposes into the sub-tasks each knob targets.
   - Under hybrid when the timeline shows large `stall_fraction` on the
     faster of env / rollout — reallocate GPUs from the idle side to the
     busy side.
+  - Under hybrid when, **excluding the first two interact chunks of a
+    step** (offload/onload warmup skews their timings), the steady-state
+    per-chunk `T_env` and `T_rol` are imbalanced — shift GPUs toward the
+    side with the longer interact time. Exclude the warmup chunks
+    explicitly because using them would bias the decision toward the
+    side that pays the onload cost, not the side that is actually the
+    steady-state bottleneck.
 - **Common failure mode:** proposing a disaggregated split that leaves
   actor with too few GPUs; `T_act` grows past every other term and now
   the actor is bound, not helping.
@@ -38,6 +75,14 @@ decomposes into the sub-tasks each knob targets.
 - **When to shrink:** env OOM, env memory has grown past ~85% of the
   device cap, or recent trials show super-linear `T_env` growth such
   that fewer envs should improve `step_time / num_trajectories`.
+- **Cross-component coupling:** `total_num_envs` is not env-local — every
+  interact chunk feeds `total_num_envs` trajectories into rollout, so
+  rollout per-chunk work scales roughly linearly with it (`T_rol ≈ a *
+  total_num_envs + b`, where `b` is the fixed rollout overhead per
+  chunk). Growing `total_num_envs` to shrink env can therefore push
+  rollout past env on the hybrid `max(T_env, T_rol)` critical path;
+  check the projected `T_rol` against current `T_env` before proposing
+  the delta, and cite both terms in the rationale.
 - **Watch for:** `T_env` also depends on `group_size` and env-side
   divisibility. Some violations fail preflight, while group-size and
   routing violations may crash at runtime; apply the `04 constraints`
@@ -88,7 +133,7 @@ decomposes into the sub-tasks each knob targets.
   propose a divisor of `global_batch_size / actor_world_size` instead
   of a nearby number.
 - **Note on pinned `global_batch_size`:** the schema pins
-  `actor.global_batch_size` (FUT-5), so the critic can only move
+  `actor.global_batch_size`, so the critic can only move
   `micro_batch_size` within its divisors.
 - **Non-monotonic effect of mbs:** when GPU memory allows, increasing
   `micro_batch_size` first *decreases* `T_act` (fewer micro-batches,
@@ -120,8 +165,13 @@ decomposes into the sub-tasks each knob targets.
   KV cache. Rollout offload is expensive in wall time (moves a large
   model checkpoint), so it is a memory rescue knob, not a throughput
   knob.
-- **When to enable:** rollout OOM only. If rollout is on the critical
-  path, offload will almost certainly regress `step_time`.
+- **When to enable:** rollout OOM. Also enable on **actor OOM** when
+  actor and rollout share GPU ranks (typical hybrid: `actor: 0-7`,
+  `rollout: 4-7`) — offloading rollout weights frees the shared GPUs'
+  memory during actor training, so the OOM rescue works even though the
+  failing component is the actor. If rollout is on the critical path,
+  offload will almost certainly regress `step_time`; only accept the
+  regression when the OOM alternative is a crash.
 - **When to disable:** rollout is bottleneck and enough memory exists to
   keep the model resident.
 
@@ -129,7 +179,7 @@ decomposes into the sub-tasks each knob targets.
 
 - **What it moves:** offloads actor optimiser state / weights between
   training steps. Big memory saving, big wall-time cost.
-- **When to enable:** actor OOM only.
+- **When to enable:** actor or rollout OOM only.
 - **When to disable:** actor is on the critical path or nvml curves show
   large downward-then-upward memory swings around each `run_training`
   call, which is the offload signature.
@@ -145,14 +195,22 @@ These are declared in the schema but rejected by the validator with
 
 ## 02.9 Cross-knob patterns
 
-- **Memory-triage cascade** on repeated OOM: `micro_batch_size` down →
-  `total_num_envs` down → `enable_offload` on the OOM component. Prefer
-  cheap-to-revert knobs first.
+- **Memory-triage cascade** on repeated OOM: `enable_offload=true` on
+  the OOM component (or on rollout if actor OOMed and actor-rollout
+  share GPU ranks) → shrink `actor.micro_batch_size` → shrink
+  `env.train.total_num_envs`. Offload first because it is the largest
+  single memory win and is fully revertible with one flag; only reach
+  for `mbs` / `total_num_envs` shrinks after offload has failed to
+  rescue, since those shrinks change the batching regime and directly
+  reduce `num_trajectories` or arithmetic intensity.
 - **Rebalance under hybrid**: when the timeline shows env-rollout
   stall imbalance ≥ 0.3, move GPUs from the idle side to the busy side
   via `component_placement`. Do not grow `total_num_envs` at the same
   time — one move at a time makes the ledger interpretable.
 - **Actor-bound recovery**: if `T_act` dominates and actor memory is
   tight, growing `micro_batch_size` may OOM. Consider disabling
-  `actor.enable_offload` (if on) before growing the batch size — offload
-  is often the reason `T_act` is bloated in the first place.
+  `actor.enable_offload` and `rollout.enable_offload` (if either is on
+  and actor-rollout share GPU ranks) before growing the batch size —
+  offload is often the reason `T_act` is bloated in the first place,
+  and turning it off frees the shared GPUs' memory so a larger
+  `micro_batch_size` fits.
