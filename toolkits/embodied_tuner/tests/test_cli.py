@@ -37,6 +37,7 @@ from toolkits.embodied_tuner.__main__ import (
     CLIError,
     _campaign_id,
     _emit_best_artefacts,
+    _emit_ledger_plot,
     _load_fake_critic,
     _preflight_adapter,
     _stable_delta_token,
@@ -264,6 +265,52 @@ def test_emit_best_artefacts_no_eligible_trial(tmp_path: Path) -> None:
     assert payload["objective"] is None
     assert payload["source_trial_idx"] is None
     assert any("stop_reason=" in r for r in payload["exclusion_reasons"])
+
+
+# ---------------------------------------------------------------------------
+# _emit_ledger_plot (auto-generated at end of every campaign)
+# ---------------------------------------------------------------------------
+
+
+def _write_ledger(ledger_dir: Path, rows: list[dict]) -> None:
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = ledger_dir / "tuner_ledger.jsonl"
+    with ledger_path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def test_emit_ledger_plot_writes_png(tmp_path: Path) -> None:
+    _write_ledger(
+        tmp_path,
+        [
+            {"status": "OK", "step_time": 100.0, "num_trajectories": 50},
+            {"status": "OK", "step_time": 90.0, "num_trajectories": 55},
+            {"status": "FAILED", "step_time": None, "num_trajectories": None},
+        ],
+    )
+    _emit_ledger_plot(tmp_path)
+    assert (tmp_path / "step_time_vs_num_trajectories.png").is_file()
+
+
+def test_emit_ledger_plot_no_ok_trials_is_silent_noop(tmp_path: Path) -> None:
+    _write_ledger(
+        tmp_path,
+        [
+            {"status": "FAILED", "step_time": None, "num_trajectories": None},
+            {"status": "TIMEOUT", "step_time": None, "num_trajectories": None},
+        ],
+    )
+    _emit_ledger_plot(tmp_path)
+    assert not (tmp_path / "step_time_vs_num_trajectories.png").exists()
+
+
+def test_emit_ledger_plot_missing_ledger_is_swallowed(tmp_path: Path) -> None:
+    """A missing ledger file must NOT crash the campaign — the plot is a
+    best-effort side artefact, log-and-swallow.
+    """
+    _emit_ledger_plot(tmp_path / "does_not_exist")
+    assert not (tmp_path / "step_time_vs_num_trajectories.png").exists()
 
 
 # ---------------------------------------------------------------------------

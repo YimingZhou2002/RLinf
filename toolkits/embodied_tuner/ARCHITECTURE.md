@@ -3,8 +3,9 @@
 This document describes **how the auto-tuner is built and why**: the
 end-to-end data flow, the role of each module, the design decisions
 that resolve non-obvious tensions (no-Ray preflight, env-tagged orphan
-cleanup, dual-source rationale, etc.), and the integration boundary
-with RLinf and the humanize plugin.
+cleanup, dual-source rationale, cross-window bitter-lesson memory,
+wiki-driven prompts, block-tag-aware timeline analytics, etc.), and
+the integration boundary with RLinf and the humanize plugin.
 
 For operator-facing usage, see [`README.md`](./README.md).
 For the original design draft, see `<repo>/draft_run.md`.
@@ -36,41 +37,79 @@ provide. We need a **cold-start auto-tuner** that:
   ~20 minutes of GPU time on an invalid trial.
 - Recovers cleanly from OOMs, timeouts, and worker crashes without
   leaving orphan Ray actors behind.
+- Remembers failures **beyond** the critic's rolling context window so
+  the same failing delta is not re-proposed once the trial that
+  produced it rolls out of history.
 - Lets a human operator audit every tuning decision (which signal
-  justified which delta).
+  justified which delta) and re-read the exact prompt Codex saw.
 
 ### 1.2 The design
 
-- An **LLM critic** (Codex via `ask-codex.sh`) proposes the next config
-  delta from the last trial's evidence. Placement-touching deltas must
-  cite **both** MetricTable evidence AND `timeline/*.jsonl` evidence —
-  the *dual-source rationale rule*. A `CriticOutputValidator` enforces
-  this mechanically; the critic retries up to 3 times with feedback.
+- An **LLM critic** (Codex by default via `scripts/ask-codex.sh`;
+  Claude also available via `scripts/ask-claude.sh`) proposes the next
+  config delta from the last trial's evidence. Placement-touching
+  deltas must cite **both** MetricTable evidence AND `timeline/*.jsonl`
+  evidence — the *dual-source rationale rule*. A
+  `CriticOutputValidator` enforces this mechanically; the critic
+  retries up to 3 times with feedback appended.
+- The critic prompt is assembled from a **numbered wiki** of markdown
+  files under `wiki/` (bottleneck rubric, placement critical paths,
+  per-knob optimization directions, timeline signals, hard
+  constraints). Editing prompt guidance is a markdown edit, not a
+  Python edit.
+- After any trial that failed with **OOM, WORKER_CRASH, TIMEOUT, or
+  CONFIG_INVALID**, the critic MUST return a `bitter_lesson`
+  `{trigger, rule}` payload. The scheduler stamps it with the failed
+  trial's index/mode/delta signature and appends the resulting
+  `BitterLesson` to a persistent **LessonBook**
+  (`<ledger_dir>/bitter_lessons.jsonl`). Every subsequent prompt
+  prepends the accumulated lessons — the critic cannot forget a
+  failure just because it fell out of the rolling `history_window`.
 - A **preflight validator** composes baseline + delta via Hydra and
   runs the targeted divisibility checks from `rlinf/config.py`. It
   deliberately **does not call `validate_cfg` / `validate_embodied_cfg`**
   because those instantiate `Cluster()` which calls `ray.init`, and
   preflight is contractually GPU/Ray-free.
 - A **trial runner** launches RLinf in its own POSIX process group,
-  enforces a per-trial timeout, escalates SIGTERM→SIGKILL on hang,
-  invokes `ray stop --force`, and sweeps both `pgrep -f` *and*
-  `/proc/<pid>/environ` for orphan workers tagged with a
-  campaign-unique trial id.
+  enforces a per-trial timeout (default 45 min, `--trial-timeout-seconds`),
+  escalates SIGTERM→SIGKILL on hang, invokes `ray stop --force`, and
+  sweeps both `pgrep -f` *and* `/proc/<pid>/environ` for orphan
+  workers tagged with a campaign-unique trial id. Timeline env vars
+  are exported by default; memory-telemetry env vars (`RLINF_NVITOP`,
+  `RLINF_NVML`) require opt-in via `--collect-memory`.
 - A **log + timeline parser** classifies each trial with
   `(Status, FailureMode)`, computes the objective by averaging
   `step_time` across every MetricTable block (single-step trials are
-  measurable), and surfaces a per-component timeline summary the next
-  critic prompt consumes.
+  measurable), and hands the loaded events to
+  `timeline_processor` for the analytical views the critic consumes.
+- A dedicated **timeline processor** derives seven analytical views
+  from `timeline/*.jsonl`: per-component stall fractions, per-tag
+  stats, a per-step critical-path summary, P95 outliers with a
+  `knob_hint` derived from the trial's `enable_offload` state, a
+  per-component union-busy / bubble breakdown, top-K raw excerpts, and
+  a warmup-skipped per-component steady-state call average. Blocking
+  wrappers (e.g. `actor/recv_traj`) are declared in `BLOCKING_TAGS`
+  and excluded from busy totals so `actor` is not mis-labelled the
+  bottleneck when it is actually waiting.
+- A **timeline feed selector** picks which raw JSONL trace files are
+  embedded verbatim in the prompt. Default `PER_COMPONENT_LATEST` picks
+  one representative rank per component (the straggler — most
+  informative). `PER_COMPONENT_RANK0`, `ALL`, and `NONE` are also
+  supported. A best-effort Gantt PNG (and optional HTML) is rendered
+  alongside every trial via `profiler/plot_timeline.py`.
 - An **append-only JSONL ledger** persists every trial, including the
-  structured `critic_rationale` payload — the **audit trail** that lets
-  operators trace WHY each placement decision was taken.
+  structured `critic_rationale` payload — the **audit trail** that
+  lets operators trace WHY each placement decision was taken.
 - A **scheduler** orchestrates the loop with explicit budget +
   stopping rules; preflight failures don't consume trial slots; if the
   critic can't produce a valid delta within `preflight_retries`, the
   loop terminates with `preflight_exhausted` rather than launching a
-  known-bad config.
-- A **CLI + shim launcher** glue everything to `examples/embodiment/run_embodiment.sh`
-  and emit `best_config.yaml` + `best_trial.json` next to the ledger.
+  known-bad config. Every critic exchange is persisted under
+  `<trial_log_dir>/critic/attempt-NN-{prompt,response}` so a human
+  debugger can replay exactly what the LLM saw and returned.
+- A **CLI + shim launcher** glue everything to
+  `examples/embodiment/run_embodiment.sh` and emit `best_config.yaml`
+  + `best_trial.json` next to the ledger.
 
 The humanize + RLCR pipeline was used **once to build this tuner**.
 The tuner's per-trial loop is **plain Python**, not an RLCR loop.
@@ -92,19 +131,49 @@ A single trial flows through the modules as follows:
    ┌─────────────────────────────────────┐
    │ (2) Critic.propose(history,         │
    │     current_knobs, prev_metrics,    │
-   │     prev_timeline,                  │
-   │     preflight_feedback?)            │ ◀────────┐
-   │                                     │          │
-   │  CodexCritic shells out to          │          │ feedback string
-   │  ask-codex.sh; parses JSON;         │          │ on validation fail
-   │  CriticOutputValidator enforces:    │          │
+   │     prev_timeline, prev_num_traj,   │
+   │     bitter_lessons,                 │ ◀────────┐
+   │     preflight_feedback?)            │          │
+   │                                     │          │ feedback string
+   │  CodexCritic (or ClaudeCritic)      │          │ on validation fail
+   │  builds prompt from wiki/*.md +     │          │
+   │  bitter lessons + rolling history + │          │
+   │  compact & verbose timeline blocks; │          │
+   │  shells out to scripts/ask-*.sh;    │          │
+   │  parses JSON; CriticOutputValidator │          │
+   │  enforces:                          │          │
    │   - knob schema                     │          │
    │   - dual-source rule (placement)    │          │
+   │   - bitter_lesson after OOM /       │          │
+   │     WORKER_CRASH / TIMEOUT /        │          │
+   │     CONFIG_INVALID                  │          │
    │   - retry up to 3x with feedback    │          │
+   │  Every attempt (prompt+response)    │          │
+   │  is captured on transaction_log.    │          │
    └─────────────────┬───────────────────┘          │
                      │ CriticOutput                 │
                      │ {delta, rationale,           │
-                     │  stop_requested}             │
+                     │  stop_requested,             │
+                     │  bitter_lesson?}             │
+                     ▼                              │
+   ┌─────────────────────────────────────┐          │
+   │ (2b) Scheduler.persist_critic_      │          │
+   │      transactions → writes          │          │
+   │   <log_dir>/critic/attempt-NN-      │          │
+   │   {prompt.md, response.txt}         │          │
+   └─────────────────┬───────────────────┘          │
+                     │                              │
+                     ▼                              │
+   ┌─────────────────────────────────────┐          │
+   │ (2c) Scheduler.record_bitter_lesson │          │
+   │      (only after a failed prev      │          │
+   │      trial). Stamps trial_idx /     │          │
+   │      failure_mode / delta_signature │          │
+   │      and appends to LessonBook.     │          │
+   │      Dedup by (mode, signature);    │          │
+   │      LRU-cap at 30.                 │          │
+   └─────────────────┬───────────────────┘          │
+                     │                              │
                      ▼                              │
    ┌─────────────────────────────────────┐          │
    │ (3) Preflight.compose_and_validate  │          │
@@ -136,7 +205,8 @@ A single trial flows through the modules as follows:
    │     TRIAL_ID=       │
    │   <campaign>-<idx>) │
    │                     │
-   │ wait/timeout/       │
+   │ wait/timeout        │
+   │  (default 2700s) /  │
    │ SIGTERM→SIGKILL/    │
    │ ray stop --force/   │
    │ /proc env scan +    │
@@ -151,24 +221,36 @@ A single trial flows through the modules as follows:
    │ (5) Parser.parse_trial              │
    │                                     │
    │  - reads metrics.log MetricTable    │
-   │  - reads timeline/*.jsonl           │
+   │  - reads timeline/*.jsonl (via      │
+   │    timeline_processor)              │
    │  - OOM/crash rubric BEFORE          │
    │    METRICS_MISSING on returncode≠0  │
-   │  - objective = avg(step_time[2..N]) │
+   │  - objective = avg(step_time[1..N]) │
    │             / num_trajectories      │
-   │  - per-component timeline summary   │
-   │    (consumed by next critic prompt) │
+   │  - runs 7 analytical views:         │
+   │    stall_fractions, tag_stats,      │
+   │    critical_path (A'),              │
+   │    per_component_bubble (D'),       │
+   │    outliers (C'), raw_excerpts,     │
+   │    component_call_averages          │
+   │  - collects raw JSONL for feed      │
+   │  - renders timeline.png / .html     │
+   │  - attaches knob_hint via effective │
+   │    enable_offload state (read from  │
+   │    tensorboard/config.yaml)         │
    └─────────────────┬───────────────────┘
                      │ TrialResult
                      │ {status, failure_mode,
-                     │  objective, summary, ...}
+                     │  objective, summary,
+                     │  peak_gpu_mem_gib, ...}
                      ▼
    ┌─────────────────────────────────────┐
    │ (6) Ledger.append(LedgerEntry)      │
    │                                     │
    │  append-only JSONL; fsync per line; │
    │  structured critic_rationale        │
-   │  persisted verbatim                 │
+   │  persisted verbatim; timeline_      │
+   │  summary carries per-view payloads  │
    └─────────────────┬───────────────────┘
                      │
                      ▼
@@ -193,8 +275,9 @@ A single trial flows through the modules as follows:
 
 Each toolkit file is independently testable; cross-references between
 them go through small public dataclasses (`LaunchSpec`, `TrialOutcome`,
-`TrialResult`, `LedgerEntry`, `CriticOutput`) defined as frozen
-dataclasses for clarity and immutability.
+`TrialResult`, `LedgerEntry`, `CriticOutput`, `BitterLesson`,
+`ProposedLesson`, `PreflightOutcome`) defined as frozen dataclasses for
+clarity and immutability.
 
 ### 3.1 `schema.py` — knob schema (AC-1)
 
@@ -301,6 +384,7 @@ dataclasses for clarity and immutability.
 - **Role.** Launch a `LaunchSpec` as a subprocess, enforce a per-trial
   timeout, clean up orphan Ray workers scoped to this trial.
 - **Public API.**
+  - `TrialRunner(timeout_seconds=..., disable_profiler=..., disable_memory_telemetry=...)`.
   - `TrialRunner.launch(spec, timeout=None)` → `TrialOutcome`.
   - `TrialOutcome` — frozen dataclass: `log_dir`, `returncode`,
     `timed_out`, `wall_clock_seconds`, `cleanup_outcome`,
@@ -319,18 +403,26 @@ dataclasses for clarity and immutability.
     `pgrep -f` alone misses them. Fix: scan `/proc/<pid>/environ`
     directly (`_pids_with_env_match`) and union with `pgrep -f`.
     Recorded as BitLesson `BL-2026-06-30-pgrep-env-vs-argv`.
-  - Profiler env vars (`RLINF_TIMELINE*`, `RLINF_NVITOP`, `RLINF_NVML`)
-    are default-on. Opt out via `disable_profiler` /
-    `disable_memory_telemetry`.
+  - **Profiler env vars.** Timeline flags (`RLINF_TIMELINE`,
+    `RLINF_TIMELINE_WORKER_TIMER`, `RLINF_TIMELINE_ACTOR_TRAINING`,
+    `RLINF_TIMELINE_DIR=auto`) are on by default and can be
+    turned off via `disable_profiler` (CLI `--no-profiler`).
+    Memory-telemetry flags (`RLINF_NVITOP`, `RLINF_NVML`) are
+    opt-in via `disable_memory_telemetry=False` (CLI
+    `--collect-memory`); the default is *off* because a long
+    campaign accumulates hundreds of MB of nvitop/NVML traces.
 
 ### 3.6 `parser.py` — log + timeline parsing (AC-6)
 
 - **Role.** Turn a trial's `LOG_DIR/{metrics.log, timeline/*.jsonl,
   nvitop/*}` into a structured `TrialResult` the scheduler and critic
-  can consume.
+  can consume. Delegates every derivation from `timeline/*.jsonl` to
+  `timeline_processor`.
 - **Public API.**
   - `parse_trial(log_dir, returncode=None, timed_out=False,
-    failure_mode_override=None, stderr_path=None)` → `TrialResult`.
+    failure_mode_override=None, stderr_path=None,
+    enable_offload=None, jsonl_feed_mode=None,
+    plot_formats=("png",))` → `TrialResult`.
   - `parse_metrics_log(path)` → `tuple[MetricStep, ...]`.
   - `parse_timeline(timeline_dir)` → `TimelineSummary`.
   - `compute_objective(per_step)` → `(objective, avg_step_time, partial_reason)`.
@@ -358,16 +450,103 @@ dataclasses for clarity and immutability.
     `step_time` is used directly); with `--max-epochs=3` all three
     blocks are averaged.
   - `num_trajectories` comes from the **final** MetricTable block (no
-    silent fallback denominator).
+    silent fallback denominator). It is passed to the critic prompt
+    verbatim as the objective's denominator.
   - `select_best` requires `(OK, NONE)` strictly — `(OK,
     METRICS_PARTIAL)` is critic context, not a best-config candidate.
-  - `TimelineSummary` carries per-rank `TagStats` for a verified
-    headline-tag set (`env_interact_step`, `actor/sync_model_to_rollout`,
-    `rollout/generate`, `predict`, etc. — the actual tags emitted by
-    `profiler/rlinf_timeline/autopatch.py`, **not** the MetricTable
-    aggregate keys), plus per-component stall fractions.
+  - `TimelineSummary` carries seven views produced by
+    `timeline_processor` (`per_tag`, `stall_fraction_by_component`,
+    `critical_path`, `outliers`, `per_component_bubble`,
+    `raw_excerpts`, `component_call_averages`) plus the raw JSONL
+    payload selected by `timeline_feed.collect_raw_jsonl` and the
+    Gantt plot paths returned by
+    `timeline_feed.render_default_plots`.
 
-### 3.7 `ledger.py` — append-only JSONL persistence (AC-9)
+### 3.7 `timeline_processor.py` — timeline analytics (new)
+
+- **Role.** Owns every derivation from `timeline/*.jsonl`. The parser
+  is a thin adapter that calls this module and packs the results into
+  `TimelineSummary`.
+- **Public API.**
+  - `load_events(timeline_dir)` — read + normalize every JSONL event.
+  - `is_blocking(event)`, `BLOCKING_TAGS`, `EXCLUDED_COMPONENTS`.
+  - `compute_stall_fractions(events)` — per-component fraction of the
+    observation window NOT covered by any of its events.
+  - `compute_tag_stats(events, headline_tags)` — per-`(component,
+    rank, tag)` count / min / median / max / total duration.
+  - `compute_critical_path(events)` (A') — per-`global_step` summary
+    of `(component, rank)` lanes ranked by REAL busy time, with a
+    matching `blocked_s` column.
+  - `compute_outliers(events, enable_offload=None)` (C') — top-K
+    events above per-tag P95 and above 1 s, each carrying a
+    `knob_hint` derived from the trial's `enable_offload` state
+    (e.g. `env.enable_offload=False → try True`).
+  - `compute_per_component_bubble(events)` (D') — per-component union
+    of REAL busy intervals across all its ranks + complementary
+    bubble fraction; per-rank detail for straggler diagnosis.
+  - `extract_raw_excerpts(events, k)` — top-K longest raw events
+    verbatim so the critic can inspect full call context.
+  - `compute_component_call_averages(events, components=("env",
+    "rollout"), skip_first=2)` — steady-state per-call duration after
+    dropping bootstrap warmup calls.
+  - `process_timeline(timeline_dir, enable_offload=None)` — entry
+    point returning all view payloads in one dict.
+- **Design notes.**
+  - `BLOCKING_TAGS` (e.g. `actor/recv_traj`,
+    `actor/recv_rollout_trajectories`, `rollout/generate`,
+    `rollout/generate_one_epoch`, `env/interact`) look like busy
+    intervals but are actually component A waiting on component B.
+    Excluding them from A'/D' is the difference between the critic
+    seeing "actor is 97% busy" (wrong) and "actor is mostly idle
+    waiting for rollout" (correct).
+  - `EXCLUDED_COMPONENTS = {"runner"}` because runner emits a single
+    `run` event spanning the whole trial — including it makes every
+    per-component ranking trivial.
+  - `DEFAULT_OUTLIER_K = 12`, `DEFAULT_RAW_EXCERPTS_K = 15`,
+    `OUTLIER_MIN_SECONDS = 1.0`. Bumping these inflates every prompt
+    token-for-token; the defaults keep the four new sections together
+    under ~3 KB.
+  - `DEFAULT_SKIP_FIRST_CALLS = 2` for
+    `compute_component_call_averages` — the first two per-component
+    calls carry offload page-in, JIT compile, and first-CUDA-kernel
+    init cost and would otherwise inflate the mean by orders of
+    magnitude.
+  - The view suite is deliberately concrete — each view answers a
+    specific question the critic prompt asks in a labelled block. If
+    a new question surfaces during a campaign (e.g. "why is env rank
+    3 late?"), add a new view here, then wire a matching
+    `_render_*` block in `critic._render_timeline_verbose`.
+
+### 3.8 `timeline_feed.py` — raw JSONL selection + Gantt rendering (new)
+
+- **Role.** Two responsibilities: pick which raw JSONL files the
+  critic sees, and render a best-effort Gantt plot after every trial.
+- **Public API.**
+  - `JsonlFeedMode` enum: `PER_COMPONENT_LATEST` (default —
+    per-component pick the rank whose last event ends latest),
+    `PER_COMPONENT_RANK0`, `ALL`, `NONE`.
+  - `collect_raw_jsonl(timeline_dir, mode=..., max_bytes_per_file=None,
+    selector=None)` → `dict[str, str]` mapping file stem to text.
+  - `render_timeline_plot(timeline_dir, output_path=None, fmt="png",
+    timeout_seconds=120, extra_args=())` — invokes
+    `profiler/plot_timeline.py`.
+  - `render_default_plots(timeline_dir, formats=("png",))` — convenience
+    wrapper for the common "PNG for the critic + HTML for humans" case.
+- **Design notes.**
+  - `PER_COMPONENT_LATEST` reads only the tail of each JSONL to fetch
+    the last `t1` — no whole-file reads. This is the informative-but-
+    bounded default. `ALL` is included so we can flip a knob later
+    when long-context critics land, but it's ~600 K tokens at 8 GPUs
+    and is not the default for that reason.
+  - `render_timeline_plot` is best-effort: every failure (missing
+    script, subprocess crash, timeout) is logged and `None` returned.
+    The trial loop must never abort because a plot didn't render.
+  - Plotting is text-only in the current critic transport — the path
+    is surfaced to the prompt via `## Last trial — timeline Gantt
+    renders`. A future multimodal critic can lift `plot_paths["png"]`
+    into an image content block.
+
+### 3.9 `ledger.py` — append-only JSONL persistence (AC-9)
 
 - **Role.** Persist every trial as one JSONL line; survive mid-loop
   crashes; serve as the audit trail for placement decisions.
@@ -394,41 +573,113 @@ dataclasses for clarity and immutability.
     audit-trail surface the plan calls "Placement Decision Audit
     Trail". Operators can `jq` the ledger to see exactly which
     observations drove each placement change.
+  - `timeline_summary` in the ledger is the full seven-view payload
+    from `TimelineSummary` (per_tag, stall_fraction_by_component,
+    critical_path, outliers, per_component_bubble, raw_excerpts,
+    raw_jsonl, plot_paths, component_call_averages) so an operator
+    can replay the exact numbers Codex saw for any past round.
 
-### 3.8 `critic.py` — prompt + validator + Codex transport (AC-7)
+### 3.10 `lessons.py` — persistent BitterLesson store (new)
+
+- **Role.** Give the critic a permanent, cross-window memory of
+  failed trials so the same failing delta is not re-proposed once
+  it falls out of `history_window`.
+- **Public API.**
+  - `BitterLesson(trigger, rule, trial_idx, failure_mode,
+    delta_signature)` — frozen dataclass. `from_dict` validates every
+    required field.
+  - `LessonBook(path, max_lessons=30, fsync_on_append=True)` —
+    append-only JSONL store. Methods: `load()`, `all()`,
+    `add(lesson)` (returns whether inserted), `extend(iterable)`.
+  - `canonical_delta_signature(delta)` — `json.dumps(dict(delta),
+    sort_keys=True, default=_json_default)`; recurses into nested
+    mappings so `component_placement` deltas dedup correctly.
+  - `LessonSchemaError` — raised on malformed on-disk payloads.
+- **Design notes.**
+  - **Why this exists.** The `maniskill_ppo_openvla` campaign showed
+    the critic proposing the same
+    `rollout.enable_offload=False` OOM three times in a row because
+    the failing trial rolled out of the 8-round `history_window`. A
+    persistent lesson survives that window.
+  - **Dedup key** is `(failure_mode, delta_signature)`. Two proposals
+    of the same delta under the same failure mode are one lesson.
+  - **LRU cap of 30 lessons.** When adding pushes over the cap, the
+    oldest lesson (by `trial_idx`, tie-broken by insertion order) is
+    dropped in memory and an `{"__evicted__": true, ...}` marker is
+    appended to the file so the on-disk audit trail is complete.
+  - **Persistence rules mirror `Ledger`.** Per-line fsync, tolerance
+    of JSON decode + schema violations per line, corrupted lines
+    counted but not fatal to the rest of the file.
+  - The critic writes only `{trigger, rule}` in its
+    `ProposedLesson`; the scheduler stamps `trial_idx`,
+    `failure_mode`, and `delta_signature` from the actual failed
+    trial before handing the assembled `BitterLesson` to
+    `LessonBook.add`. This split prevents the critic from lying
+    about which trial the lesson came from.
+
+### 3.11 `critic.py` — prompt + validator + Codex/Claude transport (AC-7)
 
 - **Role.** Turn parsed trial outcomes into a structured prompt;
-  invoke Codex; parse the JSON response; enforce the dual-source rule;
-  retry on validator failures.
+  invoke the chosen backend; parse the JSON response; enforce the
+  dual-source rule AND the mandatory-bitter-lesson rule; retry on
+  validator failures. Persist every attempt for later human audit.
 - **Public API.**
-  - `CriticPrompt` — frozen dataclass with section blocks (rubric,
-    history, current_knobs, constraints, memory_pressure,
-    timeline_summary, feedback). `__str__` assembles the prompt.
+  - `CriticPrompt` — frozen dataclass with section blocks
+    (`wiki_block`, `bitter_lessons_block`, `history_block`,
+    `current_knobs_block`, `constraints_block`,
+    `memory_pressure_block`, `metric_summary_block` (compact),
+    `timeline_verbose_block`, `schema_doc`, `feedback_block`).
+    `__str__` assembles the full prompt; `to_debug_text()` renders a
+    compact form (wiki + schema doc + verbose timeline excluded) used
+    for the per-attempt `attempt-NN-prompt.md` file that gets
+    persisted next to the trial.
   - `build_prompt(history, current_knobs, schema, last_failure_mode,
-    last_metric_summary, last_timeline_summary, feedback=None,
-    preflight_feedback=None)` → `CriticPrompt`.
-  - `Rationale` — frozen `{summary,
-    metric_table_citations, timeline_citations}`.
-  - `CriticOutput` — frozen `{delta, rationale, stop_requested}`.
-  - `TrialHistoryEntry` — per-trial summary the critic prompt repeats.
+    last_metric_summary, last_timeline_summary,
+    last_num_trajectories=None, bitter_lessons=(),
+    feedback=None, preflight_feedback=None)` → `CriticPrompt`.
+  - `Rationale` — frozen `{summary, metric_table_citations,
+    timeline_citations}`.
+  - `ProposedLesson` — frozen `{trigger, rule}`. The critic-facing
+    half of `BitterLesson`.
+  - `CriticOutput` — frozen `{delta, rationale, stop_requested,
+    bitter_lesson}`.
+  - `TrialHistoryEntry` — per-trial summary the critic prompt repeats
+    (per `history_window`).
   - `parse_critic_output(text)` → `CriticOutput`. Tolerates raw JSON,
     Markdown code fences, and brace-bracketed JSON. **Rejects** bare
-    strings / non-list / non-string-element citation arrays.
-  - `CriticOutputValidator(schema)` with `.validate(output)` →
-    `ValidationResult`. Enforces the dual-source rule.
-  - `Critic` Protocol with a `propose(...)` method.
+    strings / non-list / non-string-element citation arrays. Coerces
+    `bitter_lesson` if present.
+  - `CriticOutputValidator(schema, last_failure_mode)` with
+    `.validate(output)` → `ValidationResult`. Enforces the dual-source
+    rule AND (when `last_failure_mode` is OOM / WORKER_CRASH /
+    TIMEOUT / CONFIG_INVALID) the mandatory bitter-lesson rule.
+  - `Critic` Protocol with a `propose(...)` method taking
+    `bitter_lessons` and `last_num_trajectories`.
   - `CodexCritic` — production implementation shelling out to
-    `ask-codex.sh`. Retries up to `max_retries` (default 3) on JSON or
-    validator failure, with the failure reason appended as feedback.
+    `scripts/ask-codex.sh`. Retries up to `max_retries` (default 3) on
+    JSON or validator failure, with the failure reason appended as
+    feedback. `transaction_log` field captures per-attempt
+    `{attempt, prompt_debug, response, parse_error?, validation_ok,
+    validation_reason}` for the scheduler to persist.
 - **Design notes.**
+  - **Wiki-driven prompt.** The static optimization context lives in
+    numbered markdown files under `wiki/` (`00-bottleneck-rubric.md`
+    → `04-constraints.md`, loaded in that order). Editing prompt
+    guidance is a markdown edit — Python constants no longer hold it.
+    A missing wiki file is a build error (raised at import time), not
+    a runtime warning.
   - **Dual-source rule.** When the proposed `delta` contains
     `cluster.component_placement`, the rationale MUST contain at least
     one non-empty `metric_table_citations` entry AND at least one
     non-empty `timeline_citations` entry. Otherwise, the validator
-    rejects and the critic retries. This is the design's primary lever
-    against ungrounded placement reasoning — a hallucinated "I think
-    this is faster" placement delta cannot proceed without naming
-    actual observations.
+    rejects and the critic retries. Non-placement deltas require a
+    non-empty `rationale.summary` (a lower bar, matching the fact that
+    non-placement mutations are cheaper to undo).
+  - **Mandatory bitter-lesson rule.** When
+    `last_failure_mode ∈ {OOM, WORKER_CRASH, TIMEOUT, CONFIG_INVALID}`
+    and the response is not `stop_requested`, the validator requires a
+    populated `bitter_lesson.trigger` AND `bitter_lesson.rule`. Without
+    this the persistent memory silently drops the round's lesson.
   - **Citation type validation.** `parse_critic_output` rejects bare
     strings in `metric_table_citations` because the dual-source check
     would otherwise iterate a string character-by-character (each char
@@ -438,38 +689,50 @@ dataclasses for clarity and immutability.
     rejection reasons via this channel so the critic actually learns
     from divisibility / placement violations.
   - **Transport injection.** `CodexCritic.transport` is injectable for
-    tests (no real Codex call); production uses
-    `ask-codex.sh` via `subprocess.run`.
+    tests (no real Codex call); production uses `subprocess.run`
+    against `scripts/ask-codex.sh` (or `ask-claude.sh` when
+    `--critic-backend=claude`).
+  - **Transaction persistence.** Every `propose(...)` clears and
+    populates `transaction_log`. The scheduler drains it into
+    `<log_dir>/critic/attempt-NN-{prompt.md, response.txt}` — the
+    prompt file uses `to_debug_text()` so it stays inspection-friendly
+    (~4 KB) instead of dumping the ~36 KB wiki+verbose timeline.
 
-### 3.9 `fake_critic.py` — deterministic test critic (AC-7 helper)
+### 3.12 `fake_critic.py` — deterministic test critic (AC-7 helper)
 
 - **Role.** A deterministic `Critic` for tests and the AC-11 smoke
   harness. No LLM, no network.
 - **Public API.**
   - `FakeCritic(outputs=[CriticOutput, ...])`.
   - `FakeCritic.from_deltas(*deltas)` — builds a critic that returns
-    each delta with a minimal valid rationale.
+    each delta with a minimal valid rationale (and a placeholder
+    `bitter_lesson` when needed to satisfy the validator).
   - `FakeCritic.stop_after(*deltas)` — same, but the final response
     has `stop_requested=True`.
-  - `.calls` captures `(history_len, current_knobs, preflight_feedback)`
-    tuples so tests can assert on what the critic was called with.
+  - `.calls` captures `(history_len, current_knobs,
+    preflight_feedback, bitter_lesson_count)` tuples so tests can
+    assert on what the critic was called with.
 - **Design notes.** Lives in a separate file so it can be imported
   independently (the smoke test composes it via the CLI's
   `--fake-critic` flag).
 
-### 3.10 `scheduler.py` — campaign orchestration (AC-8)
+### 3.13 `scheduler.py` — campaign orchestration (AC-8)
 
-- **Role.** Glue critic + preflight + runner + parser + ledger into
-  the per-trial loop. Own the budget and the stopping rules.
+- **Role.** Glue critic + preflight + runner + parser + ledger +
+  lesson book into the per-trial loop. Own the budget and the
+  stopping rules. Persist critic transactions and bitter lessons at
+  the right moment in the loop.
 - **Public API.**
   - `BudgetConfig` — defaults `max_trials=20, budget_seconds=43200,
     max_oom=5, patience=3, epsilon=0.02, preflight_retries=3,
     history_window=8`.
   - `Scheduler(critic, runner_fn, parser_fn, preflight_fn, ledger,
-    budget, baseline_knobs, clock)`. `runner_fn` / `parser_fn` /
-    `preflight_fn` are callable injection points — production wires
-    them to the real `TrialRunner.launch` / `parse_trial` /
-    `compose_and_validate`; tests inject stubs.
+    budget, baseline_knobs, clock, lesson_book=None)`. `runner_fn` /
+    `parser_fn` / `preflight_fn` are callable injection points —
+    production wires them to the real `TrialRunner.launch` /
+    `parse_trial` / `compose_and_validate`; tests inject stubs.
+    `lesson_book` defaults to a `LessonBook` at
+    `<ledger.path.parent>/bitter_lessons.jsonl`.
   - `Scheduler.run()` → `CampaignResult`.
   - `CampaignResult(stop_reason, trial_count, oom_count, best_entry,
     ledger_path)`.
@@ -483,20 +746,29 @@ dataclasses for clarity and immutability.
     consecutive critic proposals all fail preflight, the scheduler
     writes a synthetic `(FAILED, CONFIG_INVALID)` ledger entry and
     stops with `stop_reason="preflight_exhausted"`. It does NOT
-    launch the runner with a known-bad config. (This is the
-    Round-3 behaviour change driven by Codex review.)
+    launch the runner with a known-bad config.
   - **Plateau** is computed over the last `patience` non-failed
     trials with non-`None` objectives. If every consecutive relative
     improvement is below `epsilon`, stop.
   - **Critic stagnation** requires *two consecutive*
     `stop_requested=True` outputs — a single one is treated as
-    "I think you should stop, but I'm not insistent".
+    "I think you should stop, but I'm not insistent". A
+    `stop_requested` proposal does NOT burn a trial slot.
   - **History window** for the next critic prompt is capped at
-    `history_window=8` (matches AC-7's last-K=8 rule).
+    `history_window=8` (matches AC-7's last-K=8 rule). BitterLessons
+    survive outside this window and are prepended to every prompt.
+  - **Bitter-lesson fold** happens BEFORE running the next trial (not
+    after). The lesson describes the *previous* failure; delaying its
+    persistence by one round would let the critic re-propose the same
+    failing delta in the very round its lesson should have prevented.
+  - **Critic transaction persistence.** After `_propose_with_preflight`
+    returns, the scheduler drains `critic.transaction_log` into
+    `<preflight_outcome.log_dir>/critic/`. Best-effort; a failure here
+    must not abort the trial loop.
   - `clock` is injectable so `budget_seconds_elapsed` tests are
     deterministic.
 
-### 3.11 `__main__.py` — CLI entrypoint (AC-10)
+### 3.14 `__main__.py` — CLI entrypoint (AC-10)
 
 - **Role.** Parse CLI args, wire the production modules into
   `Scheduler`, run the loop, emit `best_config.yaml` +
@@ -505,7 +777,27 @@ dataclasses for clarity and immutability.
   `parse_cli_args`, `_run_dry_run_preflight`, `_run_campaign`, the
   three adapter `_preflight_adapter` / `_runner_adapter` /
   `_parser_adapter`, `_emit_best_artefacts`, `_load_fake_critic`,
-  `_campaign_id`, `_stable_delta_token`.
+  `_campaign_id`, `_stable_delta_token`, `_extract_trial_context`,
+  `_build_critic`.
+- **CLI flags** (`bash examples/embodiment/run_embodied_tuner.sh --help`):
+  - `--config` (required) / `--baseline` (defaults to
+    `examples/embodiment/config/<config>.yaml`)
+  - `--max-trials` (default 20) / `--budget-seconds` (default 43200 = 12h)
+  - `--trial-timeout-seconds` (default 2700 = 45 min)
+  - `--max-oom` (default 5) / `--patience` (default 3) / `--epsilon` (default 0.02)
+  - `--max-epochs` (default 3) — passed as `runner.max_epochs=` to every trial
+  - `--collect-memory` / `--no-collect-memory` (default OFF)
+  - `--no-profiler` — opt out of timeline env exports (default on)
+  - `--critic-backend {codex,claude}` (default `codex`) — picks which
+    vendored `scripts/ask-*.sh` script to use
+  - `--ask-codex-path <path>` — explicit script override (kept for
+    backwards compatibility; the flag name predates the multi-backend
+    switch)
+  - `--dry-run-preflight` — compose baseline + `runner.max_epochs`
+    override and exit 0 without launching anything
+  - `--fake-critic <json>` — bypass the LLM with a JSON array of
+    `{delta, stop_requested?}` entries
+  - `--ledger-dir <path>` — override the default timestamped output dir
 - **Design notes.**
   - **Default `ledger_dir`** carries a 6-hex-char `os.urandom` nonce
     in addition to a timestamp + config name, so two same-second
@@ -519,6 +811,15 @@ dataclasses for clarity and immutability.
     dict-valued placement deltas don't crash the log-dir naming (the
     previous `hash(frozenset(delta.items()))` raised `TypeError:
     unhashable type: 'dict'`).
+  - **`_extract_trial_context`** reads the trial's resolved config
+    from `<log_dir>/tensorboard/config.yaml` (the file the Tensorboard
+    sidecar consumes) to recover the trial's effective
+    `enable_offload` state per component. This state is threaded into
+    `parse_trial(enable_offload=...)` so
+    `timeline_processor.compute_outliers` can attach a `knob_hint`
+    ("env.enable_offload=False → try True") to each outlier row.
+    When the file is absent (test fixtures / dry-runs) the hints are
+    simply omitted.
   - **`best_config.yaml`** is the Hydra-COMPOSED (unresolved) YAML —
     `${oc.env:...}` interpolations stay symbolic so the file is
     portable across hosts.
@@ -528,8 +829,79 @@ dataclasses for clarity and immutability.
   - **`--fake-critic`** loads a JSON array of
     `{delta, stop_requested?}` entries and instantiates `FakeCritic`.
     If any entry sets `stop_requested=true`, uses `FakeCritic.stop_after`.
+  - **`--critic-backend`** is a thin selector: `codex` maps to
+    `scripts/ask-codex.sh`, `claude` maps to `scripts/ask-claude.sh`.
+    Only takes effect when `--ask-codex-path` is left at its default.
 
-### 3.12 `examples/embodiment/run_embodied_tuner.sh` — shim launcher
+### 3.15 `wiki/` — critic optimization context (new)
+
+- **Role.** Natural-language optimization context loaded verbatim into
+  every critic prompt. Complements the mechanical inputs (MetricTable,
+  timeline JSONL, current knob values, trial history) with a bottleneck
+  rubric, placement critical paths, per-knob playbook, timeline signal
+  glossary, and hard constraint list.
+- **Files** (loaded in numeric order by `critic._load_wiki_context`):
+  - [`README.md`](./wiki/README.md) — read order + editorial rules
+  - [`00-bottleneck-rubric.md`](./wiki/00-bottleneck-rubric.md) — reading
+    order, when to trust which block, term→knob decision table
+    (extracted from what was previously the `_BOTTLENECK_RUBRIC`
+    Python constant)
+  - [`01-placement-critical-paths.md`](./wiki/01-placement-critical-paths.md) —
+    critical path per placement mode (collocated / hybrid /
+    disaggregated) and per runner mode (`run` vs `run_pipeline`)
+  - [`02-optimization-directions.md`](./wiki/02-optimization-directions.md) —
+    knob-by-knob playbook: what each knob shifts, when to touch it,
+    common OOM patterns
+  - [`03-timeline-signals.md`](./wiki/03-timeline-signals.md) — what each
+    timeline tag means, how `stall_fraction` is defined, which tags
+    are wrappers to ignore
+  - [`04-constraints.md`](./wiki/04-constraints.md) — every rule that
+    will refuse a delta, split into preflight-enforced (fail fast) vs
+    runtime-enforced (crashes the trial)
+- **Design notes.**
+  - **Why markdown, not Python.** Prompt tuning is workload knowledge
+    (which knob helps which bottleneck), not code. Keeping it in
+    markdown lets a domain expert edit without touching `critic.py`.
+    The critic prompt builder reads each file verbatim into a
+    `wiki_block` section — no templating, no substitution.
+  - **A missing wiki file is a build error.** `_read_wiki_file` raises
+    `FileNotFoundError` at import time so tests and real trials fail
+    fast rather than producing a silently-weaker critic prompt.
+  - **The wiki is excluded from `to_debug_text()`** so per-attempt
+    `attempt-NN-prompt.md` files stay compact. The debug view is what
+    a human reads when auditing a decision; the full wiki is
+    reproducible from the git-tracked files.
+
+### 3.16 `scripts/ask-codex.sh` + `scripts/ask-claude.sh` — vendored transports (new)
+
+- **Role.** Shell scripts that take a prompt on stdin, invoke the
+  respective LLM binary, and stream the response to stdout. Vendored
+  next to the toolkit so a shared-humanize install is not required.
+- **Design notes.**
+  - `CodexCritic.ask_codex_path` defaults to the script sitting next
+    to the module (`scripts/ask-codex.sh`); `--critic-backend=claude`
+    swaps it for `scripts/ask-claude.sh`.
+  - The scripts mirror the interface of humanize's `ask-codex.sh` /
+    `ask-claude.sh`; if the shared version diverges, this vendored
+    copy can be updated independently.
+
+### 3.17 `profiler/` — vendored timeline + memory profiler (new)
+
+- **Role.** Vendored copy of the `rlinf_timeline` autopatch machinery,
+  the NVITOP / NVML samplers, and the Gantt/memory plotting scripts
+  (`plot_timeline.py`, `plot_nvitop.py`, `plot_nvml.py`).
+- **How the tuner uses it.**
+  - `TrialRunner._with_profiler_env` exports
+    `RLINF_TIMELINE*` (default on) and `RLINF_NVITOP` /
+    `RLINF_NVML` (opt-in) so the autopatch turns on without the user
+    having to `source profiler/enable2.sh`.
+  - `timeline_feed.render_default_plots` invokes
+    `profiler/plot_timeline.py` via `subprocess.run` (best-effort;
+    every failure is logged and `None` returned).
+- See [`profiler/README.md`](./profiler/README.md) for the standalone
+  usage of these tools (which pre-dates the tuner).
+
+### 3.18 `examples/embodiment/run_embodied_tuner.sh` — shim launcher
 
 - **Role.** Wrap `python -m toolkits.embodied_tuner` with the
   `PYTHONPATH` / `REPO_PATH` setup the toolkit needs, matching the
@@ -548,7 +920,7 @@ dataclasses for clarity and immutability.
 
 ### 4.1 The dual-source rationale rule
 
-**Where:** `CriticOutputValidator` (`critic.py:337+`).
+**Where:** `CriticOutputValidator` (`critic.py`).
 **Why:** Placement decisions are the highest-impact, costliest-to-change
 class of mutation. Without a forcing function, an LLM critic will
 sometimes propose plausible-sounding placement shifts that are not
@@ -562,7 +934,28 @@ reason as feedback on its retry.
 `test_validator_rejects_empty_citations_for_placement_delta`,
 `test_codex_critic_retries_after_dual_source_failure`.
 
-### 4.2 Preflight without Ray
+### 4.2 The mandatory-bitter-lesson rule
+
+**Where:** `CriticOutputValidator._LESSON_REQUIRED_FAILURE_MODES`
+(`critic.py`), `Scheduler._record_bitter_lesson` (`scheduler.py`),
+`LessonBook` (`lessons.py`).
+**Why:** The critic sees only the last `history_window=8` trials in its
+prompt. In the maniskill campaign, the critic proposed the same
+`rollout.enable_offload=False` OOM three times in a row because the
+failing trial rolled out of that window. Rather than growing the window
+(which makes every prompt heavier), we force the critic to *write down
+what it just learned* after every OOM/WORKER_CRASH/TIMEOUT/CONFIG_INVALID
+failure. Those lessons are appended to `<ledger_dir>/bitter_lessons.jsonl`
+and prepended to every subsequent prompt — even long after the failing
+trial has fallen out of history. Two lessons with the same `(failure_mode,
+delta_signature)` collapse to one so the block stays bounded, and an
+LRU cap of 30 prevents runaway campaigns from ballooning the prompt.
+**Tested by:** `test_lessons.py` (dedup, LRU eviction, canonical
+signature recursion), `test_critic.py` (validator refuses missing
+lessons after failed trials), `test_scheduler.py` (fold happens before
+the next trial, not after).
+
+### 4.3 Preflight without Ray
 
 **Where:** `preflight.compose_and_validate` (`preflight.py`).
 **Why:** `rlinf.config.validate_cfg` / `validate_embodied_cfg`
@@ -582,7 +975,7 @@ coverage is a queued polish item (Codex review SUGGESTION).
 **Tested by:** `test_baseline_alone_passes_preflight`,
 `test_micro_batch_size_violation_rejected`, etc.
 
-### 4.3 Env-tagged orphan cleanup via `/proc`
+### 4.4 Env-tagged orphan cleanup via `/proc`
 
 **Where:** `runner._pids_with_env_match` + `runner._default_pgrep_runner`.
 **Why:** `pgrep -f <pattern>` matches *argv*, not environment.
@@ -596,7 +989,7 @@ union with `pgrep -f`. Recorded as BitLesson
 **Scope:** POSIX Linux only (graceful fallback to `pgrep -f` on
 other platforms). Best-effort; never raises from the cleanup path.
 
-### 4.4 Campaign-unique trial id
+### 4.5 Campaign-unique trial id
 
 **Where:** `__main__._campaign_id` + `_runner_adapter`.
 **Why:** Two same-user campaigns on a shared host using
@@ -607,7 +1000,7 @@ SHA-1 of the absolute ledger_dir path. And the default ledger_dir
 carries a 6-hex-char `os.urandom` nonce so even same-second same-config
 launches don't collide on the directory itself.
 
-### 4.5 OOM-before-METRICS_MISSING precedence
+### 4.6 OOM-before-METRICS_MISSING precedence
 
 **Where:** `parser.parse_trial`.
 **Why:** An OOM-killed trial frequently dies before writing
@@ -618,7 +1011,7 @@ failure mode. The runner already writes a merged stdout+stderr to
 the OOM/crash rubric BEFORE the metrics-presence check whenever
 `returncode != 0`.
 
-### 4.6 Append-only ledger with per-line fsync
+### 4.7 Append-only ledger with per-line fsync
 
 **Where:** `ledger.Ledger.append`.
 **Why:** Tuning campaigns run for hours; a SIGKILL between trials
@@ -626,9 +1019,10 @@ shouldn't corrupt the prior trial's record. `append()` opens in
 `"a"`, writes one line, `flush()`, `os.fsync()`. `load()` tolerates
 JSON decode + schema violations per line (counts them in
 `skipped_lines`), so a partial write on crash is detected but doesn't
-prevent loading the earlier entries.
+prevent loading the earlier entries. The same policy is applied
+verbatim to the LessonBook (`lessons.LessonBook._write_line`).
 
-### 4.7 `(FAILED, NONE)` is an enforced invariant
+### 4.8 `(FAILED, NONE)` is an enforced invariant
 
 **Where:** `TrialResult.__post_init__` (`parser.py`).
 **Why:** A `FAILED` trial must always carry a non-`NONE` failure
@@ -637,7 +1031,7 @@ The dataclass raises `ParserInvariantError` at construction time if
 the invariant is violated, surfacing bugs immediately rather than
 silently losing information.
 
-### 4.8 Preflight-exhausted ≠ trial slot
+### 4.9 Preflight-exhausted ≠ trial slot
 
 **Where:** `scheduler.Scheduler.run` + `_record_preflight_exhausted`.
 **Why:** If the critic produces `preflight_retries+1` consecutive
@@ -647,33 +1041,99 @@ know will fail `validate_cfg` in production. Instead the scheduler
 writes a synthetic `(FAILED, CONFIG_INVALID)` ledger entry (preserves
 the audit trail) and stops with `stop_reason="preflight_exhausted"`.
 
+### 4.10 Blocking-tag-aware timeline analytics
+
+**Where:** `timeline_processor.BLOCKING_TAGS` +
+`compute_critical_path` / `compute_per_component_bubble`.
+**Why:** Timeline events like `actor/recv_traj` and
+`actor/recv_rollout_trajectories` *look* like busy intervals but are
+actually the actor blocked waiting on rollout+env to produce
+trajectories. If we count them as real work, the critic sees "actor
+is 97% busy" and rules out actor-side deltas — when actor is in fact
+mostly idle. Every A' / D' aggregation subtracts blocking events
+before computing busy totals. The prompt renders a
+`_BLOCKING_TAGS_EXPLAINER` note so the LLM interprets `real_s` vs
+`blocked_s` correctly. Extending the block list is a domain decision
+and requires human review (per plan BitLesson).
+
+### 4.11 Wiki-in-git, not string constants in Python
+
+**Where:** `wiki/*.md` + `critic._load_wiki_context`.
+**Why:** The earlier build had a `_BOTTLENECK_RUBRIC` string constant
+inline in `critic.py`. Every prompt edit needed a Python change, and
+non-Python contributors couldn't touch prompt guidance. Moving the
+context to numbered markdown files under `wiki/` makes editing the
+prompt an ordinary docs edit; the same files are readable as
+standalone documentation for anyone learning the tuner. A missing
+wiki file raises at import time — no silent degradation to a
+weaker prompt.
+
+### 4.12 Critic transaction persistence
+
+**Where:** `scheduler.Scheduler._persist_critic_transactions` +
+`critic.CodexCritic.transaction_log`.
+**Why:** Reading a ledger entry tells you WHAT the critic proposed and
+WHY (via `critic_rationale`). It does not tell you what the critic
+*saw* nor what it originally returned before the dual-source /
+bitter-lesson retry loop reshaped the response. The scheduler drains
+`transaction_log` after every `propose(...)` into
+`<log_dir>/critic/attempt-NN-{prompt.md, response.txt}` so a human
+debugger can replay the full conversation. The prompt file uses
+`CriticPrompt.to_debug_text()` (compact form, wiki+schema-doc+verbose-
+timeline excluded) so the persisted file stays inspection-friendly
+instead of a 36 KB dump.
+
+### 4.13 Multi-backend critic transport
+
+**Where:** `__main__._build_critic` + `--critic-backend {codex,claude}`
++ `scripts/ask-{codex,claude}.sh`.
+**Why:** Codex and Claude have different failure modes on the
+structured-JSON contract the tuner requires. Rather than hard-code one
+provider, the CLI picks the transport script by name and hands it to
+`CodexCritic.ask_codex_path`. The class name is kept for backwards
+compatibility; the wiring is generic (any script that reads a prompt
+on stdin and writes the response on stdout works).
+
+### 4.14 Memory telemetry off by default
+
+**Where:** `__main__` (`--collect-memory` mutex group; default `False`)
++ `TrialRunner.disable_memory_telemetry`.
+**Why:** A 12-hour, 20-trial campaign accumulates hundreds of megabytes
+of nvitop/NVML JSONL. That's fine for a single debug run but wasteful
+for routine campaigns, and the tuner doesn't consume the samples during
+the loop (only the operator does, post-hoc). Timeline env exports
+remain on by default because `timeline/*.jsonl` IS consumed every
+round by the critic.
+
 ---
 
 ## 5. Test architecture
 
 ```
-tests/test_schema.py                       21 tests  (AC-1)
+tests/test_schema.py                       19 tests  (AC-1)
 tests/test_placement_enum.py               25 tests  (AC-4)
 tests/test_override_wrapper.py             16 tests  (AC-2)
 tests/test_preflight.py                    14 tests  (AC-3)
 tests/test_runner.py                       15 tests  (AC-5)
-tests/test_parser.py                       27 tests  (AC-6)
+tests/test_parser.py                       31 tests  (AC-6)
+tests/test_timeline_processor.py           38 tests  (AC-6/new)
 tests/test_ledger.py                       13 tests  (AC-9)
-tests/test_critic.py                       30 tests  (AC-7)
-tests/test_scheduler.py                    13 tests  (AC-8)
+tests/test_lessons.py                      13 tests  (new — BitterLesson store)
+tests/test_critic.py                       51 tests  (AC-7)
+tests/test_scheduler.py                    19 tests  (AC-8)
 tests/test_cli.py                          17 tests  (AC-10)
 tests/test_smoke.py                         3 tests  (AC-11)
 tests/test_no_auto_placement_import.py      7 tests  (AC-11)
 ────────────────────────────────────────────────────────────
-total                                     201 tests
+total                                     281 tests
 ```
 
 All tests are **hermetic** — no real RLinf launch, no Ray, no GPU,
-no Codex network call. The classes of test:
+no Codex/Claude network call. The classes of test:
 
 - **Unit tests** (`test_{schema,placement_enum,override_wrapper,
-  parser,ledger,critic}.py`) — pure-Python assertions on individual
-  modules.
+  parser,ledger,critic,lessons,timeline_processor}.py`) — pure-Python
+  assertions on individual modules.
 - **Subprocess tests** (`test_runner.py`) — use small `python -c
   "import time; time.sleep(...)"` subprocesses to exercise timeout /
   SIGTERM / SIGKILL paths.
@@ -684,6 +1144,14 @@ no Codex network call. The classes of test:
 - **Scheduler stub tests** (`test_scheduler.py`) — inject
   `runner_fn` / `parser_fn` / `preflight_fn` mocks via a small
   factory so every stop-reason path is verified deterministically.
+  Also asserts the bitter-lesson fold happens BEFORE the next trial.
+- **Timeline processor tests** (`test_timeline_processor.py`) —
+  synthetic event lists exercise every view (stall_fractions, tag
+  stats, critical path, outliers, per-component bubble, raw excerpts,
+  component call averages, BLOCKING_TAGS exclusion).
+- **LessonBook tests** (`test_lessons.py`) — canonical signature
+  recursion, dedup by `(mode, signature)`, LRU cap with eviction
+  markers, fsync-per-append, corruption tolerance.
 - **End-to-end smoke** (`test_smoke.py`) — drives the full
   `Scheduler.run()` via `FakeCritic` + mock runner/parser/preflight
   for N=4 synthetic trials, including OOM and parser-crash
@@ -703,9 +1171,13 @@ Run with: `cd <RLinf root>; PYTHONPATH=. python -m pytest toolkits/embodied_tune
 |------------------------|------------------------------------------------------------------------------------------------------------|
 | New tunable knob       | Add to `_default_domains()` in `schema.py`; the critic prompt auto-renders its legal range; preflight may need a new divisibility check. |
 | New pinned knob        | Same as above but set `pinned=True`. The schema rejects it with `KnobNotTunableError`.                    |
-| New `FailureMode`      | Add to the `FailureMode` enum in `parser.py` and extend `_classify_failure` if it has a regex trigger.    |
+| New `FailureMode`      | Add to the `FailureMode` enum in `parser.py`, extend `_classify_failure` if it has a regex trigger, and consider whether it should be added to `critic._LESSON_REQUIRED_FAILURE_MODES`. |
 | Alternative critic     | Implement the `Critic` protocol (`critic.py::Critic`). For Bayesian/EA fallback (FUT-3), the scheduler is critic-agnostic — just swap the `critic` argument. |
+| New critic backend     | Drop a `scripts/ask-<name>.sh` next to the module (stdin=prompt, stdout=response), then extend the `--critic-backend` choices in `__main__.build_parser`. |
 | Mirror more `validate_cfg` rules | Add new checks in `preflight._check_divisibility`. They must be computable without `Cluster()`. |
+| New timeline analysis view | Add a `compute_*` function to `timeline_processor.py`, wire it through `process_timeline`, add a matching `TimelineSummary` field in `parser.py`, and render a labelled block in `critic._render_timeline_verbose`. |
+| Widen `BLOCKING_TAGS`  | `timeline_processor.BLOCKING_TAGS`. Human review required; a wrong entry silently deflates a component's busy total.  |
+| Update critic prompt guidance | Edit the relevant file under `wiki/` — no Python change needed. Order matters; keep numeric prefixes stable.  |
 | New best-config selection rule | Change `parser.select_best`. The scheduler and ledger both delegate to it.                          |
 | Multi-node placement   | Generalise `placement_enum.is_legal_placement` to accept node-qualified ranges. (FUT-1)                   |
 | Async pipelined trials | Change `Scheduler.run` to a producer/consumer model. The runner/parser/ledger are already stateless. (FUT-2) |
@@ -726,10 +1198,17 @@ Run with: `cd <RLinf root>; PYTHONPATH=. python -m pytest toolkits/embodied_tune
 - `examples/embodiment/run_embodiment.sh` — unchanged; wrapped by
   `OverrideWrapper`.
 - `examples/embodiment/train_embodied_agent.py` — the Hydra entry
-  point the wrapper points argv at.
-- `profiler/rlinf_timeline/autopatch.py` — emits the JSONL events
-  the parser consumes. The runner exports the env flags that turn
-  the autopatch on.
+  point the wrapper points argv at. The trial's resolved
+  `<log_dir>/tensorboard/config.yaml` is read back by
+  `__main__._extract_trial_context` to recover the effective
+  `enable_offload` state.
+- `profiler/rlinf_timeline/autopatch.py` (vendored under
+  `toolkits/embodied_tuner/profiler/`) — emits the JSONL events
+  `timeline_processor` consumes. The runner exports the env flags
+  that turn the autopatch on.
+- `profiler/plot_timeline.py` (vendored) — invoked best-effort by
+  `timeline_feed.render_timeline_plot` to produce Gantt PNGs alongside
+  every trial.
 
 ### 7.2 RLinf modules deliberately NOT used
 
@@ -744,8 +1223,10 @@ Run with: `cd <RLinf root>; PYTHONPATH=. python -m pytest toolkits/embodied_tune
 
 - `humanize/commands/start-rlcr-loop.md` — the RLCR loop machinery
   that BUILT this tuner over 5 rounds.
-- `humanize/commands/ask-codex.md` + `scripts/ask-codex.sh` — the
-  Codex transport `CodexCritic` shells out to.
+- `humanize/commands/ask-codex.md` — the humanize command whose
+  interface the vendored `scripts/ask-codex.sh` matches. The shared
+  `scripts/ask-*.sh` scripts are copies vendored next to the toolkit
+  so a shared-humanize install is not required.
 - `mlsys2026-flashinfer-contest/` — the precedent contest workflow
   (`gen-idea → gen-plan → start-rlcr-loop`) this build followed.
 - BitLesson: `RLinf/.humanize/bitlesson.md` carries one entry
@@ -765,11 +1246,18 @@ Run with: `cd <RLinf root>; PYTHONPATH=. python -m pytest toolkits/embodied_tune
   parser averages `step_time` across all N blocks (single-step trials
   are still measurable).
 - `profiler/enable2.sh` leaves `RLINF_NVITOP=1` / `RLINF_NVML=1`
-  commented out by default. The tuner's runner sets them
-  unconditionally so memory telemetry is present.
+  commented out by default. The tuner's runner exposes these behind
+  `--collect-memory` (opt-in) so routine campaigns don't accumulate
+  hundreds of MB of memory telemetry; timeline env vars remain on by
+  default because the critic consumes them every round.
 - Hydra search paths in embodied baselines use
   `${oc.env:EMBODIED_PATH}/config/`. Preflight sets `EMBODIED_PATH` /
   `REPO_PATH` before `compose()` so the interpolation resolves.
+- Every trial writes its resolved Hydra config to
+  `<log_dir>/tensorboard/config.yaml`. `__main__._extract_trial_context`
+  reads that file to recover the effective `enable_offload` per
+  component; without it, `timeline_processor.compute_outliers` would
+  ship without the `knob_hint` column.
 
 ---
 
@@ -787,18 +1275,11 @@ humanize + RLCR pipeline:
    reviewing each round's summary.
 4. Codex final review on commit `8eb645b0` issued
    `COMPLETE_ELIGIBLE: yes`.
-
-Commit history (in `RLinf`):
-
-```
-5b9e28b9 docs(toolkits/embodied_tuner): add README covering CLI, outputs, and architecture
-3f54419c docs(rlcr): mark embodied_tuner RLCR loop COMPLETE in round-4-summary
-8eb645b0 fix(toolkits/embodied_tuner): default ledger_dir now carries a random nonce
-4e500491 fix(toolkits/embodied_tuner): close 2 IMPORTANT items from final Codex review
-ef650e37 feat(toolkits): add embodied_tuner Milestone D — CLI, smoke test, AST walker; fold Codex Round-2 review fixes
-7639f2dc feat(toolkits): add embodied_tuner Milestone C — ledger, critic, scheduler
-563e8dc6 feat(toolkits): add embodied_tuner Milestone B — trial runner + log/timeline parser
-8eb5a9fb feat(toolkits): add embodied_tuner Milestone A — schema, placement enum, override wrapper, preflight
-```
+5. Subsequent iterations added the persistent BitterLesson store,
+   the wiki-driven critic prompt, the seven-view timeline processor,
+   the JSONL feed selector + Gantt rendering, per-attempt critic
+   transaction persistence, the `--trial-timeout-seconds` +
+   `--critic-backend` CLI knobs, and moved memory telemetry behind
+   `--collect-memory`.
 
 For an operator-facing usage guide, see [`README.md`](./README.md).

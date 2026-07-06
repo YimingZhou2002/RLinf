@@ -71,6 +71,9 @@ from toolkits.embodied_tuner.scheduler import (
     Scheduler,
 )
 from toolkits.embodied_tuner.schema import KnobSchema
+from toolkits.embodied_tuner.utils.plot_step_time_vs_trajectories import (
+    plot_ledger_dir,
+)
 
 
 _LOGGER = logging.getLogger("toolkits.embodied_tuner")
@@ -413,6 +416,7 @@ def _run_campaign(args: CLIArgs) -> int:
     )
     campaign = scheduler.run()
     _emit_best_artefacts(campaign, args)
+    _emit_ledger_plot(args.ledger_dir)
     _LOGGER.info(
         "embodied_tuner: stop_reason=%s trials=%d oom=%d",
         campaign.stop_reason,
@@ -639,6 +643,31 @@ def _emit_best_artefacts(campaign: CampaignResult, args: CLIArgs) -> None:
             indent=2,
         )
     )
+
+
+def _emit_ledger_plot(ledger_dir: Path) -> None:
+    """Render ``step_time_vs_num_trajectories.png`` next to the ledger.
+
+    A plotting failure MUST NOT fail the campaign — the ledger and best-*
+    artefacts are the primary outputs. Log-and-swallow so operators still
+    get a non-zero exit only for real campaign problems.
+    """
+    try:
+        out = plot_ledger_dir(ledger_dir)
+    except Exception:  # noqa: BLE001 — best-effort side artefact
+        _LOGGER.warning(
+            "embodied_tuner: failed to render step_time/num_trajectories plot",
+            exc_info=True,
+        )
+        return
+    if out is None:
+        _LOGGER.info(
+            "embodied_tuner: skipped step_time/num_trajectories plot "
+            "(no successful trials in %s)",
+            ledger_dir,
+        )
+    else:
+        _LOGGER.info("embodied_tuner: wrote %s", out)
 
 
 if __name__ == "__main__":
