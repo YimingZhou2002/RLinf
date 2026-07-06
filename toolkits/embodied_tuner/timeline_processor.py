@@ -12,54 +12,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Higher-level timeline analyses consumed by the Codex critic prompt.
+"""Timeline analyses consumed by the Codex critic prompt.
 
-The existing :mod:`toolkits.embodied_tuner.parser` already produces
-per-rank :class:`TagStats` and per-component stall fractions from
-``timeline/*.jsonl``. Those signals describe *what each component spent
-time doing* but not *why the step took as long as it did*. This module
-adds four orthogonal views, derived from feedback that the critic was
-making placement decisions without enough structural evidence:
+This module owns every derivation from ``timeline/*.jsonl`` — event
+loading, per-tag aggregation, stall fractions, and the four analytical
+views. :mod:`toolkits.embodied_tuner.parser` is a thin adapter that
+calls into this module and packs the results into
+:class:`TimelineSummary`.
 
-1. ``compute_critical_path`` (A')
+Views produced:
+
+1. ``compute_stall_fractions``
+   Per-component fraction of the observation window NOT covered by any
+   of that component's events. Captures pipeline / channel waits at the
+   coarsest level; the compact block in the critic prompt renders this.
+
+2. ``compute_tag_stats``
+   Per-``(component, rank, tag)`` call count + min/median/max/total
+   duration for the headline tag list supplied by the parser.
+
+3. ``compute_critical_path`` (A')
    Per-``global_step`` summary of which ``(component, rank)`` lanes did
    the most REAL work versus how long they spent BLOCKED waiting on
-   another component. ``actor/recv_traj`` looks busy in the raw timeline
-   but is actually the actor waiting for rollout's trajectories — under
-   the hybrid placement (actor on every GPU, env/rollout sharing
-   sub-ranges) actor only does real GPU work during sync / forward /
-   backward / optimizer / compute_adv steps, not during ``recv_traj``.
-   :data:`BLOCKING_TAGS` enumerates the tag names that count as
-   blocking-wait so the critical-path view excludes them from
-   "real busy" totals.
+   another component. Uses :data:`BLOCKING_TAGS` to exclude wait-
+   disguised-as-work events.
 
-2. ``compute_outliers`` (C')
+4. ``compute_outliers`` (C')
    The longest events whose duration exceeds the per-tag P95 *and*
    exceeds 1s. Each outlier carries a ``knob_hint`` derived from the
-   current ``enable_offload`` flags so the critic can see "this 45s
-   ``env_interact_step`` was during warmup AND ``env.enable_offload``
-   was true — flipping the flag should remove this stall."
+   current ``enable_offload`` flags.
 
-3. ``compute_per_gpu_bubble`` (D')
-   GPU-by-GPU breakdown under the current ``cluster.component_placement``.
-   For each physical GPU id we union the REAL-busy intervals from every
-   component whose rank-on-this-GPU is doing real work and report the
-   complementary bubble fraction. The output includes per-GPU detail
-   *and* env-side / rollout-side averages so the critic can answer
-   "should I shift GPU budget from one side to the other?" directly.
+5. ``compute_per_component_bubble`` (D')
+   For each component (env/rollout/actor), the union of REAL-busy
+   intervals across all its ranks and the complementary bubble fraction
+   over wall time. Also reports per-rank detail so the critic can spot
+   stragglers. Replaces the old per-GPU view — same signal but keyed on
+   workload identity, which is what the critic actually reasons about.
 
-4. ``extract_raw_excerpts``
-   Top-K longest raw events copied verbatim from the JSONL stream so
-   Codex can inspect the full call context (``qualname``, ``call_index``,
-   ``configured_*`` fields, etc.) and reason about anomalies the
-   aggregated summaries alone cannot explain.
+6. ``extract_raw_excerpts``
+   Top-K longest raw events copied verbatim so the critic can inspect
+   full call context (``qualname``, ``call_index``, ``configured_*``,
+   etc.) when the aggregations don't explain an anomaly.
 
-The public entry point :func:`process_timeline` loads ``timeline_dir``
-and runs all four. The result is a JSON-serialisable dict that the
-parser splices into :class:`TimelineSummary` and the scheduler dumps
-verbatim into the ledger's ``timeline_summary`` payload, which then
-flows back into the next critic prompt via
-:func:`toolkits.embodied_tuner.critic.build_prompt`.
+7. ``compute_component_call_averages``
+   Per-component (default: env, rollout) mean per-call duration after
+   dropping the first :data:`DEFAULT_SKIP_FIRST_CALLS` events (warmup
+   skew). Pools events across all ranks/tags for the component, excludes
+   :data:`BLOCKING_TAGS` wrappers to avoid double-counting, sorts by
+   ``t0``, then averages the tail. Steady-state per-call cost the critic
+   uses when reasoning about whether a knob affected the *typical* call
+   or only the warmup call.
+
+The public entry point :func:`process_timeline` loads a timeline dir
+and runs (3)/(4)/(5)/(6)/(7); the parser calls (1)/(2) directly against
+the loaded events. All component-oriented views exclude the ``runner``
+component — its single ``run`` event spans the whole trial and adds no
+signal to per-component analysis.
 """
 
 from __future__ import annotations
@@ -70,11 +78,6 @@ from collections.abc import Iterable, Mapping, Sequence
 from glob import glob
 from pathlib import Path
 from typing import Any
-
-from toolkits.embodied_tuner.placement_enum import (
-    PlacementParseError,
-    parse_range_spec,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +115,29 @@ BLOCKING_TAGS: dict[str, frozenset[str]] = {
 }
 
 
+# Components excluded from every per-component aggregation. `runner`
+# emits a single `run` event spanning the whole trial — it dominates
+# rankings and reports 0.000 stall by construction. Dropping it makes
+# the compact block and per-component bubble legible.
+EXCLUDED_COMPONENTS: frozenset[str] = frozenset({"runner"})
+
+
 # Number of top-K outliers and raw excerpts to keep. Bumping these
 # inflates every critic prompt token-for-token; the defaults are tuned
 # so the four new sections together stay under ~3 KB.
 DEFAULT_OUTLIER_K: int = 12
 DEFAULT_RAW_EXCERPTS_K: int = 15
 OUTLIER_MIN_SECONDS: float = 1.0  # ignore sub-second "outliers"
+
+
+# Components + skip count for :func:`compute_component_call_averages`.
+# env and rollout are the two components whose per-call cost the critic
+# actually reasons about — actor per-call cost is already captured by
+# the ``per_tag`` headline stats. Skipping the first 2 calls removes the
+# bootstrap warmup (offload page-in, JIT compile, first-CUDA-kernel
+# init) which otherwise inflates the mean by orders of magnitude.
+DEFAULT_CALL_AVERAGE_COMPONENTS: tuple[str, ...] = ("env", "rollout")
+DEFAULT_SKIP_FIRST_CALLS: int = 2
 
 
 # Fields kept on raw-excerpt records. The full JSONL line can be very
@@ -135,11 +155,14 @@ _RAW_EXCERPT_FIELDS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 
-def _load_events(timeline_dir: Path | str) -> list[dict]:
-    """Return every JSONL event under ``timeline_dir``.
+def load_events(timeline_dir: Path | str) -> list[dict]:
+    """Return every JSONL event under ``timeline_dir``, normalized.
 
-    Best-effort: malformed lines and unreadable files are skipped. Each
-    event has ``t0 <= t1`` and a derived ``dur`` field.
+    Each returned dict has ``t0 <= t1``, an integer ``rank``, and a
+    derived ``dur = t1 - t0``. Missing ``t0/t1/component/rank/tag``
+    events, malformed lines, and unreadable files are silently skipped.
+    ``tag`` falls back to ``worker_timer`` when present (matches what
+    ``profiler/rlinf_timeline/autopatch.py`` emits for some paths).
     """
     events: list[dict] = []
     for path in sorted(glob(f"{Path(timeline_dir)}/*.jsonl")):
@@ -156,13 +179,23 @@ def _load_events(timeline_dir: Path | str) -> list[dict]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                tag = rec.get("tag") or rec.get("worker_timer")
+                component = rec.get("component")
+                rank = rec.get("rank")
+                if tag is None or component is None or rank is None:
+                    continue
                 try:
                     t0 = float(rec["t0"]); t1 = float(rec["t1"])
+                    rank_int = int(rank)
                 except (KeyError, TypeError, ValueError):
                     continue
                 if t1 < t0:
                     t0, t1 = t1, t0
-                rec["t0"], rec["t1"] = t0, t1
+                rec["t0"] = t0
+                rec["t1"] = t1
+                rec["tag"] = tag
+                rec["component"] = component
+                rec["rank"] = rank_int
                 rec["dur"] = t1 - t0
                 events.append(rec)
         finally:
@@ -179,39 +212,99 @@ def is_blocking(event: Mapping[str, Any]) -> bool:
     return tag in BLOCKING_TAGS.get(component, frozenset())
 
 
+def _is_excluded(component: Any) -> bool:
+    return component in EXCLUDED_COMPONENTS
+
+
 # ---------------------------------------------------------------------------
-# Placement parsing
+# Stall fractions (moved from parser._stall_fraction)
 # ---------------------------------------------------------------------------
 
 
-def placement_to_gpu_map(
-    placement: Mapping[str, Any],
-    num_gpus: int = 8,
-) -> dict[str, dict[int, int]]:
-    """Resolve ``cluster.component_placement`` into ``{component: {rank: gpu}}``.
+def compute_stall_fractions(
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, float]:
+    """Per-component fraction of the observation window NOT covered by any event.
 
-    Accepts the YAML-native form where each value is either a range
-    string (``"0-3"``, ``"all"``, ``"0,2,4-6"``) or already a list of
-    GPU ids. Components missing from ``placement`` are returned empty.
-    Unparseable entries are skipped — production callers should treat
-    a None/empty result as "no per-GPU view available".
+    Coarsest-grained idle signal — does NOT exclude blocking tags (that
+    is what :func:`compute_per_component_bubble` is for). The compact
+    block in the critic prompt renders this because it is easy to
+    explain: "when is *nothing at all* happening on this component?".
+
+    Excludes :data:`EXCLUDED_COMPONENTS`.
     """
-    out: dict[str, dict[int, int]] = {}
-    for component, value in placement.items():
-        gpus: tuple[int, ...]
-        if isinstance(value, str):
-            try:
-                gpus = parse_range_spec(value, num_gpus=num_gpus)
-            except (PlacementParseError, ValueError):
-                continue
-        elif isinstance(value, (list, tuple)):
-            try:
-                gpus = tuple(int(g) for g in value)
-            except (TypeError, ValueError):
-                continue
-        else:
+    if not events:
+        return {}
+    window_start = min(float(e["t0"]) for e in events)
+    window_end = max(float(e["t1"]) for e in events)
+    total = window_end - window_start
+    if total <= 0:
+        return {}
+    intervals_by_component: dict[str, list[tuple[float, float]]] = {}
+    for event in events:
+        component = event.get("component")
+        if _is_excluded(component):
             continue
-        out[component] = {rank: gpu for rank, gpu in enumerate(gpus)}
+        intervals_by_component.setdefault(str(component), []).append(
+            (float(event["t0"]), float(event["t1"]))
+        )
+    out: dict[str, float] = {}
+    for component, intervals in intervals_by_component.items():
+        covered = sum(t - s for s, t in _merge_intervals(intervals))
+        stall = max(total - covered, 0.0)
+        out[component] = stall / total
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-tag stats (moved from parser)
+# ---------------------------------------------------------------------------
+
+
+def compute_tag_stats(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    headline_tags: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Per-``(component, rank, tag)`` aggregation for the headline tag list.
+
+    Returns dict rows keyed by the same fields as the parser's
+    :class:`TagStats` dataclass so the parser can wrap them in one pass.
+    Only tags in ``headline_tags`` are summarised, to keep the critic
+    prompt compact. Excludes :data:`EXCLUDED_COMPONENTS`.
+    """
+    wanted = frozenset(headline_tags)
+    grouped: dict[tuple[str, int, str], list[float]] = {}
+    for event in events:
+        component = event.get("component")
+        if _is_excluded(component):
+            continue
+        tag = event.get("tag")
+        rank = event.get("rank")
+        if tag not in wanted:
+            continue
+        try:
+            rank_int = int(rank)
+        except (TypeError, ValueError):
+            continue
+        grouped.setdefault(
+            (str(component), rank_int, str(tag)), []
+        ).append(float(event.get("dur", 0.0)))
+    out: list[dict[str, Any]] = []
+    for (component, rank, tag) in sorted(grouped):
+        durs = grouped[(component, rank, tag)]
+        if not durs:
+            continue
+        out.append({
+            "component": component,
+            "rank": rank,
+            "tag": tag,
+            "call_count": len(durs),
+            "duration_min": min(durs),
+            "duration_median": statistics.median(durs),
+            "duration_max": max(durs),
+            "duration_total": sum(durs),
+        })
     return out
 
 
@@ -230,6 +323,7 @@ def compute_critical_path(
     Returns ``{global_step: {step_span_s, real_busy_top: [...]}}``.
     Events without a ``global_step`` (bootstrap warmup) are ignored;
     the bootstrap stalls show up in :func:`compute_outliers` instead.
+    Events from :data:`EXCLUDED_COMPONENTS` are dropped.
 
     The ``real_busy_top`` list ranks ``(component, rank)`` lanes by
     REAL busy seconds (blocking tags excluded). Each entry also reports
@@ -239,6 +333,8 @@ def compute_critical_path(
     """
     by_step: dict[int, list[Mapping[str, Any]]] = {}
     for event in events:
+        if _is_excluded(event.get("component")):
+            continue
         gs = event.get("global_step")
         if gs is None:
             continue
@@ -353,7 +449,7 @@ def compute_outliers(
 
 
 # ---------------------------------------------------------------------------
-# D' — Per-GPU bubble under placement
+# D' — Per-component bubble
 # ---------------------------------------------------------------------------
 
 
@@ -371,92 +467,82 @@ def _merge_intervals(
     return [(s, t) for s, t in out]
 
 
-def compute_per_gpu_bubble(
+def compute_per_component_bubble(
     events: Sequence[Mapping[str, Any]],
-    *,
-    placement: Mapping[str, Any] | None,
-    num_gpus: int = 8,
 ) -> dict[str, Any]:
-    """GPU-by-GPU bubble breakdown under ``placement``.
+    """Per-component real-busy vs bubble breakdown.
 
-    Returns ``{}`` when ``placement`` is None or no events match. The
-    output schema includes per-GPU detail *and* env-side / rollout-side
-    averages so the critic can read both granularities without rerunning
-    the analysis.
+    For each component (excluding :data:`EXCLUDED_COMPONENTS`, and
+    excluding blocking-wait tags via :func:`is_blocking`):
+
+    - ``busy_s`` — union of real-busy intervals across every rank of
+      this component. Answers "how much wall time is *at least one*
+      rank of this component doing real work?".
+    - ``bubble_s`` = wall - busy_s, ``bubble_frac`` = bubble_s / wall.
+      Lower bubble = component's ranks collectively covered more of
+      the trial wall.
+    - ``per_rank[rank]`` — same three stats per rank so the critic can
+      spot a straggler (one rank with much higher busy_s than the rest).
+
+    Returns ``{}`` when there are no events or the wall window is
+    degenerate. No placement required — the "which component sits on
+    which GPU" mapping is not needed to answer "is this component the
+    pipeline bottleneck".
     """
-    if not placement:
-        return {}
-    gpu_map = placement_to_gpu_map(placement, num_gpus=num_gpus)
-    if not gpu_map:
-        return {}
-
-    intervals_by_gpu: dict[int, list[tuple[float, float]]] = {}
-    for event in events:
-        if is_blocking(event):
-            continue
-        component = event.get("component")
-        rank = event.get("rank")
-        if component not in gpu_map:
-            continue
-        try:
-            rank_int = int(rank)
-        except (TypeError, ValueError):
-            continue
-        gpu = gpu_map[component].get(rank_int)
-        if gpu is None:
-            continue
-        intervals_by_gpu.setdefault(gpu, []).append(
-            (float(event["t0"]), float(event["t1"]))
-        )
-
     if not events:
         return {}
     t_min = min(float(e["t0"]) for e in events)
     t_max = max(float(e["t1"]) for e in events)
-    total = t_max - t_min
-    if total <= 0:
+    wall = t_max - t_min
+    if wall <= 0:
         return {}
 
-    per_gpu: dict[int, dict[str, Any]] = {}
-    all_gpus = set(intervals_by_gpu)
-    for component, mapping in gpu_map.items():
-        all_gpus.update(mapping.values())
-    for gpu in sorted(all_gpus):
-        busy = sum(t - s for s, t in _merge_intervals(intervals_by_gpu.get(gpu, [])))
-        bubble = max(total - busy, 0.0)
-        residents = sorted(
-            comp for comp, mapping in gpu_map.items() if gpu in mapping.values()
-        )
-        per_gpu[gpu] = {
-            "residents": residents,
+    intervals_by_c: dict[str, list[tuple[float, float]]] = {}
+    intervals_by_cr: dict[tuple[str, int], list[tuple[float, float]]] = {}
+    for event in events:
+        component = event.get("component")
+        if _is_excluded(component):
+            continue
+        if is_blocking(event):
+            continue
+        try:
+            rank = int(event.get("rank"))
+        except (TypeError, ValueError):
+            continue
+        iv = (float(event["t0"]), float(event["t1"]))
+        intervals_by_c.setdefault(str(component), []).append(iv)
+        intervals_by_cr.setdefault((str(component), rank), []).append(iv)
+
+    if not intervals_by_c:
+        return {}
+
+    per_component: dict[str, dict[str, Any]] = {}
+    for component in sorted(intervals_by_c):
+        busy = sum(t - s for s, t in _merge_intervals(intervals_by_c[component]))
+        bubble = max(wall - busy, 0.0)
+        ranks = sorted(r for c, r in intervals_by_cr if c == component)
+        per_rank: dict[str, dict[str, float]] = {}
+        for rank in ranks:
+            r_busy = sum(
+                t - s
+                for s, t in _merge_intervals(intervals_by_cr[(component, rank)])
+            )
+            r_bubble = max(wall - r_busy, 0.0)
+            per_rank[str(rank)] = {
+                "busy_s": round(r_busy, 1),
+                "bubble_s": round(r_bubble, 1),
+                "bubble_frac": round(r_bubble / wall, 2),
+            }
+        per_component[component] = {
+            "num_ranks": len(ranks),
             "busy_s": round(busy, 1),
             "bubble_s": round(bubble, 1),
-            "bubble_frac": round(bubble / total, 2),
+            "bubble_frac": round(bubble / wall, 2),
+            "per_rank": per_rank,
         }
-
-    # env-side = the union of GPUs where env lives; rollout-side = where
-    # rollout lives. These two sets may overlap (collocated placement);
-    # we report the average bubble across the union so the critic gets a
-    # single comparable number per side.
-    env_gpus = set(gpu_map.get("env", {}).values())
-    rollout_gpus = set(gpu_map.get("rollout", {}).values())
-    env_side_avg = (
-        sum(per_gpu[g]["bubble_s"] for g in env_gpus) / len(env_gpus)
-        if env_gpus else None
-    )
-    rollout_side_avg = (
-        sum(per_gpu[g]["bubble_s"] for g in rollout_gpus) / len(rollout_gpus)
-        if rollout_gpus else None
-    )
     return {
-        "wall_s": round(total, 1),
-        "per_gpu": {str(g): info for g, info in per_gpu.items()},
-        "env_side_avg_bubble_s": (
-            round(env_side_avg, 1) if env_side_avg is not None else None
-        ),
-        "rollout_side_avg_bubble_s": (
-            round(rollout_side_avg, 1) if rollout_side_avg is not None else None
-        ),
+        "wall_s": round(wall, 1),
+        "per_component": per_component,
     }
 
 
@@ -476,11 +562,11 @@ def extract_raw_excerpts(
     :data:`_RAW_EXCERPT_FIELDS`) are copied through. Keeps every
     excerpt under ~200 chars when serialised.
 
-    Events from the ``runner`` component are dropped — its single
-    ``run`` event spans the whole trial and would otherwise dominate
-    the top-K list with zero signal value.
+    Events from :data:`EXCLUDED_COMPONENTS` are dropped — the runner's
+    single ``run`` event spans the whole trial and would otherwise
+    dominate the top-K list with zero signal value.
     """
-    filtered = [e for e in events if e.get("component") != "runner"]
+    filtered = [e for e in events if not _is_excluded(e.get("component"))]
     ordered = sorted(filtered, key=lambda e: -float(e.get("dur", 0.0)))
     out: list[dict[str, Any]] = []
     for event in ordered[:top_k]:
@@ -497,6 +583,68 @@ def extract_raw_excerpts(
 
 
 # ---------------------------------------------------------------------------
+# Per-component steady-state call averages
+# ---------------------------------------------------------------------------
+
+
+def compute_component_call_averages(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    components: Iterable[str] = DEFAULT_CALL_AVERAGE_COMPONENTS,
+    skip_first: int = DEFAULT_SKIP_FIRST_CALLS,
+) -> dict[str, dict[str, Any]]:
+    """Mean per-call duration per component after dropping the first N calls.
+
+    For each component in ``components`` (default: ``env``, ``rollout``):
+
+    - Collect every event of that component EXCLUDING :data:`BLOCKING_TAGS`
+      wrappers (`interact` / `run_interact_once` / `rollout/generate` /
+      `rollout/generate_one_epoch` — counting these alongside their
+      per-step children would double-count).
+    - Also excludes :data:`EXCLUDED_COMPONENTS`.
+    - Pool across all ranks and tags of the component, sort by ``t0``,
+      drop the first ``skip_first`` events, average ``dur`` over the
+      remainder.
+
+    Skipping the first ``skip_first`` calls filters out bootstrap warmup
+    (offload page-in, JIT compile, first-CUDA-kernel init) that would
+    otherwise dominate the mean. The critic uses this to see the
+    *steady-state* per-call cost — i.e. whether a knob affected the
+    typical call or only the warmup call.
+
+    Returns ``{component: {call_count_total, skipped, remaining_count,
+    mean_duration_s, min_duration_s, max_duration_s}}``. Components with
+    ``<= skip_first`` matching events are omitted (nothing to average).
+    """
+    requested = frozenset(components)
+    per_component: dict[str, list[Mapping[str, Any]]] = {}
+    for event in events:
+        component = event.get("component")
+        if _is_excluded(component) or component not in requested:
+            continue
+        if is_blocking(event):
+            continue
+        per_component.setdefault(str(component), []).append(event)
+
+    out: dict[str, dict[str, Any]] = {}
+    for component, evs in per_component.items():
+        if len(evs) <= skip_first:
+            continue
+        evs_sorted = sorted(evs, key=lambda e: float(e["t0"]))
+        tail = evs_sorted[skip_first:]
+        durs = [float(e["dur"]) for e in tail]
+        out[component] = {
+            "call_count_total": len(evs_sorted),
+            "skipped": skip_first,
+            "remaining_count": len(tail),
+            "mean_duration_s": round(sum(durs) / len(durs), 3),
+            "min_duration_s": round(min(durs), 3),
+            "max_duration_s": round(max(durs), 3),
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
 # High-level entry point
 # ---------------------------------------------------------------------------
 
@@ -504,25 +652,24 @@ def extract_raw_excerpts(
 def process_timeline(
     timeline_dir: Path | str,
     *,
-    placement: Mapping[str, Any] | None = None,
     enable_offload: Mapping[str, bool] | None = None,
-    num_gpus: int = 8,
 ) -> dict[str, Any]:
-    """Run all four analyses and return a JSON-serialisable dict.
+    """Run the four analyses and return a JSON-serialisable dict.
 
-    Empty input → ``{}``. Missing ``placement`` skips the per-GPU
-    bubble view (the critic falls back to the existing
-    ``stall_fraction_by_component`` signal). Missing ``enable_offload``
-    means outliers ship without a ``knob_hint``.
+    Empty input → ``{}``. Missing ``enable_offload`` means outliers
+    ship without a ``knob_hint``. The parser wraps this together with
+    ``stall_fractions`` and ``tag_stats`` — those two are recomputable
+    from the same event stream but are packed into
+    :class:`TimelineSummary` separately because they feed the compact
+    block of the critic prompt.
     """
-    events = _load_events(timeline_dir)
+    events = load_events(timeline_dir)
     if not events:
         return {}
     return {
         "critical_path": compute_critical_path(events),
         "outliers": list(compute_outliers(events, enable_offload=enable_offload)),
-        "per_gpu_bubble": compute_per_gpu_bubble(
-            events, placement=placement, num_gpus=num_gpus
-        ),
+        "per_component_bubble": compute_per_component_bubble(events),
         "raw_excerpts": list(extract_raw_excerpts(events)),
+        "component_call_averages": compute_component_call_averages(events),
     }

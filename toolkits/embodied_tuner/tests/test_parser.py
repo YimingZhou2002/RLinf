@@ -186,9 +186,12 @@ def test_parse_timeline_against_live_baseline() -> None:
     # actor/sync_model_to_rollout appears for ranks 0..7 in the live data.
     tags = {(t.component, t.tag) for t in summary.per_tag}
     assert ("actor", "actor/sync_model_to_rollout") in tags
-    # All four components have stall fractions in [0, 1].
+    # Stall fractions live in [0, 1] for every non-excluded component
+    # (runner is dropped — it emits a single wrapper event that gives 0
+    # stall by construction).
     for component, fraction in summary.stall_fraction_by_component.items():
         assert 0.0 <= fraction <= 1.0, f"{component}: {fraction}"
+    assert "runner" not in summary.stall_fraction_by_component
 
 
 def test_parse_timeline_synthetic(tmp_path: Path) -> None:
@@ -438,27 +441,27 @@ def test_parse_timeline_populates_new_fields(tmp_path):
         json.dumps({"t0": 0.0, "t1": 50.0, "component": "rollout", "rank": 0,
                     "tag": "predict", "global_step": 0}) + "\n"
     )
-    ts = parse_timeline(
-        timeline,
-        placement={"actor": "0-7", "env": "0-3", "rollout": "4-7"},
-        enable_offload={"env": True},
-    )
+    ts = parse_timeline(timeline, enable_offload={"env": True})
     # critical_path keyed by global_step
     assert 0 in ts.critical_path
-    # per_gpu_bubble populated under hybrid placement
-    assert ts.per_gpu_bubble["wall_s"] == 50.0
+    # per_component_bubble populated without needing placement
+    assert ts.per_component_bubble["wall_s"] == 50.0
+    assert ts.per_component_bubble["per_component"]["env"]["busy_s"] == 30.0
     # raw_excerpts top-K
     assert len(ts.raw_excerpts) == 2
 
 
-def test_parse_timeline_skips_per_gpu_bubble_without_placement(tmp_path):
+def test_parse_timeline_excludes_runner_from_stall_fractions(tmp_path):
     timeline = tmp_path / "timeline"
     timeline.mkdir()
+    (timeline / "runner_rank0.jsonl").write_text(
+        json.dumps({"t0": 0.0, "t1": 100.0, "component": "runner", "rank": 0,
+                    "tag": "run", "global_step": 0}) + "\n"
+    )
     (timeline / "env_rank0.jsonl").write_text(
         json.dumps({"t0": 0.0, "t1": 30.0, "component": "env", "rank": 0,
                     "tag": "env_interact_step", "global_step": 0}) + "\n"
     )
-    ts = parse_timeline(timeline)  # no placement
-    assert ts.per_gpu_bubble == {}
-    # Other fields still produced
-    assert 0 in ts.critical_path
+    ts = parse_timeline(timeline)
+    assert "runner" not in ts.stall_fraction_by_component
+    assert "runner" not in ts.per_component_bubble.get("per_component", {})

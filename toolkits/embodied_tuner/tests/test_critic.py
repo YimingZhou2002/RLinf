@@ -565,22 +565,31 @@ def test_fake_critic_stop_after_marks_final_output() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_renders_per_gpu_bubble_section() -> None:
+def test_prompt_renders_per_component_bubble_section() -> None:
     schema = KnobSchema()
     summary = {
         "stall_fraction_by_component": {},
         "per_tag": [],
         "critical_path": {},
         "outliers": [],
-        "per_gpu_bubble": {
+        "per_component_bubble": {
             "wall_s": 100.0,
-            "env_side_avg_bubble_s": 20.0,
-            "rollout_side_avg_bubble_s": 50.0,
-            "per_gpu": {
-                "0": {"residents": ["actor", "env"], "busy_s": 80.0,
-                      "bubble_s": 20.0, "bubble_frac": 0.2},
-                "4": {"residents": ["actor", "rollout"], "busy_s": 50.0,
-                      "bubble_s": 50.0, "bubble_frac": 0.5},
+            "per_component": {
+                "env": {
+                    "num_ranks": 4, "busy_s": 30.0, "bubble_s": 70.0,
+                    "bubble_frac": 0.70,
+                    "per_rank": {
+                        "0": {"busy_s": 30.0, "bubble_s": 70.0, "bubble_frac": 0.70},
+                        "1": {"busy_s": 30.0, "bubble_s": 70.0, "bubble_frac": 0.70},
+                    },
+                },
+                "rollout": {
+                    "num_ranks": 4, "busy_s": 90.0, "bubble_s": 10.0,
+                    "bubble_frac": 0.10,
+                    "per_rank": {
+                        "0": {"busy_s": 90.0, "bubble_s": 10.0, "bubble_frac": 0.10},
+                    },
+                },
             },
         },
         "raw_excerpts": [],
@@ -591,10 +600,11 @@ def test_prompt_renders_per_gpu_bubble_section() -> None:
         last_timeline_summary=summary,
     )
     text = str(prompt)
-    assert "per-GPU bubble" in text
-    assert "env_side_avg_bubble_s=20.0" in text
-    assert "GPU0 (actor+env)" in text
-    assert "GPU4 (actor+rollout)" in text
+    assert "per-component bubble" in text
+    assert "wall_s=100.0" in text
+    assert "env: busy_s=30.0 bubble_s=70.0 bubble_frac=0.7 ranks=4" in text
+    assert "rollout: busy_s=90.0 bubble_s=10.0 bubble_frac=0.1 ranks=4" in text
+    assert "r0: busy_s=30.0" in text
 
 
 def test_prompt_renders_critical_path_with_blocking_explainer() -> None:
@@ -610,7 +620,7 @@ def test_prompt_renders_critical_path_with_blocking_explainer() -> None:
                  "blocked_s": 90.0, "real_frac": 0.1},
             ]},
         },
-        "outliers": [], "per_gpu_bubble": {}, "raw_excerpts": [],
+        "outliers": [], "per_component_bubble": {}, "raw_excerpts": [],
     }
     prompt = build_prompt(
         history=(), current_knobs={}, schema=schema,
@@ -636,7 +646,7 @@ def test_prompt_renders_outliers_with_knob_hint() -> None:
              "global_step": None, "dur_s": 45.0,
              "knob_hint": "env.enable_offload=True"},
         ],
-        "per_gpu_bubble": {}, "raw_excerpts": [],
+        "per_component_bubble": {}, "raw_excerpts": [],
     }
     prompt = build_prompt(
         history=(), current_knobs={}, schema=schema,
@@ -655,7 +665,7 @@ def test_prompt_renders_raw_excerpts_as_jsonl() -> None:
         "per_tag": [],
         "critical_path": {},
         "outliers": [],
-        "per_gpu_bubble": {},
+        "per_component_bubble": {},
         "raw_excerpts": [
             {"component": "rollout", "rank": 0, "tag": "rollout/generate",
              "global_step": 0, "dur_s": 273.6, "qualname": "MSR.generate",

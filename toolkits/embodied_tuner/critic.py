@@ -276,6 +276,7 @@ def build_prompt(
     last_failure_mode: str | None,
     last_metric_summary: Mapping[str, float] | None,
     last_timeline_summary: Mapping[str, Any] | None,
+    last_num_trajectories: int | None = None,
     bitter_lessons: Sequence[BitterLesson] = (),
     feedback: str | None = None,
     preflight_feedback: str | None = None,
@@ -293,6 +294,11 @@ def build_prompt(
             successful trial (``env/interact``, ``actor/run_training``, etc.).
         last_timeline_summary: ``TimelineSummary``-shaped dict (per-rank
             stats + stall fractions) from the last successful trial.
+        last_num_trajectories: ``num_trajectories`` from the final
+            MetricTable block of the last successful trial. Rendered as a
+            sibling ``## Last trial — MetricTable Environment-section keys``
+            sub-section so the critic sees the denominator of
+            ``objective = avg_step_time / num_trajectories`` explicitly.
         bitter_lessons: Full campaign lessons from
             :class:`~toolkits.embodied_tuner.lessons.LessonBook`, rendered
             above the rolling history so they survive the ``history_window``.
@@ -319,10 +325,8 @@ def build_prompt(
         constraints_block=_render_constraints(),
         memory_pressure_block=_render_memory_pressure(last_failure_mode),
         metric_summary_block=_render_metric_summary_compact(
-            last_metric_summary, last_timeline_summary
+            last_metric_summary, last_timeline_summary, last_num_trajectories
         ),
-        # timeline_verbose_block=None,
-        # _render_timeline_verbose(last_timeline_summary),
         timeline_verbose_block= _render_timeline_verbose(last_timeline_summary),
         feedback_block=combined_feedback,
     )
@@ -412,8 +416,14 @@ def _render_memory_pressure(last_failure_mode: str | None) -> str:
 def _render_metric_summary_compact(
     metric_summary: Mapping[str, float] | None,
     timeline_summary: Mapping[str, Any] | None,
+    num_trajectories: int | None = None,
 ) -> str:
     """Compact block: MetricTable time keys + per-component stall fractions.
+
+    Also renders ``num_trajectories`` (from the final MetricTable's
+    Environment section) as its own ``- key=value`` sibling sub-section
+    so the critic sees the denominator of
+    ``objective = avg_step_time / num_trajectories`` explicitly.
 
     This is the block that survives ``CriticPrompt.to_debug_text()`` — the
     smallest possible summary of what the critic saw for last-trial
@@ -424,6 +434,12 @@ def _render_metric_summary_compact(
         lines = ["## Last trial — MetricTable Time-section keys"]
         for key in sorted(metric_summary):
             lines.append(f"- {key}={metric_summary[key]}")
+        sections.append("\n".join(lines))
+    if num_trajectories is not None:
+        lines = [
+            "## Last trial — MetricTable Environment-section keys",
+            f"- num_trajectories={num_trajectories}",
+        ]
         sections.append("\n".join(lines))
     if timeline_summary:
         stalls = timeline_summary.get("stall_fraction_by_component", {})
@@ -440,7 +456,7 @@ def _render_metric_summary_compact(
 def _render_timeline_verbose(
     timeline_summary: Mapping[str, Any] | None,
 ) -> str:
-    """Verbose block: per-tag stats, critical path, per-GPU bubble,
+    """Verbose block: per-tag stats, critical path, per-component bubble,
     outliers, raw excerpts. Excluded from ``to_debug_text()``.
     """
     if not timeline_summary:
@@ -459,14 +475,17 @@ def _render_timeline_verbose(
 
     critical_path = timeline_summary.get("critical_path") or {}
     outliers = timeline_summary.get("outliers") or ()
-    per_gpu_bubble = timeline_summary.get("per_gpu_bubble") or {}
+    per_component_bubble = timeline_summary.get("per_component_bubble") or {}
     raw_excerpts = timeline_summary.get("raw_excerpts") or ()
     raw_jsonl = timeline_summary.get("raw_jsonl") or {}
+    component_call_averages = timeline_summary.get("component_call_averages") or {}
 
     if critical_path:
         sections.append(_render_critical_path(critical_path))
-    if per_gpu_bubble:
-        sections.append(_render_per_gpu_bubble(per_gpu_bubble))
+    if per_component_bubble:
+        sections.append(_render_per_component_bubble(per_component_bubble))
+    if component_call_averages:
+        sections.append(_render_component_call_averages(component_call_averages))
     if outliers:
         sections.append(_render_outliers(outliers))
     if raw_excerpts:
@@ -551,26 +570,69 @@ def _render_critical_path(critical_path: Mapping[Any, Mapping[str, Any]]) -> str
     return "\n".join(lines)
 
 
-def _render_per_gpu_bubble(per_gpu_bubble: Mapping[str, Any]) -> str:
-    """D' — GPU-by-GPU bubble under the trial's placement."""
-    wall = per_gpu_bubble.get("wall_s")
-    env_avg = per_gpu_bubble.get("env_side_avg_bubble_s")
-    rollout_avg = per_gpu_bubble.get("rollout_side_avg_bubble_s")
+def _render_per_component_bubble(per_component_bubble: Mapping[str, Any]) -> str:
+    """D' — per-component (env/rollout/actor) bubble under this trial."""
+    wall = per_component_bubble.get("wall_s")
     lines = [
-        "## Last trial — per-GPU bubble under this trial's placement",
-        f"wall_s={wall}  env_side_avg_bubble_s={env_avg}  "
-        f"rollout_side_avg_bubble_s={rollout_avg}",
-        "Bubble = wall - union(real-busy intervals from components on this GPU). "
-        "Lower bubble = more useful work. The side with the larger bubble is "
-        "the one whose GPU budget can be reduced without hurting throughput.",
+        "## Last trial — per-component bubble",
+        f"wall_s={wall}",
+        "Bubble = wall - union(real-busy intervals across all ranks of this "
+        "component); blocking-wait tags (e.g. `actor/recv_traj`) are excluded "
+        "so busy_s reflects real GPU work only. The component with the "
+        "largest bubble_frac is the one whose ranks were idle the most "
+        "wall-clock — usually the side whose GPU budget can be reduced.",
     ]
-    per_gpu = per_gpu_bubble.get("per_gpu") or {}
-    for raw_gpu in sorted(per_gpu, key=lambda k: int(k)):
-        info = per_gpu[raw_gpu]
-        residents = "+".join(info.get("residents", []))
+    per_component = per_component_bubble.get("per_component") or {}
+    for component in sorted(per_component):
+        info = per_component[component]
         lines.append(
-            f"  - GPU{raw_gpu} ({residents}): busy_s={info.get('busy_s')} "
-            f"bubble_s={info.get('bubble_s')} bubble_frac={info.get('bubble_frac')}"
+            f"  - {component}: busy_s={info.get('busy_s')} "
+            f"bubble_s={info.get('bubble_s')} "
+            f"bubble_frac={info.get('bubble_frac')} "
+            f"ranks={info.get('num_ranks')}"
+        )
+        per_rank = info.get("per_rank") or {}
+        for raw_rank in sorted(per_rank, key=lambda k: int(k)):
+            rank_info = per_rank[raw_rank]
+            lines.append(
+                f"      r{raw_rank}: busy_s={rank_info.get('busy_s')} "
+                f"bubble_s={rank_info.get('bubble_s')} "
+                f"bubble_frac={rank_info.get('bubble_frac')}"
+            )
+    return "\n".join(lines)
+
+
+def _render_component_call_averages(
+    component_call_averages: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """Per-component steady-state mean per-call duration (first 2 events skipped).
+
+    Renders the ``compute_component_call_averages`` view — the typical
+    per-call cost for env / rollout after the bootstrap warmup calls
+    are dropped. Complements per_component_bubble (which sums busy time)
+    by exposing the *typical* per-call number the critic can compare
+    against outliers.
+    """
+    lines = [
+        "## Last trial — env/rollout steady-state per-call duration "
+        "(first 2 calls dropped as warmup)",
+        "For each component: pool every non-blocking event across all "
+        "ranks/tags, sort by t0, drop the first 2 (bootstrap warmup — "
+        "offload page-in, JIT compile, first-CUDA-kernel init), then "
+        "average dur over the remainder. Wrapper tags "
+        "(`interact`, `run_interact_once`, `rollout/generate`, "
+        "`rollout/generate_one_epoch`) are excluded to avoid double-"
+        "counting per-step children.",
+    ]
+    for component in sorted(component_call_averages):
+        info = component_call_averages[component]
+        lines.append(
+            f"  - {component}: mean={info.get('mean_duration_s')}s "
+            f"min={info.get('min_duration_s')}s "
+            f"max={info.get('max_duration_s')}s "
+            f"n={info.get('remaining_count')} "
+            f"(skipped={info.get('skipped')} of "
+            f"total={info.get('call_count_total')})"
         )
     return "\n".join(lines)
 
@@ -833,6 +895,7 @@ class Critic(Protocol):
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
     ) -> CriticOutput:
@@ -880,6 +943,7 @@ class CodexCritic:
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
     ) -> CriticOutput:
@@ -901,6 +965,7 @@ class CodexCritic:
                 last_failure_mode=last_failure_mode,
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
+                last_num_trajectories=last_num_trajectories,
                 bitter_lessons=bitter_lessons,
                 feedback=feedback,
                 preflight_feedback=preflight_feedback,

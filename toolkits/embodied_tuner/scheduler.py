@@ -178,6 +178,7 @@ class Scheduler:
         last_failure_mode: str | None = None
         last_metric_summary: Mapping[str, float] | None = None
         last_timeline_summary: Mapping[str, Any] | None = None
+        last_num_trajectories: int | None = None
         # Track the delta that produced last_failure_mode so a lesson
         # emitted in the NEXT round can be attributed to the right
         # trial and delta signature. Cleared once folded into a lesson.
@@ -206,6 +207,7 @@ class Scheduler:
                     last_failure_mode=last_failure_mode,
                     last_metric_summary=last_metric_summary,
                     last_timeline_summary=last_timeline_summary,
+                    last_num_trajectories=last_num_trajectories,
                     bitter_lessons=lessons,
                 )
             except CriticError as exc:
@@ -298,6 +300,7 @@ class Scheduler:
             last_failure_mode = entry.failure_mode
             last_metric_summary = entry.per_component_timings
             last_timeline_summary = entry.timeline_summary
+            last_num_trajectories = entry.num_trajectories
             if entry.failure_mode != FailureMode.NONE.value:
                 last_failed_trial_idx = entry.trial_idx
                 last_failed_delta = dict(entry.delta)
@@ -319,6 +322,7 @@ class Scheduler:
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
     ) -> tuple[CriticOutput, PreflightOutcome]:
         """Ask the critic, run preflight, retry on preflight failures.
@@ -342,6 +346,7 @@ class Scheduler:
                 last_failure_mode=last_failure_mode,
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
+                last_num_trajectories=last_num_trajectories,
                 bitter_lessons=bitter_lessons,
                 preflight_feedback=preflight_feedback,
             )
@@ -520,13 +525,16 @@ class Scheduler:
                 ],
                 "critical_path": dict(result.timeline_summary.critical_path),
                 "outliers": list(result.timeline_summary.outliers),
-                "per_gpu_bubble": dict(result.timeline_summary.per_gpu_bubble),
+                "per_component_bubble": dict(result.timeline_summary.per_component_bubble),
                 "raw_excerpts": list(result.timeline_summary.raw_excerpts),
                 "raw_jsonl": dict(result.timeline_summary.raw_jsonl),
                 "plot_paths": {
                     fmt: str(path)
                     for fmt, path in result.timeline_summary.plot_paths.items()
                 },
+                "component_call_averages": dict(
+                    result.timeline_summary.component_call_averages
+                ),
             }
         per_component = (
             dict(result.per_step[-1].time_keys)

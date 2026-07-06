@@ -494,13 +494,12 @@ def _runner_adapter(
 
 
 def _parser_adapter(outcome: TrialOutcome) -> TrialResult:
-    placement, enable_offload = _extract_trial_context(outcome.log_dir)
+    enable_offload = _extract_trial_context(outcome.log_dir)
     return parse_trial(
         outcome.log_dir,
         returncode=outcome.returncode,
         timed_out=outcome.timed_out,
         stderr_path=outcome.stdout_path,
-        placement=placement,
         enable_offload=enable_offload,
         plot_formats=("png", "html"),
     )
@@ -508,31 +507,24 @@ def _parser_adapter(outcome: TrialOutcome) -> TrialResult:
 
 def _extract_trial_context(
     log_dir: Path,
-) -> tuple[Mapping[str, Any] | None, Mapping[str, bool] | None]:
-    """Recover this trial's effective placement + offload knobs.
+) -> Mapping[str, bool] | None:
+    """Recover this trial's effective offload knobs.
 
     The embodied training entrypoint writes the resolved Hydra config
     to ``<log_dir>/tensorboard/config.yaml`` (the file consumed by the
-    Tensorboard sidecar). We read it best-effort so the per-GPU bubble
-    view in :class:`TimelineSummary` reflects exactly the placement the
-    trial ran under, not the baseline. When the file is absent (e.g.
-    test fixtures, dry-runs) both values are ``None`` and the
-    timeline_processor falls back to the stall-fraction signal.
+    Tensorboard sidecar). We read it best-effort so the outlier
+    ``knob_hint`` field in :class:`TimelineSummary` reflects the
+    trial's actual ``enable_offload`` state. When the file is absent
+    (e.g. test fixtures, dry-runs) the value is ``None`` and outliers
+    ship without hints.
     """
     cfg_path = log_dir / "tensorboard" / "config.yaml"
     if not cfg_path.is_file():
-        return None, None
+        return None
     try:
         cfg = OmegaConf.load(cfg_path)
     except Exception:  # noqa: BLE001 — best-effort
-        return None, None
-    placement_node = OmegaConf.select(cfg, "cluster.component_placement")
-    placement: Mapping[str, Any] | None = None
-    if placement_node is not None:
-        try:
-            placement = OmegaConf.to_container(placement_node, resolve=True)
-        except Exception:  # noqa: BLE001
-            placement = None
+        return None
     enable_offload: dict[str, bool] = {}
     for component in ("env", "rollout", "actor"):
         # env.train.enable_offload lives under env.train; rollout/actor at top.
@@ -542,7 +534,7 @@ def _extract_trial_context(
             value = OmegaConf.select(cfg, f"{component}.enable_offload")
         if value is not None:
             enable_offload[component] = bool(value)
-    return placement, (enable_offload or None)
+    return enable_offload or None
 
 
 # ---------------------------------------------------------------------------

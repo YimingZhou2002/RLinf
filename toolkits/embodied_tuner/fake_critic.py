@@ -64,10 +64,17 @@ class FakeCritic:
         last_failure_mode: str | None = None,
         last_metric_summary: Mapping[str, float] | None = None,
         last_timeline_summary: Mapping[str, Any] | None = None,
+        last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
     ) -> CriticOutput:
-        del schema, last_failure_mode, last_metric_summary, last_timeline_summary
+        del (
+            schema,
+            last_failure_mode,
+            last_metric_summary,
+            last_timeline_summary,
+            last_num_trajectories,
+        )
         self.calls.append(
             (len(history), dict(current_knobs), preflight_feedback, len(bitter_lessons))
         )
