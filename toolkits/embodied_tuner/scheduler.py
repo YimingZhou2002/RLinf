@@ -171,6 +171,13 @@ class Scheduler:
         """Run the scheduler until a termination predicate fires."""
         start = self.clock()
         current_knobs = dict(self.baseline_knobs)
+        # Accumulator of every knob override the campaign has applied on
+        # top of baseline so far. Each round's Hydra overrides are
+        # ``{**cumulative_delta, **critic_output.delta}`` — without this,
+        # a knob changed in round N would silently revert to baseline in
+        # round N+1 unless the critic re-emitted it, which contradicts
+        # the "current_knobs" view the critic prompt shows.
+        cumulative_delta: dict[str, Any] = {}
         history: list[TrialHistoryEntry] = []
         trial_idx = 0
         oom_count = 0
@@ -182,6 +189,9 @@ class Scheduler:
         # Track the delta that produced last_failure_mode so a lesson
         # emitted in the NEXT round can be attributed to the right
         # trial and delta signature. Cleared once folded into a lesson.
+        # Attribution uses the critic's incremental proposal (not the
+        # cumulative override set), so the lesson signature identifies
+        # the specific knob flip the critic chose that round.
         last_failed_trial_idx: int | None = None
         last_failed_delta: dict[str, Any] | None = None
 
@@ -204,6 +214,7 @@ class Scheduler:
                 critic_output, preflight_outcome = self._propose_with_preflight(
                     history=history,
                     current_knobs=current_knobs,
+                    cumulative_delta=cumulative_delta,
                     last_failure_mode=last_failure_mode,
                     last_metric_summary=last_metric_summary,
                     last_timeline_summary=last_timeline_summary,
@@ -254,6 +265,11 @@ class Scheduler:
                 continue
             consecutive_stop_requests = 0
 
+            # Cumulative override set actually applied this round. The
+            # runner (and the preflight it just passed) both saw this
+            # merged view, not just the critic's incremental proposal.
+            effective_delta = {**cumulative_delta, **critic_output.delta}
+
             # Bail out cleanly if preflight rejected the delta on every
             # retry. Per Codex review of Round 2, running the runner with
             # a known-invalid config burns a trial slot for no benefit;
@@ -262,7 +278,8 @@ class Scheduler:
             if not preflight_outcome.ok:
                 self._record_preflight_exhausted(
                     trial_idx=trial_idx,
-                    delta=critic_output.delta,
+                    delta=effective_delta,
+                    proposed_delta=critic_output.delta,
                     preflight=preflight_outcome,
                     rationale=critic_output.rationale,
                     start=start,
@@ -272,7 +289,7 @@ class Scheduler:
             # 2. Launch the trial via the runner (subprocess + cleanup).
             ts_start = _time.time()
             outcome = self.runner_fn(
-                critic_output.delta, preflight_outcome, trial_idx
+                effective_delta, preflight_outcome, trial_idx
             )
             ts_end = _time.time()
 
@@ -283,9 +300,11 @@ class Scheduler:
             if result.failure_mode is FailureMode.OOM:
                 oom_count += 1
             current_knobs = self._apply_delta(current_knobs, critic_output.delta)
+            cumulative_delta = effective_delta
             entry = self._build_ledger_entry(
                 trial_idx=trial_idx,
-                delta=critic_output.delta,
+                delta=effective_delta,
+                proposed_delta=critic_output.delta,
                 preflight=preflight_outcome,
                 outcome=outcome,
                 result=result,
@@ -294,7 +313,11 @@ class Scheduler:
                 ts_end=ts_end,
             )
             self.ledger.append(entry)
-            history.append(self._history_entry(entry, critic_output.rationale))
+            history.append(
+                self._history_entry(
+                    entry, critic_output.rationale, critic_output.delta
+                )
+            )
             history = history[-self.budget.history_window :]
             trial_idx += 1
             last_failure_mode = entry.failure_mode
@@ -303,7 +326,7 @@ class Scheduler:
             last_num_trajectories = entry.num_trajectories
             if entry.failure_mode != FailureMode.NONE.value:
                 last_failed_trial_idx = entry.trial_idx
-                last_failed_delta = dict(entry.delta)
+                last_failed_delta = dict(critic_output.delta)
             else:
                 last_failed_trial_idx = None
                 last_failed_delta = None
@@ -319,6 +342,7 @@ class Scheduler:
         *,
         history: list[TrialHistoryEntry],
         current_knobs: Mapping[str, Any],
+        cumulative_delta: Mapping[str, Any],
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
@@ -334,6 +358,12 @@ class Scheduler:
         pair is returned with ``preflight_outcome.ok == False`` so the
         caller can record a synthetic ``CONFIG_INVALID`` ledger entry and
         terminate with the dedicated ``preflight_exhausted`` stop reason.
+
+        ``cumulative_delta`` is the override set already accepted by
+        earlier rounds; each retry's preflight is run against
+        ``{**cumulative_delta, **critic.delta}`` so that a delta the
+        critic proposes here is validated in the context that will
+        actually reach the runner, not in isolation.
         """
         attempts = 0
         preflight_feedback: str | None = None
@@ -358,7 +388,8 @@ class Scheduler:
                     log_dir=Path(""),
                     delta=critic_output.delta,
                 )
-            preflight = self.preflight_fn(critic_output.delta)
+            effective_delta = {**cumulative_delta, **critic_output.delta}
+            preflight = self.preflight_fn(effective_delta)
             if preflight.ok:
                 return critic_output, preflight
             attempts += 1
@@ -462,6 +493,7 @@ class Scheduler:
         *,
         trial_idx: int,
         delta: Mapping[str, Any],
+        proposed_delta: Mapping[str, Any],
         preflight: PreflightOutcome,
         rationale: Rationale,
         start: float,
@@ -472,10 +504,16 @@ class Scheduler:
         within ``preflight_retries``. The trial slot is NOT consumed
         (``trial_idx`` is the slot that would have been used, but the
         scheduler returns immediately afterwards with ``preflight_exhausted``).
+
+        ``delta`` is the cumulative override set that would have been
+        applied; ``proposed_delta`` is the last incremental proposal the
+        critic emitted (stored separately for lesson attribution and
+        debugging).
         """
         entry = make_entry(
             trial_idx=trial_idx,
             delta=delta,
+            proposed_delta=proposed_delta,
             resolved_config_sha=preflight.resolved_config_sha,
             log_dir=str(preflight.log_dir) if preflight.log_dir != Path("") else "",
             returncode=None,
@@ -488,6 +526,10 @@ class Scheduler:
             ts_start=start,
             ts_end=_time.time(),
             cleanup_outcome="preflight_exhausted: " + "; ".join(preflight.errors)[:200],
+            # Surface the exact preflight errors so on a resumed campaign
+            # or downstream analysis the LLM sees why the delta was
+            # rejected, not just "CONFIG_INVALID".
+            error_excerpt="preflight errors:\n" + "\n".join(preflight.errors),
         )
         self.ledger.append(entry)
 
@@ -496,6 +538,7 @@ class Scheduler:
         *,
         trial_idx: int,
         delta: Mapping[str, Any],
+        proposed_delta: Mapping[str, Any],
         preflight: PreflightOutcome,
         outcome: TrialOutcome,
         result: TrialResult,
@@ -544,6 +587,7 @@ class Scheduler:
         return make_entry(
             trial_idx=trial_idx,
             delta=delta,
+            proposed_delta=proposed_delta,
             resolved_config_sha=preflight.resolved_config_sha,
             log_dir=str(outcome.log_dir),
             returncode=outcome.returncode,
@@ -559,19 +603,27 @@ class Scheduler:
             ts_start=ts_start,
             ts_end=ts_end,
             cleanup_outcome=outcome.cleanup_outcome,
+            error_excerpt=result.error_excerpt,
         )
 
     def _history_entry(
-        self, ledger_entry: LedgerEntry, rationale: Rationale
+        self,
+        ledger_entry: LedgerEntry,
+        rationale: Rationale,
+        proposed_delta: Mapping[str, Any],
     ) -> TrialHistoryEntry:
+        # The history block in the critic prompt shows what the critic
+        # *chose to change* each round, not the cumulative override set
+        # (which is redundant with the "Current knob values" section).
         return TrialHistoryEntry(
             trial_idx=ledger_entry.trial_idx,
-            delta=ledger_entry.delta,
+            delta=dict(proposed_delta),
             status=ledger_entry.status,
             failure_mode=ledger_entry.failure_mode,
             objective=ledger_entry.objective,
             step_time=ledger_entry.step_time,
             rationale_summary=rationale.summary,
+            error_excerpt=ledger_entry.error_excerpt,
         )
 
     @staticmethod

@@ -29,6 +29,12 @@ numbers in ``rlinf/config.py``):
 - ``max_steps_per_rollout_epoch % num_action_chunks == 0`` (line 980)
 - ``global_batch_size % (micro_batch_size * actor_world_size) == 0``
   (lines 1363-1368, FSDP branch)
+- ``(total_num_envs // env_world_size) % rollout_world_size == 0`` and
+  ``(total_num_envs // env_world_size) % actor_world_size == 0`` —
+  routing-layer assertion in ``rlinf/scheduler/worker/routing.py:139``
+  (``CommMapper.get_dst_ranks``). Not mirrored by
+  ``validate_embodied_cfg``, so preflight is the only pre-launch gate for
+  this. See ``toolkits/embodied_tuner/wiki/04-constraints.md`` §04.2.6.
 
 The reason for re-implementing instead of calling RLinf's validators
 directly: ``validate_embodied_cfg`` instantiates
@@ -303,8 +309,10 @@ def _check_divisibility(cfg: DictConfig, num_gpus: int) -> list[str]:
     placement = _placement_to_str_map(cfg.cluster.component_placement)
     env_gpus = parse_range_spec(placement["env"], num_gpus=num_gpus)
     actor_gpus = parse_range_spec(placement["actor"], num_gpus=num_gpus)
+    rollout_gpus = parse_range_spec(placement["rollout"], num_gpus=num_gpus)
     env_world_size = len(env_gpus)
     actor_world_size = len(actor_gpus)
+    rollout_world_size = len(rollout_gpus)
 
     # env.train.total_num_envs % env_world_size == 0  (rlinf/config.py:962)
     total_num_envs = _get(cfg, "env.train.total_num_envs")
@@ -322,6 +330,27 @@ def _check_divisibility(cfg: DictConfig, num_gpus: int) -> list[str]:
                 errors.append(
                     f"divisibility: per-rank env count {per_rank} is not divisible "
                     f"by rollout.pipeline_stage_num={stage_num} (see rlinf/config.py:965)"
+                )
+
+            # Routing-layer assertion (rlinf/scheduler/worker/routing.py:139,
+            # CommMapper.get_dst_ranks): per-env-rank batch must be divisible
+            # by every downstream world size the env worker sends to.
+            # See toolkits/embodied_tuner/wiki/04-constraints.md §04.2.6.
+            if rollout_world_size > 0 and per_rank % rollout_world_size != 0:
+                errors.append(
+                    f"divisibility: per-rank env count {per_rank} "
+                    f"(total_num_envs={total_num_envs} // env_world_size={env_world_size}) "
+                    f"is not divisible by rollout_world_size={rollout_world_size} "
+                    f"— will crash rlinf/scheduler/worker/routing.py:139 "
+                    f"(env→rollout send). See wiki/04-constraints.md §04.2.6."
+                )
+            if actor_world_size > 0 and per_rank % actor_world_size != 0:
+                errors.append(
+                    f"divisibility: per-rank env count {per_rank} "
+                    f"(total_num_envs={total_num_envs} // env_world_size={env_world_size}) "
+                    f"is not divisible by actor_world_size={actor_world_size} "
+                    f"— will crash rlinf/scheduler/worker/routing.py:139 "
+                    f"(rollout→actor send). See wiki/04-constraints.md §04.2.6."
                 )
 
     # max_steps_per_rollout_epoch % num_action_chunks == 0  (rlinf/config.py:980)

@@ -586,3 +586,101 @@ def test_scheduler_ignores_lesson_when_last_trial_was_ok(tmp_path: Path) -> None
 
     book = LessonBook(path=tmp_path / "bitter_lessons.jsonl")
     assert book.load() == ()
+
+
+# ---------------------------------------------------------------------------
+# Delta accumulation across trials
+# ---------------------------------------------------------------------------
+
+
+def test_runner_and_preflight_receive_cumulative_delta(tmp_path: Path) -> None:
+    """Each round's runner/preflight input is the cumulative override set.
+
+    A knob set in round 0 must remain in the round 1/2 payloads even
+    when the critic's incremental proposal that round doesn't repeat
+    it — otherwise the actual training config silently reverts to
+    baseline while the critic prompt says it's still changed.
+    """
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[100.0, 90.0, 80.0],
+    )
+    # Round 0: change A. Round 1: change B (A must persist).
+    # Round 2: overwrite A (B must persist).
+    critic = FakeCritic.from_deltas(
+        {"actor.micro_batch_size": 32},
+        {"rollout.gpu_memory_utilization": 0.9},
+        {"actor.micro_batch_size": 64},
+    )
+    scheduler = factory.build(
+        critic, BudgetConfig(max_trials=3, budget_seconds=999, max_oom=99)
+    )
+    scheduler.run()
+
+    assert [d for _, d in factory.runner_calls] == [
+        {"actor.micro_batch_size": 32},
+        {"actor.micro_batch_size": 32, "rollout.gpu_memory_utilization": 0.9},
+        {"actor.micro_batch_size": 64, "rollout.gpu_memory_utilization": 0.9},
+    ]
+
+
+def test_ledger_records_effective_and_proposed_delta(tmp_path: Path) -> None:
+    """The ledger's ``delta`` field is the cumulative override set that
+    actually ran; ``proposed_delta`` captures the critic's incremental
+    change for the round (used for lesson attribution and audit)."""
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[100.0, 90.0],
+    )
+    critic = FakeCritic.from_deltas(
+        {"actor.micro_batch_size": 32},
+        {"rollout.gpu_memory_utilization": 0.9},
+    )
+    scheduler = factory.build(
+        critic, BudgetConfig(max_trials=2, budget_seconds=999, max_oom=99)
+    )
+    scheduler.run()
+
+    entries = Ledger(tmp_path / "ledger.jsonl").load().entries
+    assert entries[0].delta == {"actor.micro_batch_size": 32}
+    assert entries[0].proposed_delta == {"actor.micro_batch_size": 32}
+    assert entries[1].delta == {
+        "actor.micro_batch_size": 32,
+        "rollout.gpu_memory_utilization": 0.9,
+    }
+    assert entries[1].proposed_delta == {"rollout.gpu_memory_utilization": 0.9}
+
+
+def test_bitter_lesson_signature_uses_incremental_proposal(tmp_path: Path) -> None:
+    """A lesson recorded after a failure is attributed to the specific
+    knob flip the critic chose that round, not the whole cumulative
+    override stack — otherwise every lesson signature would inflate
+    with unrelated prior knobs and dedupe would stop working."""
+    from toolkits.embodied_tuner.lessons import LessonBook, canonical_delta_signature
+
+    factory = _SchedulerFactory(
+        tmp_path=tmp_path,
+        objectives=[50.0, None, 40.0],
+        failure_modes=[FailureMode.NONE, FailureMode.OOM, FailureMode.NONE],
+        statuses=[Status.OK, Status.FAILED, Status.OK],
+    )
+    # Round 0 sets A successfully. Round 1 adds B and OOMs. Round 2's
+    # lesson should point at B alone (the flip), not {A, B}.
+    critic = FakeCritic.from_outputs(
+        CriticOutput(delta={"actor.micro_batch_size": 32}, rationale=Rationale(summary="ok")),
+        CriticOutput(delta={"rollout.enable_offload": False}, rationale=Rationale(summary="try")),
+        _output_with_lesson(
+            {"actor.micro_batch_size": 10},
+            trigger="OOM on rollout offload flip",
+            rule="do not disable rollout offload once micro_batch >= 32",
+        ),
+    )
+    scheduler = factory.build(critic, BudgetConfig(max_trials=3, budget_seconds=999, max_oom=99))
+    scheduler.run()
+
+    book = LessonBook(path=tmp_path / "bitter_lessons.jsonl")
+    lessons = book.load()
+    assert len(lessons) == 1
+    assert lessons[0].delta_signature == canonical_delta_signature(
+        {"rollout.enable_offload": False}
+    )

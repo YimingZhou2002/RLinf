@@ -133,6 +133,74 @@ def test_per_rank_envs_not_divisible_by_pipeline_stage_num_rejected() -> None:
     assert any("pipeline_stage_num" in e for e in result.errors)
 
 
+def test_routing_env_to_rollout_divisibility_rejected() -> None:
+    """Reproduces the runtime crash from wiki §04.2.6.
+
+    With ``env=0-1`` (env_world_size=2), ``rollout=2-7``
+    (rollout_world_size=6), and baseline ``total_num_envs=128``, the
+    per-env-rank batch is 64. 64 % 6 != 0, which trips
+    ``CommMapper.get_dst_ranks`` at
+    ``rlinf/scheduler/worker/routing.py:139`` and kills the trial. All
+    other Tier-1 checks pass, so this is the check that must catch it.
+    """
+    result = compose_and_validate(
+        BASELINE,
+        delta={
+            "cluster.component_placement": {
+                "actor": "0-7",
+                "env": "0-1",
+                "rollout": "2-7",
+            }
+        },
+    )
+    assert not result.ok
+    assert any(
+        "rollout_world_size" in e and "routing.py" in e for e in result.errors
+    ), result.errors
+
+
+def test_routing_env_to_actor_divisibility_rejected() -> None:
+    """A placement where ``per_rank`` divides ``rollout_world_size`` but not
+    ``actor_world_size`` must still be rejected — the same routing
+    assertion fires on the rollout→actor hop."""
+    # env=0-1 (2), rollout=4-7 (4), actor=0-2 (3). total_num_envs=48:
+    # per_rank=24, 24 % 2 (pipeline_stage_num) == 0, 24 % 4 == 0
+    # (rollout OK), but 24 % 3 == 0 too — need a case where actor
+    # violates. Use actor=0-4 (5): 24 % 5 != 0.
+    result = compose_and_validate(
+        BASELINE,
+        delta={
+            "env.train.total_num_envs": 48,
+            "cluster.component_placement": {
+                "actor": "0-4",
+                "env": "0-1",
+                "rollout": "4-7",
+            },
+        },
+    )
+    assert not result.ok
+    assert any(
+        "actor_world_size" in e and "routing.py" in e for e in result.errors
+    ), result.errors
+
+
+def test_routing_divisibility_passes_when_fixed() -> None:
+    """The suggested fix from wiki §04.2.6 (rollout=2-5, 4 GPUs) must pass."""
+    result = compose_and_validate(
+        BASELINE,
+        delta={
+            "cluster.component_placement": {
+                "actor": "0-7",
+                "env": "0-1",
+                "rollout": "2-5",
+            }
+        },
+    )
+    # per_rank=64, 64%4==0 (rollout) and 64%8==0 (actor) and 64%2==0
+    # (pipeline_stage_num) — all divisibility must pass.
+    assert result.ok, result.errors
+
+
 # ---------------------------------------------------------------------------
 # Negative: placement
 # ---------------------------------------------------------------------------

@@ -121,12 +121,13 @@ _RATIONALE_SCHEMA_DOC = (
     "citation arrays MUST contain at least one non-empty entry.\n"
     "\n"
     "Rule (bitter lesson): when the previous trial's failure_mode is one of\n"
-    "OOM, WORKER_CRASH, TIMEOUT, or CONFIG_INVALID, the response MUST include a\n"
-    "non-empty `bitter_lesson.trigger` and `bitter_lesson.rule`. The scheduler\n"
-    "persists it under `<ledger_dir>/bitter_lessons.jsonl` and prepends every\n"
-    "future prompt with the accumulated lessons so the same failing delta is\n"
-    "not re-proposed. Omit the field on a successful follow-up unless the trial\n"
-    "revealed a durable constraint worth persisting.\n"
+    "OOM, WORKER_CRASH, TIMEOUT, CONFIG_INVALID, or DIVISIBILITY_VIOLATION, the\n"
+    "response MUST include a non-empty `bitter_lesson.trigger` and\n"
+    "`bitter_lesson.rule`. The scheduler persists it under\n"
+    "`<ledger_dir>/bitter_lessons.jsonl` and prepends every future prompt with\n"
+    "the accumulated lessons so the same failing delta is not re-proposed. Omit\n"
+    "the field on a successful follow-up unless the trial revealed a durable\n"
+    "constraint worth persisting.\n"
     "\n"
     "The wrapper rejects outputs that violate either rule and retries.\n"
 )
@@ -198,6 +199,9 @@ class TrialHistoryEntry:
     rationale_summary: str = ""
     metric_table_excerpt: str = ""
     timeline_excerpt: str = ""
+    # Short tail-of-log slice for OOM / WORKER_CRASH / METRICS_MISSING /
+    # DIVISIBILITY_VIOLATION trials. Empty otherwise.
+    error_excerpt: str = ""
 
 
 @dataclass(frozen=True)
@@ -370,6 +374,12 @@ def _render_history(history: Sequence[TrialHistoryEntry]) -> str:
             lines.append(f"    metric_excerpt: {entry.metric_table_excerpt}")
         if entry.timeline_excerpt:
             lines.append(f"    timeline_excerpt: {entry.timeline_excerpt}")
+        if entry.error_excerpt:
+            lines.append("    error_log_excerpt (tail of run_embodiment.log):")
+            lines.append("    ```")
+            for raw_line in entry.error_excerpt.splitlines():
+                lines.append(f"    {raw_line}")
+            lines.append("    ```")
     return "\n".join(lines) + "\n"
 
 
@@ -397,6 +407,11 @@ def _render_constraints() -> str:
         "- (env.train.total_num_envs / env_world_size) % rollout.pipeline_stage_num == 0 (line 965)\n"
         "- env.train.max_steps_per_rollout_epoch % actor.model.num_action_chunks == 0 (line 980)\n"
         "- actor.global_batch_size % (actor.micro_batch_size * actor_world_size) == 0 (lines 1363-1368)\n"
+        "- (env.train.total_num_envs / env_world_size) % rollout_world_size == 0 AND\n"
+        "  (env.train.total_num_envs / env_world_size) % actor_world_size == 0 —\n"
+        "  routing-layer assertion at rlinf/scheduler/worker/routing.py:139; if\n"
+        "  violated, preflight synthesises a DIVISIBILITY_VIOLATION failure. See\n"
+        "  toolkits/embodied_tuner/wiki/04-constraints.md §04.2.6.\n"
         "- cluster.component_placement components use contiguous GPU ranges; env and rollout are either equal or disjoint.\n"
     )
 
@@ -810,7 +825,7 @@ def _extract_json_candidate(text: str) -> str:
 
 
 _LESSON_REQUIRED_FAILURE_MODES: frozenset[str] = frozenset(
-    {"OOM", "WORKER_CRASH", "TIMEOUT", "CONFIG_INVALID"}
+    {"OOM", "WORKER_CRASH", "TIMEOUT", "CONFIG_INVALID", "DIVISIBILITY_VIOLATION"}
 )
 
 

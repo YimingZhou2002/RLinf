@@ -368,6 +368,121 @@ def test_parse_trial_worker_crash_via_run_embodiment_log(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
+# DIVISIBILITY_VIOLATION and error_excerpt
+# ---------------------------------------------------------------------------
+
+
+_ROUTING_ASSERT_TRACEBACK = (
+    "Traceback (most recent call last):\n"
+    '  File "/repo/rlinf/workers/env/env_worker.py", line 934, in _run_interact_once\n'
+    "    env_outputs = self._bootstrap_and_send_train(rollout_channel)\n"
+    '  File "/repo/rlinf/workers/env/env_worker.py", line 854, in _send_train_bootstrap\n'
+    "    self.send_to(\n"
+    '  File "/repo/rlinf/scheduler/worker/routing.py", line 139, in get_dst_ranks\n'
+    "    assert batch_size % dst_world_size == 0, (\n"
+    "AssertionError: batch_size (64) must be divisible by dst_world_size (6).\n"
+)
+
+
+def test_parse_trial_routing_assertion_classified_as_divisibility_violation(
+    tmp_path: Path,
+) -> None:
+    """The exact assertion from wiki §04.2.6 must classify as DIVISIBILITY_VIOLATION,
+    NOT swallowed as WORKER_CRASH by the generic Traceback regex."""
+    (tmp_path / "run_embodiment.log").write_text(
+        "training started\n" + _ROUTING_ASSERT_TRACEBACK
+    )
+    result = parse_trial(tmp_path, returncode=1)
+    assert result.status is Status.FAILED
+    assert result.failure_mode is FailureMode.DIVISIBILITY_VIOLATION
+
+
+def test_divisibility_violation_carries_error_excerpt(tmp_path: Path) -> None:
+    """The LLM prompt gets fed the actual assertion message so it can act on it."""
+    (tmp_path / "run_embodiment.log").write_text(
+        "some earlier chatter\n" * 100 + _ROUTING_ASSERT_TRACEBACK
+    )
+    result = parse_trial(tmp_path, returncode=1)
+    assert result.failure_mode is FailureMode.DIVISIBILITY_VIOLATION
+    assert "batch_size (64) must be divisible by dst_world_size (6)" in result.error_excerpt
+    assert "routing.py" in result.error_excerpt
+
+
+def test_oom_carries_error_excerpt(tmp_path: Path) -> None:
+    (tmp_path / "run_embodiment.log").write_text(
+        "warmup\n" * 5
+        + "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 12.34 GiB\n"
+    )
+    result = parse_trial(tmp_path, returncode=1)
+    assert result.failure_mode is FailureMode.OOM
+    assert "OutOfMemoryError" in result.error_excerpt
+
+
+def test_metrics_missing_carries_error_excerpt_tail(tmp_path: Path) -> None:
+    """When metrics.log is absent, LLM should still see the tail of the stdout log."""
+    tail_marker = "hydra: encountered a compose error on this run"
+    (tmp_path / "run_embodiment.log").write_text(
+        "boot\n" * 10 + tail_marker + "\n"
+    )
+    result = parse_trial(tmp_path, returncode=0)  # returncode 0 so we hit METRICS_MISSING branch
+    assert result.failure_mode is FailureMode.METRICS_MISSING
+    assert tail_marker in result.error_excerpt
+
+
+def test_ok_trial_has_no_error_excerpt(tmp_path: Path) -> None:
+    _write_metrics_log(
+        tmp_path / "metrics.log",
+        [(1, 3, 360.0, 18), (2, 3, 200.0, 18), (3, 3, 210.0, 18)],
+    )
+    (tmp_path / "run_embodiment.log").write_text("all good\n")
+    result = parse_trial(tmp_path, returncode=0)
+    # (OK, METRICS_PARTIAL) because timeline is absent — still no excerpt attached.
+    assert result.error_excerpt == ""
+
+
+@pytest.mark.parametrize(
+    "assertion_line",
+    [
+        # Original routing.py shape (dst_world_size).
+        "AssertionError: batch_size (64) must be divisible by dst_world_size (6).",
+        # Same regex path, src_world_size variant.
+        "AssertionError: batch_size (32) must be divisible by src_world_size (3).",
+        # validate_embodied_cfg style at rlinf/config.py:962.
+        "AssertionError: total_num_envs (128) must be divisible by env_world_size (3)",
+        # Actor FSDP branch, modulo shape without the word "divisible".
+        "AssertionError: global_batch_size % (micro_batch_size * world_size) == 0",
+        # Typo tolerance — "divisable" is a common misspelling in error messages.
+        "AssertionError: X must be divisable by Y",
+    ],
+)
+def test_divisibility_regex_generalises_across_rlinf_asserts(
+    tmp_path: Path, assertion_line: str
+) -> None:
+    """Regex must catch divisibility asserts from any RLinf subsystem,
+    not just the specific batch_size / dst_world_size wording."""
+    (tmp_path / "run_embodiment.log").write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/repo/rlinf/some/module.py", line 1, in fn\n'
+        "    assert cond\n" + assertion_line + "\n"
+    )
+    result = parse_trial(tmp_path, returncode=1)
+    assert result.failure_mode is FailureMode.DIVISIBILITY_VIOLATION, (
+        f"failed to classify: {assertion_line!r} → {result.failure_mode}"
+    )
+
+
+def test_divisibility_regex_does_not_swallow_plain_asserts(tmp_path: Path) -> None:
+    """A generic AssertionError without divisibility language must stay
+    WORKER_CRASH — otherwise the widened regex would over-classify."""
+    (tmp_path / "run_embodiment.log").write_text(
+        "Traceback (most recent call last):\n"
+        "AssertionError: expected 3 shards, got 2\n"
+    )
+    result = parse_trial(tmp_path, returncode=1)
+    assert result.failure_mode is FailureMode.WORKER_CRASH
+
+
+# ---------------------------------------------------------------------------
 # select_best
 # ---------------------------------------------------------------------------
 

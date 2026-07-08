@@ -64,6 +64,15 @@ _REQUIRED_FIELDS = (
     "cleanup_outcome",
 )
 
+# Optional fields added after the initial ledger schema shipped. They
+# have safe defaults on ``LedgerEntry`` and are tolerated as missing
+# when loading older ledger lines, so a resumed campaign keeps working
+# against a ledger written before the field existed.
+_OPTIONAL_FIELDS = (
+    "error_excerpt",
+    "proposed_delta",
+)
+
 
 @dataclass(frozen=True)
 class LedgerEntry:
@@ -93,6 +102,16 @@ class LedgerEntry:
     ts_start: float
     ts_end: float
     cleanup_outcome: str
+    # Short tail-around-error slice from run_embodiment.log. Empty for
+    # OK trials and for override-classified failures. Optional in the
+    # persisted schema for backward compat with pre-existing ledgers.
+    error_excerpt: str = ""
+    # This round's incremental proposal from the critic (a subset of
+    # ``delta``, which is the cumulative override set actually applied
+    # on top of baseline). Optional for backward compat: older ledger
+    # lines predate accumulation and only carry the per-round proposal
+    # under ``delta``; on those, treat ``delta`` itself as the proposal.
+    proposed_delta: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain ``dict`` suitable for ``json.dumps``."""
@@ -105,7 +124,11 @@ class LedgerEntry:
             raise LedgerSchemaError(
                 f"ledger entry is missing required fields: {missing}"
             )
-        return cls(**{name: raw[name] for name in _REQUIRED_FIELDS})
+        kwargs: dict[str, Any] = {name: raw[name] for name in _REQUIRED_FIELDS}
+        for name in _OPTIONAL_FIELDS:
+            if name in raw:
+                kwargs[name] = raw[name]
+        return cls(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -214,6 +237,8 @@ def make_entry(
     ts_start: float,
     ts_end: float,
     cleanup_outcome: str = "ok",
+    error_excerpt: str = "",
+    proposed_delta: Mapping[str, Any] | None = None,
 ) -> LedgerEntry:
     """Construct a :class:`LedgerEntry` with sensible defaults for missing fields.
 
@@ -239,6 +264,10 @@ def make_entry(
         ts_start=ts_start,
         ts_end=ts_end,
         cleanup_outcome=cleanup_outcome,
+        error_excerpt=error_excerpt,
+        proposed_delta=(
+            dict(proposed_delta) if proposed_delta is not None else None
+        ),
     )
 
 

@@ -85,6 +85,7 @@ class FailureMode(str, Enum):
     OOM = "OOM"
     WORKER_CRASH = "WORKER_CRASH"
     TIMEOUT = "TIMEOUT"
+    DIVISIBILITY_VIOLATION = "DIVISIBILITY_VIOLATION"
 
 
 class ParserInvariantError(AssertionError):
@@ -212,6 +213,11 @@ class TrialResult:
     timeline_summary: TimelineSummary | None = None
     peak_gpu_mem_gib: float | None = None
     returncode: int | None = None
+    # Short (~40-line) tail-around-error slice for OOM / WORKER_CRASH /
+    # DIVISIBILITY_VIOLATION / METRICS_MISSING trials. Empty for OK
+    # trials and for override-classified failures (CONFIG_INVALID /
+    # LAUNCH_FAILURE) where the caller already owns the reason string.
+    error_excerpt: str = ""
 
     def __post_init__(self) -> None:
         if self.status is Status.FAILED and self.failure_mode is FailureMode.NONE:
@@ -234,6 +240,30 @@ _WORKER_CRASH_REGEX = re.compile(
     r"(RayActorError|ActorDiedError|killed by signal|Traceback \(most recent call last\))",
     re.IGNORECASE,
 )
+# Divisibility violations show up in multiple RLinf subsystems:
+#   - CommMapper.get_dst_ranks / get_src_ranks at
+#     rlinf/scheduler/worker/routing.py:137-141:
+#       "AssertionError: batch_size (64) must be divisible by dst_world_size (6)."
+#   - validate_embodied_cfg at rlinf/config.py:962-978:
+#       "AssertionError: total_num_envs ... must be divisible by env_world_size ..."
+#   - Actor FSDP / rollout branches with modulo asserts like
+#       "AssertionError: global_batch_size % (micro_batch_size * world_size) == 0"
+#
+# We match either an ``AssertionError`` whose message contains a
+# "divisible"-shaped word (tolerating the common ``divisable`` typo) or
+# a modulo comparison of the form ``X % Y == 0`` / ``!= 0``. Anchoring
+# on ``AssertionError:`` keeps stray ``%`` in unrelated log chatter or
+# Python source lines from misclassifying trials.
+_DIVISIBILITY_REGEX = re.compile(
+    r"AssertionError:[^\n]{0,500}?"
+    r"(?:divis[ia]ble|%[^\n]{0,80}?[!=]=\s*0)",
+    re.IGNORECASE,
+)
+
+# Number of lines to keep when extracting the tail-around-error for the
+# critic prompt. ~40 lines is enough to cover the deepest Traceback we
+# see from Ray-wrapped errors without ballooning the prompt.
+_ERROR_EXCERPT_MAX_LINES = 40
 
 
 def parse_trial(
@@ -341,6 +371,7 @@ def parse_trial(
                 reason=f"detected via {effective_stderr_path}",
                 returncode=returncode,
                 per_step=per_step_for_failure,
+                error_excerpt=_extract_error_excerpt(effective_stderr_path, oom_mode),
             )
 
     per_step: tuple[MetricStep, ...]
@@ -351,6 +382,9 @@ def parse_trial(
             failure_mode=FailureMode.METRICS_MISSING,
             reason=f"metrics.log not found at {metrics_path}",
             returncode=returncode,
+            error_excerpt=_extract_error_excerpt(
+                effective_stderr_path, FailureMode.METRICS_MISSING
+            ),
         )
     try:
         per_step = parse_metrics_log(metrics_path)
@@ -361,6 +395,9 @@ def parse_trial(
             failure_mode=FailureMode.METRICS_MISSING,
             reason=f"failed to parse metrics.log: {exc}",
             returncode=returncode,
+            error_excerpt=_extract_error_excerpt(
+                effective_stderr_path, FailureMode.METRICS_MISSING
+            ),
         )
 
     # OOM / worker-crash rubric already ran above (before parsing
@@ -378,6 +415,9 @@ def parse_trial(
             reason="metrics.log contained no MetricTable blocks",
             returncode=returncode,
             per_step=(),
+            error_excerpt=_extract_error_excerpt(
+                effective_stderr_path, FailureMode.METRICS_MISSING
+            ),
         )
 
     # Compute objective across all parsed MetricTable blocks.
@@ -438,6 +478,9 @@ def parse_trial(
             per_step=per_step,
             timeline_summary=timeline_summary,
             peak_gpu_mem_gib=peak_mem,
+            error_excerpt=_extract_error_excerpt(
+                effective_stderr_path, FailureMode.WORKER_CRASH
+            ),
         )
 
     if reasons:
@@ -711,7 +754,15 @@ def parse_timeline(
 
 
 def _classify_failure(stderr_path: Path | str | None) -> FailureMode | None:
-    """Inspect ``stderr_path`` (if any) and return OOM / WORKER_CRASH if matched."""
+    """Inspect ``stderr_path`` (if any) and return OOM / WORKER_CRASH /
+    DIVISIBILITY_VIOLATION if matched.
+
+    The divisibility check runs BEFORE the generic worker-crash regex so
+    a routing-layer assertion isn't swallowed as a plain worker crash —
+    the LLM critic needs the specific classification to know the fix is
+    a placement / total_num_envs adjustment (wiki §04.2.6), not a memory
+    or code bug.
+    """
     if stderr_path is None:
         return None
     path = Path(stderr_path)
@@ -723,9 +774,82 @@ def _classify_failure(stderr_path: Path | str | None) -> FailureMode | None:
         return None
     if _OOM_REGEX.search(text):
         return FailureMode.OOM
+    if _DIVISIBILITY_REGEX.search(text):
+        return FailureMode.DIVISIBILITY_VIOLATION
     if _WORKER_CRASH_REGEX.search(text):
         return FailureMode.WORKER_CRASH
     return None
+
+
+def _extract_error_excerpt(
+    log_path: Path | str | None,
+    failure_mode: FailureMode,
+    *,
+    max_lines: int = _ERROR_EXCERPT_MAX_LINES,
+) -> str:
+    """Return a short tail-of-log slice for the critic prompt.
+
+    For OOM / WORKER_CRASH / DIVISIBILITY_VIOLATION we anchor the slice
+    on the LAST regex hit and grab the trailing ``max_lines`` lines so
+    the LLM sees the actual assertion / exception message + a bit of
+    surrounding traceback. For METRICS_MISSING we just grab the tail of
+    the log — there is no anchor to search for, but the runner's final
+    lines usually explain why (e.g. Ray init failure, Hydra error).
+
+    Returns an empty string when the log is missing, unreadable, or
+    when the failure mode isn't one that benefits from a log excerpt.
+    """
+    if log_path is None:
+        return ""
+    path = Path(log_path)
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return ""
+
+    anchor_end: int | None = None
+    if failure_mode is FailureMode.DIVISIBILITY_VIOLATION:
+        matches = list(_DIVISIBILITY_REGEX.finditer(text))
+        if matches:
+            anchor_end = matches[-1].end()
+    elif failure_mode is FailureMode.OOM:
+        matches = list(_OOM_REGEX.finditer(text))
+        if matches:
+            anchor_end = matches[-1].end()
+    elif failure_mode is FailureMode.WORKER_CRASH:
+        matches = list(_WORKER_CRASH_REGEX.finditer(text))
+        if matches:
+            anchor_end = matches[-1].end()
+    elif failure_mode is FailureMode.METRICS_MISSING:
+        # No anchor — fall through to plain tail.
+        pass
+    else:
+        return ""
+
+    if anchor_end is not None:
+        # Extend the anchor to the end of its current line so the
+        # assertion message stays contiguous in the extracted excerpt
+        # (a non-greedy match on ``divisible`` / ``% ... == 0`` would
+        # otherwise land mid-line and split the message across
+        # ``preceding``/``following``).
+        newline_pos = text.find("\n", anchor_end)
+        anchor_end = newline_pos if newline_pos != -1 else len(text)
+        # Include a few lines BEFORE the anchor so the traceback frames
+        # leading up to the assertion / OOM are visible.
+        prefix_lines = 8
+        preceding = text[:anchor_end].splitlines()
+        following = text[anchor_end:].splitlines()
+        start = max(0, len(preceding) - prefix_lines)
+        selected = preceding[start:] + following[: max_lines - min(prefix_lines, len(preceding) - start)]
+    else:
+        selected = text.splitlines()[-max_lines:]
+
+    excerpt = "\n".join(selected).strip()
+    if not excerpt:
+        return ""
+    return excerpt
 
 
 def _read_peak_gpu_mem(nvitop_dir: Path) -> float | None:
