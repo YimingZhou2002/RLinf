@@ -67,6 +67,7 @@ class FakeCritic:
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
+        dag_block: str = "",
     ) -> CriticOutput:
         del (
             schema,
@@ -74,6 +75,7 @@ class FakeCritic:
             last_metric_summary,
             last_timeline_summary,
             last_num_trajectories,
+            dag_block,
         )
         self.calls.append(
             (len(history), dict(current_knobs), preflight_feedback, len(bitter_lessons))

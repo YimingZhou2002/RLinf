@@ -1116,6 +1116,130 @@ round by the critic.
 
 ---
 
+## 4.15 DAG-structured trial store (NodeStore, dedup, rollback, prompt view)
+
+Alongside the flat `Ledger`, the tuner maintains a **DAG-structured
+NodeStore** that persists every trial as a graph node with an
+explicit `parent_id`. The DAG substrate powers three related
+mechanisms — parent-rollback on failure, resolved-config dedup, and
+a DAG-aware Codex prompt view — that could not be built on the flat
+Ledger alone. All three are wired in coexistence mode: the flat
+Ledger continues to be written unchanged (so existing consumers such
+as `_emit_best_artefacts` and `plot_step_time_vs_trajectories` are
+untouched), while the NodeStore is authoritative for DAG state.
+
+### 4.15.1 On-disk schema (`nodes.jsonl`, `config_dedup_index.jsonl`)
+
+Two sidecar files land next to `tuner_ledger.jsonl`:
+
+- `nodes.jsonl`: one `DAGNode` per line, append-only, fsync-per-write,
+  corruption-tolerant load (mirrors the `LessonBook` persistence
+  contract). A node is written to disk ONLY after its final
+  `(status, failure_mode)` is known — the scheduler never persists an
+  in-flight `RUNNING` state. There is **no** semantic LRU eviction:
+  authoritative node retention is a correctness requirement (ancestor
+  walk, dedup rebuild, active-leaf recovery all need it).
+- `config_dedup_index.jsonl`: one `DedupEntry` per line, keyed by
+  `resolved_config_sha`. Rebuildable from `nodes.jsonl` at scheduler
+  startup so a lost / corrupt sidecar is a warning, not a
+  campaign-level failure. First-write-wins on any given SHA so
+  `origin_node_id` always points at the ORIGINAL non-duplicate node
+  for that SHA — never at another `DUPLICATE_OF` synthetic entry.
+
+Integrity guards enforced by `NodeStore.append`:
+
+- reject `status == "RUNNING"` (or any non-terminal status);
+- reject duplicate `node_id` (no in-place updates);
+- reject `parent_id` referencing a node not already in the store;
+- reject cycles;
+- reject a second root (a node with `parent_id is None`).
+
+Load-time integrity guards are looser: dangling `parent_id` or cycles
+on disk are counted as `skipped_lines` rather than raised.
+
+### 4.15.2 Rollback state machine (AC-5)
+
+`Scheduler.run()` tracks an `active_leaf_id` local variable alongside
+`cumulative_delta` and `current_knobs`. On each launched trial:
+
+- **OK trial**: advance `active_leaf` to the new child, merge the
+  incremental delta into `cumulative_delta`, and reset the per-parent
+  sibling-failure counter.
+- **Rollback failure** (`failure_mode` in `ROLLBACK_FAILURE_MODES =
+  {OOM, WORKER_CRASH, TIMEOUT, METRICS_PARTIAL, METRICS_MISSING}`):
+  rewind `active_leaf` to the failing node's parent, restore
+  `cumulative_delta` and `current_knobs` from that parent's state
+  (so the failing knob is not silently carried forward), and
+  increment the sibling counter. When the counter reaches
+  `BudgetConfig.max_siblings` (default 3, CLI flag
+  `--max-siblings`) the active leaf climbs one more level up the
+  DAG; a climb above the root terminates the campaign with the new
+  `rollback_exhausted` stop reason.
+
+Preflight rejections (`CONFIG_INVALID`, `DIVISIBILITY_VIOLATION`)
+never reach this branch — they are handled by the pre-existing
+`_propose_with_preflight` retry loop, never create a `DAGNode`, and
+never mutate `active_leaf`.
+
+### 4.15.3 Dedup index and duplicate-OF short-circuit (AC-6)
+
+After every preflight pass, `_propose_with_preflight` consults the
+`ConfigDedupIndex` keyed by the resolved SHA:
+
+- **Duplicate-of-FAILED**: the proposal is rejected via
+  `preflight_feedback` sharing the `preflight_retries` budget. The
+  critic sees a message naming the prior origin node and its failure
+  mode, and must propose a different delta.
+- **Duplicate-of-OK**: `run()` short-circuits the runner and appends
+  a synthetic `DAGNode` with `status = "OK"`,
+  `failure_mode = "DUPLICATE_OF"`, `duplicate_of_node_id` pointing at
+  the ORIGINAL non-duplicate node (never a chain), and the original
+  trial's objective copied for continuity. **No** Ledger entry is
+  written for this case — the flat Ledger stays free of synthetic
+  rows so `plot_step_time_vs_trajectories` and best-config selection
+  behave identically to pre-DAG campaigns. Best-config selection,
+  plateau eligibility, and the top-K OK leaderboard in the DAG prompt
+  view all exclude `DUPLICATE_OF` entries.
+
+### 4.15.4 DAG-aware Codex prompt block (AC-7)
+
+`CriticPrompt` gains a `dag_block` string field, positioned between
+`bitter_lessons_block` and `history_block` in both the full
+`__str__` and the human-readable `to_debug_text()` renderings. The
+scheduler pre-renders this block once per proposal round via
+`render_dag_view(node_store, active_leaf_id, max_dag_nodes)` and
+passes it through `Critic.propose()` → `build_prompt()`. Layout:
+
+1. **Active branch** (ancestor chain of `active_leaf`, always
+   unconditional).
+2. **Sibling attempts** at the active leaf's parent.
+3. **Top-K OK leaves** by objective ascending (excluding
+   `DUPLICATE_OF`).
+4. **Recent failure leaves** by recency.
+
+Sections 2 + 3 + 4 are jointly capped by
+`Scheduler.max_dag_nodes` (default 30). Section 1 is never
+truncated. A `max_dag_nodes = 0` still renders a well-formed block
+with the ancestor chain plus empty leaderboard sections.
+
+The wiki file `wiki/09-dag-search.md` documents this block to Codex
+and is loaded via `_WIKI_CONTEXT_FILES`.
+
+### 4.15.5 Coexistence contract
+
+The Scheduler dataclass has both `node_store: NodeStore | None` and
+`dedup_index: ConfigDedupIndex | None` as optional fields with a
+default of `None`. When both are `None` (backward-compat mode), the
+scheduler behaves exactly as it did before the DAG substrate landed:
+no coexistence writes, no bootstrap, no rollback rewind (state
+advances unconditionally as before), no dedup lookups, no DAG prompt
+block. This preserves every pre-DAG test and every pre-DAG campaign
+directory. The production CLI (`__main__.py::_run_campaign`) wires
+both fields on every run; internal tests pass ``None`` to isolate
+behaviour.
+
+---
+
 ## 5. Test architecture
 
 ```

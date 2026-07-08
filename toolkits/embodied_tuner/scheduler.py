@@ -49,11 +49,24 @@ from toolkits.embodied_tuner.critic import (
     Rationale,
     TrialHistoryEntry,
 )
+from toolkits.embodied_tuner.config_dedup_index import (
+    ConfigDedupIndex,
+    DedupEntry,
+)
 from toolkits.embodied_tuner.ledger import Ledger, LedgerEntry, make_entry
 from toolkits.embodied_tuner.lessons import (
     BitterLesson,
     LessonBook,
     canonical_delta_signature,
+)
+from toolkits.embodied_tuner.node_store import (
+    DAGNode,
+    NodeStore,
+    NodeStoreIntegrityError,
+    ROLLBACK_FAILURE_MODES,
+    ROOT_STATUS,
+    derive_node_id,
+    render_dag_view,
 )
 from toolkits.embodied_tuner.parser import (
     FailureMode,
@@ -82,6 +95,12 @@ class BudgetConfig:
     epsilon: float = 0.02
     preflight_retries: int = 3
     history_window: int = 8  # K from AC-7's "last K=8 trials"
+    # Sibling cap for the parent-rollback state machine (AC-5). After
+    # this many consecutive launched-trial failures at the same active
+    # parent, the active leaf climbs one level further up the DAG. A
+    # climb above the baseline root terminates the campaign with the
+    # ``rollback_exhausted`` stop reason.
+    max_siblings: int = 3
 
 
 @dataclass(frozen=True)
@@ -164,6 +183,24 @@ class Scheduler:
     baseline_knobs: dict[str, Any] = field(default_factory=dict)
     clock: Callable[[], float] = _time.monotonic
     lesson_book: LessonBook | None = None
+    # Optional DAG-structured coexistence store. When set, every trial is
+    # mirrored to this store alongside the flat ``ledger``. The scheduler
+    # bootstraps a baseline root node on startup if the store is empty.
+    # Left ``None`` for backward compat: legacy tests and pre-DAG
+    # campaigns continue to work with the flat ``Ledger`` only.
+    node_store: NodeStore | None = None
+    # Optional persistent config-dedup sidecar. When set (typically
+    # alongside ``node_store``), the scheduler consults it after every
+    # preflight pass: duplicate-of-OK short-circuits the runner and
+    # emits a synthetic DUPLICATE_OF DAGNode; duplicate-of-FAILED is
+    # rejected via ``preflight_feedback`` sharing the preflight-retry
+    # budget. Left ``None`` for backward compat.
+    dedup_index: ConfigDedupIndex | None = None
+    # AC-7: cap on the number of sibling / top-K OK / recent-FAILED
+    # entries rendered in the DAG-view prompt block. The ancestor
+    # chain is always unconditional (never truncated by this cap).
+    # Set to 0 to render an empty leaderboard (still well-formed).
+    max_dag_nodes: int = 30
 
     # ----- Public API -----------------------------------------------------
 
@@ -194,9 +231,28 @@ class Scheduler:
         # the specific knob flip the critic chose that round.
         last_failed_trial_idx: int | None = None
         last_failed_delta: dict[str, Any] | None = None
+        # AC-5 sibling counter: how many consecutive launched-trial
+        # failures have hit the CURRENT active parent since the last
+        # advance / climb. Reset when active_leaf changes (advance on
+        # OK, or climb after reaching ``max_siblings``).
+        sibling_failures_at_active_parent = 0
 
         lesson_book = self._resolve_lesson_book()
         lessons: list[BitterLesson] = list(lesson_book.load())
+
+        # Bootstrap the DAG root (if a NodeStore is wired in) BEFORE any
+        # stopping-rule checks so a resumed campaign always has a root
+        # regardless of ``max_trials``. Returns ``None`` when the store
+        # is not configured (backward-compat mode).
+        active_leaf_id: str | None = self._bootstrap_root_if_needed(start)
+        # Load / rebuild the persistent dedup sidecar (if wired). The
+        # NodeStore is the authoritative source; the sidecar rebuild
+        # step ensures a lost or corrupt sidecar file is not fatal.
+        # Also seeds the counter used to synthesise unique node ids
+        # for duplicate-of short-circuits.
+        duplicate_counter = 0
+        if self.dedup_index is not None:
+            self.dedup_index.load_or_rebuild(self.node_store)
 
         if self.budget.max_trials <= 0:
             return self._finish("no_trials_run", trial_idx, oom_count)
@@ -220,6 +276,7 @@ class Scheduler:
                     last_timeline_summary=last_timeline_summary,
                     last_num_trajectories=last_num_trajectories,
                     bitter_lessons=lessons,
+                    active_leaf_id=active_leaf_id,
                 )
             except CriticError as exc:
                 self._record_critic_failure(trial_idx, str(exc), start)
@@ -286,6 +343,42 @@ class Scheduler:
                 )
                 return self._finish("preflight_exhausted", trial_idx, oom_count)
 
+            # Duplicate-of-OK short-circuit. When the (validated)
+            # resolved-config SHA matches a prior clean-OK trial, skip
+            # the runner entirely: emit a synthetic DUPLICATE_OF DAG
+            # node that back-references the ORIGINAL non-duplicate and
+            # copies its objective. AC-6: does NOT consume a
+            # max_trials slot; does NOT create a Ledger entry (the
+            # flat Ledger stays free of synthetic rows so existing
+            # consumers like `plot_step_time_vs_trajectories` are
+            # untouched). The DAG's ``active_leaf`` advances to the
+            # new duplicate node so subsequent Codex proposals treat
+            # it like any other expansion point.
+            if (
+                self.dedup_index is not None
+                and preflight_outcome.resolved_config_sha is not None
+            ):
+                origin = self.dedup_index.lookup(
+                    preflight_outcome.resolved_config_sha
+                )
+                if origin is not None and origin.is_ok():
+                    duplicate_counter += 1
+                    new_dup_id = self._record_duplicate_of_ok(
+                        origin=origin,
+                        parent_id=active_leaf_id,
+                        delta_from_parent=critic_output.delta,
+                        cumulative_delta=effective_delta,
+                        resolved_config_sha=preflight_outcome.resolved_config_sha,
+                        rationale=critic_output.rationale,
+                        duplicate_seq=duplicate_counter,
+                    )
+                    if new_dup_id is not None:
+                        active_leaf_id = new_dup_id
+                    # Do not advance trial_idx; do not touch oom_count.
+                    # Loop back and let the critic propose again from
+                    # the updated (post-dedup-visible) active leaf.
+                    continue
+
             # 2. Launch the trial via the runner (subprocess + cleanup).
             ts_start = _time.time()
             outcome = self.runner_fn(
@@ -299,8 +392,6 @@ class Scheduler:
             # 4. Update bookkeeping.
             if result.failure_mode is FailureMode.OOM:
                 oom_count += 1
-            current_knobs = self._apply_delta(current_knobs, critic_output.delta)
-            cumulative_delta = effective_delta
             entry = self._build_ledger_entry(
                 trial_idx=trial_idx,
                 delta=effective_delta,
@@ -313,6 +404,86 @@ class Scheduler:
                 ts_end=ts_end,
             )
             self.ledger.append(entry)
+            # Mirror to the DAG store (if wired). The parent id here is
+            # the CURRENT ``active_leaf_id``, which is either the
+            # baseline root, a prior OK/DUPLICATE_OF node, or an
+            # ancestor reached by an earlier rollback. AC-5's state
+            # machine (below) rewinds ``active_leaf_id`` after the
+            # mirror step when this trial is a rollback failure.
+            new_node_id = self._mirror_to_node_store(
+                entry=entry,
+                parent_id=active_leaf_id,
+                ts_start=ts_start,
+            )
+            if new_node_id is not None:
+                # Register this real launched trial in the dedup index so
+                # a subsequent proposal that resolves to the same SHA
+                # can short-circuit (OK) or be rejected (FAILED).
+                if self.dedup_index is not None and self.node_store is not None:
+                    origin_node = self.node_store.get(new_node_id)
+                    if origin_node is not None:
+                        self.dedup_index.add(node=origin_node)
+
+            # AC-5 state machine: any launched-trial failure in
+            # ROLLBACK_FAILURE_MODES rewinds ``active_leaf`` to the
+            # failing node's parent (and, if the sibling cap has been
+            # reached, one more level up). Only OK trials advance the
+            # active leaf; only OK trials update the flat
+            # ``cumulative_delta`` / ``current_knobs`` accumulators (a
+            # rollback failure must not silently leave its knobs
+            # applied for the next round). Preflight rejections
+            # (CONFIG_INVALID / DIVISIBILITY_VIOLATION) are handled
+            # above via ``preflight_exhausted`` and never reach this
+            # block — they do not create a DAG node.
+            is_rollback_failure = entry.failure_mode in ROLLBACK_FAILURE_MODES
+            if self.node_store is not None and new_node_id is not None and is_rollback_failure:
+                # Rewind: undo the tentative advance and reset the
+                # flat accumulators to the parent's cumulative state.
+                parent = self.node_store.parent_of(new_node_id)
+                if parent is not None:
+                    active_leaf_id = parent.node_id
+                    cumulative_delta = dict(parent.cumulative_delta)
+                    current_knobs = self._apply_delta(
+                        dict(self.baseline_knobs), cumulative_delta
+                    )
+                else:
+                    # Should be unreachable — every launched trial's
+                    # parent is at least the root — but degrade safely.
+                    _log.warning(
+                        "rollback: failing trial %s has no parent in the"
+                        " NodeStore; skipping state machine update",
+                        new_node_id,
+                    )
+                sibling_failures_at_active_parent += 1
+                if sibling_failures_at_active_parent >= self.budget.max_siblings:
+                    grandparent = (
+                        self.node_store.parent_of(active_leaf_id)
+                        if active_leaf_id is not None
+                        else None
+                    )
+                    if grandparent is None:
+                        # We were rewound to root (or above); no
+                        # further climb possible. Terminate the
+                        # campaign with the dedicated stop reason.
+                        return self._finish(
+                            "rollback_exhausted", trial_idx, oom_count
+                        )
+                    active_leaf_id = grandparent.node_id
+                    cumulative_delta = dict(grandparent.cumulative_delta)
+                    current_knobs = self._apply_delta(
+                        dict(self.baseline_knobs), cumulative_delta
+                    )
+                    sibling_failures_at_active_parent = 0
+            else:
+                # OK trial (or backward-compat mode without node_store):
+                # advance the flat state and, when we have a DAG store,
+                # advance active_leaf to the new node too. Reset the
+                # sibling counter — this parent has produced a success.
+                current_knobs = self._apply_delta(current_knobs, critic_output.delta)
+                cumulative_delta = effective_delta
+                if new_node_id is not None:
+                    active_leaf_id = new_node_id
+                sibling_failures_at_active_parent = 0
             history.append(
                 self._history_entry(
                     entry, critic_output.rationale, critic_output.delta
@@ -348,6 +519,7 @@ class Scheduler:
         last_timeline_summary: Mapping[str, Any] | None,
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
+        active_leaf_id: str | None = None,
     ) -> tuple[CriticOutput, PreflightOutcome]:
         """Ask the critic, run preflight, retry on preflight failures.
 
@@ -369,6 +541,18 @@ class Scheduler:
         preflight_feedback: str | None = None
         last_critic_output: CriticOutput | None = None
         last_preflight: PreflightOutcome | None = None
+        # AC-7: render the compact DAG view once per proposal round so
+        # every retry in this preflight loop sees the same DAG state
+        # (Codex should not observe the DAG shifting mid-retry). When
+        # the NodeStore is not wired in the block is left empty and
+        # ``CriticPrompt`` renders nothing for it.
+        dag_block = ""
+        if self.node_store is not None:
+            dag_block = render_dag_view(
+                self.node_store,
+                active_leaf_id=active_leaf_id,
+                max_dag_nodes=self.max_dag_nodes,
+            )
         while attempts <= self.budget.preflight_retries:
             critic_output = self.critic.propose(
                 history=history,
@@ -379,6 +563,7 @@ class Scheduler:
                 last_num_trajectories=last_num_trajectories,
                 bitter_lessons=bitter_lessons,
                 preflight_feedback=preflight_feedback,
+                dag_block=dag_block,
             )
             if critic_output.stop_requested:
                 return critic_output, PreflightOutcome(
@@ -391,6 +576,41 @@ class Scheduler:
             effective_delta = {**cumulative_delta, **critic_output.delta}
             preflight = self.preflight_fn(effective_delta)
             if preflight.ok:
+                # Dedup guard for previously-FAILED configs: if the
+                # cumulative resolved-config SHA matches a prior failed
+                # trial, reject this proposal via ``preflight_feedback``
+                # sharing the preflight-retry budget. Duplicate-of-OK
+                # is handled outside this helper (see ``run``): it
+                # short-circuits the runner rather than looping the
+                # critic.
+                if (
+                    self.dedup_index is not None
+                    and preflight.resolved_config_sha is not None
+                ):
+                    prior = self.dedup_index.lookup(preflight.resolved_config_sha)
+                    if prior is not None and not prior.is_ok():
+                        attempts += 1
+                        feedback_msg = (
+                            "The resolved config for your proposed delta has "
+                            "already been attempted in this campaign (node "
+                            f"{prior.origin_node_id!r}) and failed with "
+                            f"{prior.failure_mode!r}. Propose a different "
+                            "delta that produces a different resolved config."
+                        )
+                        preflight_feedback = feedback_msg
+                        last_critic_output = critic_output
+                        # Track a synthesised rejection so the exit
+                        # path still surfaces preflight_exhausted (the
+                        # semantic is identical: no acceptable config
+                        # was produced within the retry budget).
+                        last_preflight = PreflightOutcome(
+                            ok=False,
+                            errors=(feedback_msg,),
+                            resolved_config_sha=preflight.resolved_config_sha,
+                            log_dir=preflight.log_dir,
+                            delta=preflight.delta,
+                        )
+                        continue
                 return critic_output, preflight
             attempts += 1
             last_critic_output = critic_output
@@ -408,11 +628,19 @@ class Scheduler:
         return last_critic_output, last_preflight
 
     def _is_plateaued(self, history: list[TrialHistoryEntry]) -> bool:
-        """Return ``True`` when the last ``patience`` non-failed trials plateaued."""
+        """Return ``True`` when the last ``patience`` non-failed trials plateaued.
+
+        Excludes DUPLICATE_OF entries: a synthetic duplicate copies the
+        original trial's objective, so treating it as a distinct
+        improvement (or lack thereof) would artificially satisfy the
+        plateau predicate.
+        """
         eligible = [
             entry
             for entry in history
-            if entry.status == Status.OK.value and entry.objective is not None
+            if entry.status == Status.OK.value
+            and entry.failure_mode == FailureMode.NONE.value
+            and entry.objective is not None
         ]
         if len(eligible) < self.budget.patience + 1:
             return False
@@ -693,3 +921,241 @@ class Scheduler:
             best_entry=self.ledger.best(),
             ledger_path=self.ledger.path,
         )
+
+    # ----- DAG coexistence -----------------------------------------------
+
+    def _bootstrap_root_if_needed(self, start: float) -> str | None:
+        """Ensure the DAG root node exists; return the active leaf id or ``None``.
+
+        Called once at the top of :meth:`run`. Behaviour depends on
+        whether a :class:`NodeStore` has been wired in:
+
+        - ``self.node_store is None``: DAG coexistence is disabled.
+          Return ``None`` and skip every subsequent mirror step.
+        - Store already has a root (resumed campaign): derive the
+          active leaf id by scanning the persisted stream. Rollback
+          rules replay via :meth:`NodeStore.active_leaf`; falls back to
+          the root when no non-root node has been persisted yet.
+        - Store is empty (fresh campaign): run preflight with an empty
+          delta to compute the baseline ``resolved_config_sha``, append
+          a root :class:`DAGNode`, and return its id.
+        """
+        if self.node_store is None:
+            return None
+        existing_root = self.node_store.root()
+        if existing_root is not None:
+            # Defensive resume path: the Scheduler doesn't yet support
+            # resuming a partial campaign (that is dedicated Milestone-3
+            # / task9 work), but a stale nodes.jsonl in the ledger
+            # directory shouldn't crash startup. Use the newest
+            # appended node as the starting active leaf under
+            # linear-chain semantics (which is what Milestone-1's
+            # coexistence writer produces). Task9 will replace this
+            # with the rollback-aware ``active_leaf()`` derivation.
+            all_nodes = self.node_store.all_nodes()
+            if len(all_nodes) > 1:
+                return all_nodes[-1].node_id
+            return existing_root.node_id
+        # Fresh campaign: compute baseline SHA via preflight so root's
+        # resolved_config_sha matches the same hash the runner would
+        # observe. Preflight is by contract Ray/GPU-free, so this is
+        # cheap and safe at scheduler startup.
+        baseline_preflight = self.preflight_fn({})
+        root_ts = _time.time()
+        root_id = derive_node_id(
+            parent_id=None,
+            delta_from_parent={},
+            trial_idx=None,
+            ts_start=root_ts,
+        )
+        root_node = DAGNode(
+            node_id=root_id,
+            parent_id=None,
+            delta_from_parent={},
+            cumulative_delta={},
+            trial_idx=None,
+            resolved_config_sha=baseline_preflight.resolved_config_sha,
+            log_dir="",
+            returncode=None,
+            status=ROOT_STATUS,
+            failure_mode=FailureMode.NONE.value,
+            objective=None,
+            step_time=None,
+            num_trajectories=None,
+            per_component_timings={},
+            timeline_summary=None,
+            peak_gpu_mem=None,
+            critic_rationale=None,
+            ts_start=root_ts,
+            ts_end=root_ts,
+            cleanup_outcome="ok",
+        )
+        self.node_store.append(root_node)
+        # Seed the dedup index with the baseline root's SHA so a Codex
+        # proposal that resolves back to the pristine baseline short-
+        # circuits to a duplicate rather than re-running the baseline.
+        if self.dedup_index is not None:
+            self.dedup_index.load_or_rebuild(self.node_store)
+        return root_id
+
+    def _mirror_to_node_store(
+        self,
+        *,
+        entry: LedgerEntry,
+        parent_id: str | None,
+        ts_start: float,
+    ) -> str | None:
+        """Project ``entry`` into a :class:`DAGNode` and append it.
+
+        Called after every ``ledger.append`` in :meth:`run`. When
+        ``self.node_store`` is ``None`` (backward-compat mode) this is a
+        no-op returning ``None``. When the node store is wired but a
+        parent id is missing (should never happen once the root is
+        bootstrapped), the mirror step is skipped defensively rather
+        than raising — the flat Ledger remains the authoritative
+        campaign record for existing consumers.
+        """
+        if self.node_store is None:
+            return None
+        if parent_id is None:
+            _log.warning(
+                "DAG coexistence: no parent_id available for trial_idx=%s;"
+                " skipping node_store mirror",
+                entry.trial_idx,
+            )
+            return None
+        node_id = derive_node_id(
+            parent_id=parent_id,
+            delta_from_parent=entry.proposed_delta or {},
+            trial_idx=entry.trial_idx,
+            ts_start=ts_start,
+        )
+        node = DAGNode(
+            node_id=node_id,
+            parent_id=parent_id,
+            delta_from_parent=dict(entry.proposed_delta or {}),
+            cumulative_delta=dict(entry.delta),
+            trial_idx=entry.trial_idx,
+            resolved_config_sha=entry.resolved_config_sha,
+            log_dir=entry.log_dir,
+            returncode=entry.returncode,
+            status=entry.status,
+            failure_mode=entry.failure_mode,
+            objective=entry.objective,
+            step_time=entry.step_time,
+            num_trajectories=entry.num_trajectories,
+            per_component_timings=dict(entry.per_component_timings),
+            timeline_summary=(
+                dict(entry.timeline_summary)
+                if entry.timeline_summary is not None
+                else None
+            ),
+            peak_gpu_mem=entry.peak_gpu_mem,
+            critic_rationale=(
+                dict(entry.critic_rationale)
+                if entry.critic_rationale is not None
+                else None
+            ),
+            ts_start=entry.ts_start,
+            ts_end=entry.ts_end,
+            cleanup_outcome=entry.cleanup_outcome,
+            error_excerpt=entry.error_excerpt,
+        )
+        try:
+            self.node_store.append(node)
+        except NodeStoreIntegrityError as exc:
+            _log.warning(
+                "DAG coexistence: node_store rejected trial_idx=%s (%s);"
+                " Ledger remains authoritative for this trial",
+                entry.trial_idx,
+                exc,
+            )
+            return None
+        return node_id
+
+    def _record_duplicate_of_ok(
+        self,
+        *,
+        origin: DedupEntry,
+        parent_id: str | None,
+        delta_from_parent: Mapping[str, Any],
+        cumulative_delta: Mapping[str, Any],
+        resolved_config_sha: str,
+        rationale: Rationale,
+        duplicate_seq: int,
+    ) -> str | None:
+        """Append a synthetic ``DUPLICATE_OF`` DAGNode short-circuiting the runner.
+
+        Emitted when the resolved-config SHA of a preflight-passing
+        proposal has already been observed with a clean-OK outcome
+        (see AC-6). The synthetic node:
+
+        - Uses ``status = "OK"`` and ``failure_mode = "DUPLICATE_OF"``.
+        - Sets ``duplicate_of_node_id`` to the ORIGINAL non-duplicate
+          node's id (never to another duplicate — the ``ConfigDedupIndex``
+          already collapses chains).
+        - Copies the original trial's ``objective`` for continuity in
+          downstream leaderboards.
+        - Uses a negative ``trial_idx`` (``-duplicate_seq``) so it
+          renders as ``dup<seq>-<hash>`` in the DAG viewer, is easy to
+          distinguish from real launched trials, and never collides
+          with a positive ``trial_idx``.
+
+        No :class:`Ledger` entry is written — the flat Ledger stays
+        clean of synthetic rows so ``_emit_best_artefacts`` and
+        ``plot_step_time_vs_trajectories`` continue to consume only
+        real launched trials. The DAG is the audit trail for
+        duplicates.
+        """
+        if self.node_store is None:
+            return None
+        if parent_id is None:
+            _log.warning(
+                "duplicate-of-OK short-circuit: no parent_id available;"
+                " skipping DUPLICATE_OF DAG node emission for SHA %s",
+                resolved_config_sha,
+            )
+            return None
+        ts = _time.time()
+        synthetic_trial_idx = -duplicate_seq
+        node_id = derive_node_id(
+            parent_id=parent_id,
+            delta_from_parent=delta_from_parent,
+            trial_idx=synthetic_trial_idx,
+            ts_start=ts,
+        )
+        dup_node = DAGNode(
+            node_id=node_id,
+            parent_id=parent_id,
+            delta_from_parent=dict(delta_from_parent),
+            cumulative_delta=dict(cumulative_delta),
+            trial_idx=synthetic_trial_idx,
+            resolved_config_sha=resolved_config_sha,
+            log_dir="",
+            returncode=None,
+            status=Status.OK.value,
+            failure_mode=FailureMode.DUPLICATE_OF.value,
+            objective=origin.objective,
+            step_time=None,
+            num_trajectories=None,
+            per_component_timings={},
+            timeline_summary=None,
+            peak_gpu_mem=None,
+            critic_rationale=rationale.to_dict(),
+            ts_start=ts,
+            ts_end=ts,
+            cleanup_outcome="ok",
+            duplicate_of_node_id=origin.origin_node_id,
+        )
+        try:
+            self.node_store.append(dup_node)
+        except NodeStoreIntegrityError as exc:
+            _log.warning(
+                "duplicate-of-OK short-circuit: node_store rejected"
+                " synthetic node for SHA %s (%s); ledger and dedup"
+                " state remain consistent",
+                resolved_config_sha,
+                exc,
+            )
+            return None
+        return node_id

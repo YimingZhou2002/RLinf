@@ -86,6 +86,13 @@ class FailureMode(str, Enum):
     WORKER_CRASH = "WORKER_CRASH"
     TIMEOUT = "TIMEOUT"
     DIVISIBILITY_VIOLATION = "DIVISIBILITY_VIOLATION"
+    # Synthetic mode set on a DAGNode that short-circuits the runner
+    # because its cumulative resolved-config SHA has already been
+    # attempted in the campaign (see ConfigDedupIndex). The
+    # accompanying ``duplicate_of_node_id`` back-reference on the
+    # DAGNode always points at the ORIGINAL non-duplicate that
+    # produced the recycled objective — never at a chain of duplicates.
+    DUPLICATE_OF = "DUPLICATE_OF"
 
 
 class ParserInvariantError(AssertionError):

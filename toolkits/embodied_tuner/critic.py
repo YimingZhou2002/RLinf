@@ -78,6 +78,7 @@ _WIKI_CONTEXT_FILES: tuple[str, ...] = (
     "06-playbook.md",
     "07-constraints.md",
     "08-gotchas.md",
+    "09-dag-search.md",
 )
 
 
@@ -214,6 +215,13 @@ class CriticPrompt:
     wiki_block: str = field(default_factory=_load_wiki_context)
     schema_doc: str = _RATIONALE_SCHEMA_DOC
     bitter_lessons_block: str = ""  # permanent, cross-window failure memory
+    # AC-7: compact DAG view (ancestor chain + parent siblings +
+    # top-K OK leaves + recent FAILED leaves). Rendered by
+    # :func:`toolkits.embodied_tuner.node_store.render_dag_view`.
+    # Inserted between ``bitter_lessons_block`` and ``history_block``
+    # so Codex sees "permanent memory → global topology → recent
+    # trials" in that order.
+    dag_block: str = ""
     history_block: str = "## Trial History\n(none — first round)\n"
     current_knobs_block: str = ""
     constraints_block: str = ""
@@ -226,6 +234,7 @@ class CriticPrompt:
         sections = [
             self.wiki_block,
             self.bitter_lessons_block,
+            self.dag_block,
             self.history_block,
             self.current_knobs_block,
             self.constraints_block,
@@ -248,10 +257,13 @@ class CriticPrompt:
         the round's decision without those keys is missing the
         primary signal the critic saw, and keeps
         ``bitter_lessons_block`` because it is the permanent memory
-        the critic acts on.
+        the critic acts on. The DAG view is also kept because it
+        explains why Codex is being expanded from a particular parent
+        this round.
         """
         sections = [
             self.bitter_lessons_block,
+            self.dag_block,
             self.history_block,
             self.current_knobs_block,
             self.memory_pressure_block,
@@ -287,6 +299,7 @@ def build_prompt(
     bitter_lessons: Sequence[BitterLesson] = (),
     feedback: str | None = None,
     preflight_feedback: str | None = None,
+    dag_block: str = "",
 ) -> CriticPrompt:
     """Assemble a :class:`CriticPrompt` from current scheduler state.
 
@@ -327,6 +340,7 @@ def build_prompt(
         )
     return CriticPrompt(
         bitter_lessons_block=_render_bitter_lessons(bitter_lessons),
+        dag_block=dag_block,
         history_block=_render_history(history),
         current_knobs_block=_render_current_knobs(current_knobs, schema),
         constraints_block=_render_constraints(),
@@ -916,6 +930,7 @@ class Critic(Protocol):
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
+        dag_block: str = "",
     ) -> CriticOutput:
         ...
 
@@ -964,6 +979,7 @@ class CodexCritic:
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
+        dag_block: str = "",
     ) -> CriticOutput:
         active_schema = schema or self.schema
         validator = CriticOutputValidator(
@@ -987,6 +1003,7 @@ class CodexCritic:
                 bitter_lessons=bitter_lessons,
                 feedback=feedback,
                 preflight_feedback=preflight_feedback,
+                dag_block=dag_block,
             )
             debug_prompt = prompt.to_debug_text()
             response = self._invoke_transport(str(prompt))

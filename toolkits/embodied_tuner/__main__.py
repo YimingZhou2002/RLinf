@@ -57,6 +57,8 @@ from toolkits.embodied_tuner.critic import (
 )
 from toolkits.embodied_tuner.fake_critic import FakeCritic
 from toolkits.embodied_tuner.ledger import Ledger
+from toolkits.embodied_tuner.config_dedup_index import ConfigDedupIndex
+from toolkits.embodied_tuner.node_store import NodeStore
 from toolkits.embodied_tuner.override_wrapper import LaunchSpec, OverrideWrapper
 from toolkits.embodied_tuner.parser import TrialResult, parse_trial
 from toolkits.embodied_tuner.preflight import (
@@ -106,6 +108,7 @@ class CLIArgs:
     fake_critic_path: Path | None
     ledger_dir: Path
     ask_codex_path: str
+    max_siblings: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +169,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="runner.max_epochs Hydra override per trial (default 3; every step contributes to the averaged objective).",
+    )
+    parser.add_argument(
+        "--max-siblings",
+        type=int,
+        default=3,
+        help=(
+            "Per-parent sibling cap for the DAG rollback state machine "
+            "(default 3). After this many consecutive launched-trial "
+            "failures at the same active parent, the scheduler climbs "
+            "one level up the DAG; a climb above the baseline root "
+            "terminates the campaign with the ``rollback_exhausted`` "
+            "stop reason. Ignored when the DAG coexistence store is "
+            "disabled."
+        ),
     )
     memory_group = parser.add_mutually_exclusive_group()
     memory_group.add_argument(
@@ -295,6 +312,7 @@ def parse_cli_args(argv: list[str] | None = None) -> CLIArgs:
         fake_critic_path=ns.fake_critic,
         ledger_dir=ledger_dir,
         ask_codex_path=ask_script_path,
+        max_siblings=ns.max_siblings,
     )
 
 
@@ -377,12 +395,23 @@ def _run_campaign(args: CLIArgs) -> int:
     )
     ledger_path = args.ledger_dir / "tuner_ledger.jsonl"
     ledger = Ledger(ledger_path)
+    # DAG-structured coexistence sidecar (see AC-1/AC-2). Written on
+    # every trial alongside the flat Ledger; the Ledger remains the
+    # authoritative source for existing consumers (best_config.yaml,
+    # plot_step_time_vs_trajectories, historical tuner_ledger.jsonl).
+    node_store_path = args.ledger_dir / "nodes.jsonl"
+    node_store = NodeStore(node_store_path)
+    # Persistent config-dedup sidecar (AC-6). Keyed by resolved-config
+    # SHA; rebuildable from the NodeStore on load so a lost/corrupt
+    # sidecar is a warning not a campaign failure.
+    dedup_index = ConfigDedupIndex(args.ledger_dir / "config_dedup_index.jsonl")
     budget = BudgetConfig(
         max_trials=args.max_trials,
         budget_seconds=args.budget_seconds,
         max_oom=args.max_oom,
         patience=args.patience,
         epsilon=args.epsilon,
+        max_siblings=args.max_siblings,
     )
     campaign_id = _campaign_id(args.ledger_dir)
     _LOGGER.info("embodied_tuner: campaign_id=%s", campaign_id)
@@ -413,6 +442,8 @@ def _run_campaign(args: CLIArgs) -> int:
         ledger=ledger,
         budget=budget,
         baseline_knobs=baseline_knobs,
+        node_store=node_store,
+        dedup_index=dedup_index,
     )
     campaign = scheduler.run()
     _emit_best_artefacts(campaign, args)

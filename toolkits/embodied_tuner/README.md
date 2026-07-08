@@ -47,26 +47,43 @@ PYTHONPATH=. python -m toolkits.embodied_tuner --config maniskill_ppo_openvla
 ## What the tuner does each trial
 
 1. **Critic proposes** a knob delta with structured rationale
-   `{summary, metric_table_citations, timeline_citations}`.
+   `{summary, metric_table_citations, timeline_citations}`. The critic
+   prompt is augmented with a compact **DAG view** (ancestor chain of
+   the active leaf, sibling attempts, top-K OK leaderboard, recent
+   failures) so Codex can see the shape of the search so far.
 2. **Preflight validates** the delta: composes baseline + delta via Hydra,
    runs the targeted divisibility checks from `rlinf/config.py:962/965/980/1363-1368`
    plus a placement-legality check. **Never starts Ray** (preflight is GPU-free
    and Ray-free by contract).
-3. **Trial runner** launches the trial as a subprocess in its own POSIX
+3. **Config dedup** (post-preflight): the resolved-config SHA is
+   looked up in `config_dedup_index.jsonl`. If the cumulative config
+   has already been attempted OK, the runner is short-circuited and a
+   synthetic `DUPLICATE_OF` DAG node is emitted (no Ledger row, no
+   trial-slot burn). If it has already FAILED, the proposal is
+   rejected via `preflight_feedback` sharing the `preflight_retries`
+   budget.
+4. **Trial runner** launches the trial as a subprocess in its own POSIX
    process group with a per-trial timeout, escalates SIGTERM → SIGKILL on
    timeout, invokes `ray stop --force`, and sweeps `/proc/<pid>/environ` +
    `pgrep -f` for orphan Ray workers tagged with the trial id.
-4. **Parser** reads `metrics.log` (the MetricTable) + `timeline/*.jsonl`
+5. **Parser** reads `metrics.log` (the MetricTable) + `timeline/*.jsonl`
    (per-component events), classifies the trial with
    `(Status, FailureMode)`, computes the objective as
    `step_time / num_trajectories` averaged over every parsed MetricTable
    block (single-step trials are measurable),
    and surfaces a per-component timeline summary the next critic prompt
    consumes.
-5. **Ledger** persists each trial as one JSONL line, including the structured
-   `critic_rationale` payload — the audit trail that lets operators trace
-   which MetricTable observation AND which timeline observation drove each
-   placement change.
+6. **Ledger + NodeStore** persist each trial. The flat
+   `tuner_ledger.jsonl` is written unchanged (existing consumers
+   continue to work) plus a `DAGNode` is appended to `nodes.jsonl` with
+   an explicit `parent_id`. On a rollback failure
+   (`OOM`/`WORKER_CRASH`/`TIMEOUT`/`METRICS_PARTIAL`/`METRICS_MISSING`),
+   the scheduler rewinds `active_leaf` to the failing node's parent so
+   the next round's proposal starts from a clean context; a
+   sibling-cap counter (`--max-siblings`, default 3) drives ancestor
+   climbing after repeated failures at the same parent, and a climb
+   above the root terminates the campaign with the new
+   `rollback_exhausted` stop reason.
 
 ## The dual-source rationale rule (critic contract)
 
@@ -275,7 +292,7 @@ The tuner itself is plain Python — it is **not** an RLCR loop. Specifically:
 one RLCR round of the build process equals "the entire plan is finished",
 not "one RLinf trial". The trial loop happens inside `Scheduler.run()`.
 
-## Known limitations (FUT-1 … FUT-9)
+## Known limitations (FUT-1 … FUT-12)
 
 The plan explicitly defers these:
 
@@ -290,6 +307,33 @@ The plan explicitly defers these:
 - Cross-config tuning (`FUT-7`).
 - Deterministic memory-shrink retry on OOM (`FUT-8`).
 - Additional baseline configs beyond `maniskill_ppo_openvla` (`FUT-9`).
+- **Algorithmic frontier-selection over the DAG** (`FUT-10`).
+  Introduce a `FrontierPolicy` protocol with concrete implementations
+  (`BestFirstPolicy`, `UCB1Policy`, `BeamPolicy`, `PlateauBacktrackPolicy`);
+  replace the current "always expand active leaf" order with
+  policy-driven expansion; adjust plateau / critic-stagnation semantics
+  for graph search. Corresponds to Alt-5 from the DAG-store design
+  draft. Prerequisites are the current-loop DAG infrastructure
+  (`AC-1` NodeStore, `AC-5` rollback state machine, `AC-6` dedup
+  index). A negative-space AST walker
+  (`tests/test_no_frontier_policy.py`) guards against accidental
+  drift: introducing any class / function / import named
+  `FrontierPolicy`, `FrontierScheduler`, `BestFirstPolicy`,
+  `UCB1Policy`, `BeamPolicy`, or `PlateauBacktrackPolicy` inside
+  `toolkits/embodied_tuner/**/*.py` will immediately fail the test
+  suite until this FUT is explicitly promoted in a future RLCR loop.
+- **Operator-facing DAG visualization + manual branch injection**
+  (`FUT-11`). ASCII / Plotly-HTML DAG viewer alongside every campaign
+  and a `--inject --from-trial N --delta '{...}'` CLI flag for
+  human-directed branching. Corresponds to Alt-4 from the DAG-store
+  design draft. Prerequisite: `AC-1` (`NodeStore` provides the
+  read model).
+- **True multi-parent DAG for duplicate-config convergence**
+  (`FUT-12`). Model unique resolved configs as nodes keyed by
+  `resolved_config_sha` with multiple incoming edges when different
+  parent paths converge, replacing the single-parent tree +
+  `duplicate_of_node_id` back-reference the current loop uses (see
+  `AC-6`). Prerequisite: `AC-1`.
 
 Codex review also flagged three polish items (non-blocking):
 
