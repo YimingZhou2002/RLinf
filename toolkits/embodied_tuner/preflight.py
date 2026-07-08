@@ -34,7 +34,7 @@ numbers in ``rlinf/config.py``):
   routing-layer assertion in ``rlinf/scheduler/worker/routing.py:139``
   (``CommMapper.get_dst_ranks``). Not mirrored by
   ``validate_embodied_cfg``, so preflight is the only pre-launch gate for
-  this. See ``toolkits/embodied_tuner/wiki/04-constraints.md`` §04.2.6.
+  this. See ``toolkits/embodied_tuner/wiki/07-constraints.md`` §2.6.
 
 The reason for re-implementing instead of calling RLinf's validators
 directly: ``validate_embodied_cfg`` instantiates
@@ -335,14 +335,14 @@ def _check_divisibility(cfg: DictConfig, num_gpus: int) -> list[str]:
             # Routing-layer assertion (rlinf/scheduler/worker/routing.py:139,
             # CommMapper.get_dst_ranks): per-env-rank batch must be divisible
             # by every downstream world size the env worker sends to.
-            # See toolkits/embodied_tuner/wiki/04-constraints.md §04.2.6.
+            # See toolkits/embodied_tuner/wiki/07-constraints.md §2.6.
             if rollout_world_size > 0 and per_rank % rollout_world_size != 0:
                 errors.append(
                     f"divisibility: per-rank env count {per_rank} "
                     f"(total_num_envs={total_num_envs} // env_world_size={env_world_size}) "
                     f"is not divisible by rollout_world_size={rollout_world_size} "
                     f"— will crash rlinf/scheduler/worker/routing.py:139 "
-                    f"(env→rollout send). See wiki/04-constraints.md §04.2.6."
+                    f"(env→rollout send). See wiki/07-constraints.md §2.6."
                 )
             if actor_world_size > 0 and per_rank % actor_world_size != 0:
                 errors.append(
@@ -350,7 +350,7 @@ def _check_divisibility(cfg: DictConfig, num_gpus: int) -> list[str]:
                     f"(total_num_envs={total_num_envs} // env_world_size={env_world_size}) "
                     f"is not divisible by actor_world_size={actor_world_size} "
                     f"— will crash rlinf/scheduler/worker/routing.py:139 "
-                    f"(rollout→actor send). See wiki/04-constraints.md §04.2.6."
+                    f"(rollout→actor send). See wiki/07-constraints.md §2.6."
                 )
 
     # max_steps_per_rollout_epoch % num_action_chunks == 0  (rlinf/config.py:980)

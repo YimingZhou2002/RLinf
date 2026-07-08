@@ -663,8 +663,8 @@ clarity and immutability.
     validation_reason}` for the scheduler to persist.
 - **Design notes.**
   - **Wiki-driven prompt.** The static optimization context lives in
-    numbered markdown files under `wiki/` (`00-bottleneck-rubric.md`
-    → `04-constraints.md`, loaded in that order). Editing prompt
+    numbered markdown files under `wiki/` (`01-concepts.md`
+    → `08-gotchas.md`, loaded in that order). Editing prompt
     guidance is a markdown edit — Python constants no longer hold it.
     A missing wiki file is a build error (raised at import time), not
     a runtime warning.
@@ -837,27 +837,36 @@ clarity and immutability.
 
 - **Role.** Natural-language optimization context loaded verbatim into
   every critic prompt. Complements the mechanical inputs (MetricTable,
-  timeline JSONL, current knob values, trial history) with a bottleneck
-  rubric, placement critical paths, per-knob playbook, timeline signal
-  glossary, and hard constraint list.
+  timeline JSONL, current knob values, trial history) with a concepts
+  glossary, placement critical paths, prompt-input contract, timeline
+  signal glossary, decision recipe, per-knob playbook, hard-constraint
+  list, and consolidated anti-patterns.
 - **Files** (loaded in numeric order by `critic._load_wiki_context`):
   - [`README.md`](./wiki/README.md) — read order + editorial rules
-  - [`00-bottleneck-rubric.md`](./wiki/00-bottleneck-rubric.md) — reading
-    order, when to trust which block, term→knob decision table
-    (extracted from what was previously the `_BOTTLENECK_RUBRIC`
-    Python constant)
-  - [`01-placement-critical-paths.md`](./wiki/01-placement-critical-paths.md) —
-    critical path per placement mode (collocated / hybrid /
-    disaggregated) and per runner mode (`run` vs `run_pipeline`)
-  - [`02-optimization-directions.md`](./wiki/02-optimization-directions.md) —
-    knob-by-knob playbook: what each knob shifts, when to touch it,
-    common OOM patterns
-  - [`03-timeline-signals.md`](./wiki/03-timeline-signals.md) — what each
-    timeline tag means, how `stall_fraction` is defined, which tags
-    are wrappers to ignore
-  - [`04-constraints.md`](./wiki/04-constraints.md) — every rule that
-    will refuse a delta, split into preflight-enforced (fail fast) vs
-    runtime-enforced (crashes the trial)
+  - [`01-concepts.md`](./wiki/01-concepts.md) — objective, notation
+    (`T_env / T_rol / T_act / T_sync / R`), placement modes, runner
+    modes, and the trajectory-scaling model
+  - [`02-paths.md`](./wiki/02-paths.md) — critical-path formula per
+    `(placement, runner mode)` combination with quick-reference table
+    and timeline signatures
+  - [`03-inputs.md`](./wiki/03-inputs.md) — the data blocks the critic
+    receives, their schemas, block-priority-on-conflict rule, and
+    `FailureMode` catalog
+  - [`04-signals.md`](./wiki/04-signals.md) — timeline tag reference,
+    `stall_fraction` semantics, wrapper tags to ignore, missing-data
+    handling
+  - [`05-recipe.md`](./wiki/05-recipe.md) — step-by-step decision
+    flow: identify → locate → verify → choose → validate → cite;
+    dual-source and failed-trial revert-bundle rules
+  - [`06-playbook.md`](./wiki/06-playbook.md) — per-knob playbook:
+    what each knob moves, when to grow/shrink, per-knob preflight
+    checks, cross-knob patterns
+  - [`07-constraints.md`](./wiki/07-constraints.md) — Tier 1 preflight
+    and Tier 2 runtime rules with per-delta-type checklists; §2.6
+    documents the routing-divisibility trap that produces synthetic
+    `DIVISIBILITY_VIOLATION`
+  - [`08-gotchas.md`](./wiki/08-gotchas.md) — consolidated
+    anti-patterns with cross-references to the rule detail
 - **Design notes.**
   - **Why markdown, not Python.** Prompt tuning is workload knowledge
     (which knob helps which bottleneck), not code. Keeping it in

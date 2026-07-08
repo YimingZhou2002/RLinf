@@ -402,7 +402,7 @@ def test_build_prompt_contains_all_required_sections() -> None:
         last_timeline_summary=None,
     )
     text = str(prompt)
-    assert "Bottleneck rubric" in text
+    assert "Concepts" in text
     assert "Trial History" in text  # "(none — first round)" branch
     assert "Current knob values" in text
     assert "Hard constraints" in text
@@ -462,8 +462,12 @@ def test_build_prompt_memory_pressure_only_when_last_failure_was_oom() -> None:
         last_metric_summary=None,
         last_timeline_summary=None,
     )
-    assert "Memory pressure" in str(prompt_oom)
-    assert "Memory pressure" not in str(prompt_ok)
+    # The wiki (03-inputs.md) quotes both the block header and describes
+    # the block's purpose, so substring assertions on the header alone
+    # can't distinguish "block rendered" from "wiki describes the block".
+    # Assert on body text unique to _render_memory_pressure.
+    assert "Prefer memory-reducing knobs in the next delta" in str(prompt_oom)
+    assert "Prefer memory-reducing knobs in the next delta" not in str(prompt_ok)
 
 
 def test_build_prompt_timeline_summary_rendered_when_supplied() -> None:
@@ -871,7 +875,10 @@ def test_build_prompt_omits_bitter_lessons_block_when_empty() -> None:
         last_timeline_summary=None,
         bitter_lessons=(),
     )
-    assert "Bitter Lessons" not in str(prompt)
+    # Same reasoning as memory-pressure test above: 03-inputs.md quotes the
+    # Bitter Lessons header, so assert on body text unique to
+    # _render_bitter_lessons instead.
+    assert "Each lesson was written by an earlier round" not in str(prompt)
 
 
 def test_debug_text_includes_bitter_lessons_block() -> None:

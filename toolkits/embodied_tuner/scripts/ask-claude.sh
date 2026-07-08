@@ -39,6 +39,15 @@ CLAUDE_MODEL="$DEFAULT_CLAUDE_MODEL"
 CLAUDE_EFFORT="${DEFAULT_CODEX_EFFORT:-high}"
 CLAUDE_TIMEOUT="$DEFAULT_ASK_CLAUDE_TIMEOUT"
 USE_STDIN=false
+ENABLE_TOOLS=false
+if [[ "${HUMANIZE_CLAUDE_ENABLE_TOOLS:-}" == "true" ]] || [[ "${HUMANIZE_CLAUDE_ENABLE_TOOLS:-}" == "1" ]]; then
+    ENABLE_TOOLS=true
+fi
+# Read-only + Skill tool allowlist (no Bash/Edit/Write) — keeps side effects
+# out while letting Claude use skills and browse the repo. Override with
+# HUMANIZE_CLAUDE_ALLOWED_TOOLS if a different set is needed.
+DEFAULT_CLAUDE_ALLOWED_TOOLS="Read,Grep,Glob,Skill,WebFetch,WebSearch"
+CLAUDE_ALLOWED_TOOLS="${HUMANIZE_CLAUDE_ALLOWED_TOOLS:-$DEFAULT_CLAUDE_ALLOWED_TOOLS}"
 
 show_help() {
     cat << 'HELP_EOF'
@@ -56,11 +65,20 @@ OPTIONS:
                        Timeout for the Claude query in seconds (default: 3600)
   --stdin              Read the question from stdin instead of argv (avoids
                        the 128 KiB per-argv cap for large prompts)
+  --enable-tools       Enable read-only tools + Skill inside the Claude
+                       subsession (Read/Grep/Glob/Skill/WebFetch/WebSearch by
+                       default). Off by default so the response stays pure
+                       text for the critic's JSON contract. Also togglable via
+                       HUMANIZE_CLAUDE_ENABLE_TOOLS=1. Override the allowlist
+                       with HUMANIZE_CLAUDE_ALLOWED_TOOLS="Read,Grep,...".
   -h, --help           Show this help message
 
 NOTES:
   - Runs `claude -p --model <M> --effort <E>` non-interactively.
-  - Disables all tools so the response is pure text (critic returns JSON).
+  - Without --enable-tools all tools are disabled so the response is pure
+    text (the critic contract is JSON out, no side effects). With
+    --enable-tools, output may include tool-call chatter — the caller's
+    parser must tolerate that.
   - When invoked as root, --dangerously-skip-permissions is not passed
     because the Claude CLI refuses that combination.
 HELP_EOF
@@ -102,6 +120,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --stdin) USE_STDIN=true; shift ;;
+        --enable-tools) ENABLE_TOOLS=true; shift ;;
         -*) echo "Error: Unknown option: $1" >&2; echo "Use --help for usage information" >&2; exit 1 ;;
         *) QUESTION_PARTS+=("$1"); OPTIONS_DONE=true; shift ;;
     esac
@@ -174,10 +193,21 @@ $QUESTION
 - Tool: claude
 EOF
 
-# Build claude arguments. We disable tools (no bash/edit/etc.) so the response
-# is pure text — the critic contract is JSON out, no side effects.
+# Build claude arguments. Default: disable all tools so the response is pure
+# text — the critic contract is JSON out, no side effects. With --enable-tools
+# switch to an allowlist so Claude can use skills and read-only exploration.
 CLAUDE_ARGS=("-p" "--model" "$CLAUDE_MODEL" "--effort" "$CLAUDE_EFFORT")
-CLAUDE_ARGS+=("--disallowedTools" "*")
+if [[ "$ENABLE_TOOLS" == "true" ]]; then
+    # Validate allowlist chars (comma-separated tool names)
+    if [[ ! "$CLAUDE_ALLOWED_TOOLS" =~ ^[a-zA-Z0-9_,]+$ ]]; then
+        echo "Error: HUMANIZE_CLAUDE_ALLOWED_TOOLS contains invalid characters: $CLAUDE_ALLOWED_TOOLS" >&2
+        echo "  Only comma-separated tool names allowed (alphanumeric + underscore)" >&2
+        exit 1
+    fi
+    CLAUDE_ARGS+=("--allowedTools" "$CLAUDE_ALLOWED_TOOLS")
+else
+    CLAUDE_ARGS+=("--disallowedTools" "*")
+fi
 CLAUDE_ARGS+=("--add-dir" "$PROJECT_ROOT")
 # --dangerously-skip-permissions is rejected under root; only add it otherwise
 # and only when the caller opts in via HUMANIZE_CLAUDE_BYPASS_PERMISSIONS=1.
@@ -203,7 +233,7 @@ CLAUDE_STDERR_FILE="$CACHE_DIR/claude-run.log"
     echo "$QUESTION"
 } > "$CLAUDE_CMD_FILE"
 
-echo "ask-claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT timeout=${CLAUDE_TIMEOUT}s" >&2
+echo "ask-claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT timeout=${CLAUDE_TIMEOUT}s tools=$([[ "$ENABLE_TOOLS" == "true" ]] && echo "$CLAUDE_ALLOWED_TOOLS" || echo "disabled")" >&2
 echo "ask-claude: cache=$CACHE_DIR" >&2
 echo "ask-claude: running claude -p..." >&2
 

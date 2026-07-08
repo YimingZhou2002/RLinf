@@ -760,7 +760,7 @@ def _classify_failure(stderr_path: Path | str | None) -> FailureMode | None:
     The divisibility check runs BEFORE the generic worker-crash regex so
     a routing-layer assertion isn't swallowed as a plain worker crash —
     the LLM critic needs the specific classification to know the fix is
-    a placement / total_num_envs adjustment (wiki §04.2.6), not a memory
+    a placement / total_num_envs adjustment (wiki §2.6), not a memory
     or code bug.
     """
     if stderr_path is None:

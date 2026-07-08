@@ -387,7 +387,7 @@ _ROUTING_ASSERT_TRACEBACK = (
 def test_parse_trial_routing_assertion_classified_as_divisibility_violation(
     tmp_path: Path,
 ) -> None:
-    """The exact assertion from wiki §04.2.6 must classify as DIVISIBILITY_VIOLATION,
+    """The exact assertion from wiki §2.6 must classify as DIVISIBILITY_VIOLATION,
     NOT swallowed as WORKER_CRASH by the generic Traceback regex."""
     (tmp_path / "run_embodiment.log").write_text(
         "training started\n" + _ROUTING_ASSERT_TRACEBACK

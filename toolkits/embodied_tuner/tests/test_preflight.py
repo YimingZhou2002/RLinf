@@ -134,7 +134,7 @@ def test_per_rank_envs_not_divisible_by_pipeline_stage_num_rejected() -> None:
 
 
 def test_routing_env_to_rollout_divisibility_rejected() -> None:
-    """Reproduces the runtime crash from wiki §04.2.6.
+    """Reproduces the runtime crash from wiki §2.6.
 
     With ``env=0-1`` (env_world_size=2), ``rollout=2-7``
     (rollout_world_size=6), and baseline ``total_num_envs=128``, the
@@ -185,7 +185,7 @@ def test_routing_env_to_actor_divisibility_rejected() -> None:
 
 
 def test_routing_divisibility_passes_when_fixed() -> None:
-    """The suggested fix from wiki §04.2.6 (rollout=2-5, 4 GPUs) must pass."""
+    """The suggested fix from wiki §2.6 (rollout=2-5, 4 GPUs) must pass."""
     result = compose_and_validate(
         BASELINE,
         delta={

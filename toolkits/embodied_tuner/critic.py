@@ -70,11 +70,14 @@ _WIKI_DIR = Path(__file__).resolve().parent / "wiki"
 # Files pulled into the ``wiki_block`` section of the prompt, in this
 # order.
 _WIKI_CONTEXT_FILES: tuple[str, ...] = (
-    "00-bottleneck-rubric.md",
-    "01-placement-critical-paths.md",
-    "02-optimization-directions.md",
-    "03-timeline-signals.md",
-    "04-constraints.md",
+    "01-concepts.md",
+    "02-paths.md",
+    "03-inputs.md",
+    "04-signals.md",
+    "05-recipe.md",
+    "06-playbook.md",
+    "07-constraints.md",
+    "08-gotchas.md",
 )
 
 
@@ -411,7 +414,7 @@ def _render_constraints() -> str:
         "  (env.train.total_num_envs / env_world_size) % actor_world_size == 0 —\n"
         "  routing-layer assertion at rlinf/scheduler/worker/routing.py:139; if\n"
         "  violated, preflight synthesises a DIVISIBILITY_VIOLATION failure. See\n"
-        "  toolkits/embodied_tuner/wiki/04-constraints.md §04.2.6.\n"
+        "  toolkits/embodied_tuner/wiki/07-constraints.md §2.6.\n"
         "- cluster.component_placement components use contiguous GPU ranges; env and rollout are either equal or disjoint.\n"
     )
 
