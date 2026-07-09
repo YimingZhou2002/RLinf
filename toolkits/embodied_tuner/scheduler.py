@@ -266,6 +266,14 @@ class Scheduler:
 
         lesson_book = self._resolve_lesson_book()
         lessons: list[BitterLesson] = list(lesson_book.load())
+        # AC-9: bitter_lessons.jsonl is one of the four artefacts the
+        # plan guarantees on every campaign. LessonBook.add() is the
+        # only path that writes the sidecar, so a clean campaign with
+        # no critic-proposed lesson would otherwise finish without
+        # the file. Materialise an empty JSONL now to make the
+        # "no lessons yet" state observable and to keep resume-time
+        # reload consumers from tripping over a missing file.
+        lesson_book.ensure_file()
 
         # Bootstrap the DAG root (if a NodeStore is wired in) BEFORE any
         # stopping-rule checks so a resumed campaign always has a root

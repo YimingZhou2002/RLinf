@@ -179,6 +179,21 @@ class LessonBook:
         self._loaded = True
         return tuple(self._lessons)
 
+    def ensure_file(self) -> None:
+        """Create parent directory and an empty JSONL file if missing.
+
+        Called from scheduler startup so a clean campaign that emits no
+        critic-proposed lessons still leaves ``bitter_lessons.jsonl``
+        on disk. Downstream consumers (``AC-9`` artefact contract, any
+        resume-time reload) can then always ``open()`` the file — an
+        empty file is the valid "no lessons yet" representation, not
+        a missing file. Idempotent: if the file already exists it is
+        left untouched (no truncate, no touch-mtime).
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.write_bytes(b"")
+
     def all(self) -> tuple[BitterLesson, ...]:
         """Return the current in-memory lessons (loads on first call)."""
         if not self._loaded:

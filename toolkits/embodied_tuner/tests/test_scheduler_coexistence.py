@@ -261,3 +261,83 @@ def test_ledger_and_node_store_stay_in_sync_across_failed_trials(tmp_path: Path)
     assert len(ledger_entries) == len(dag_launched) == 3
     for entry, node in zip(ledger_entries, dag_launched):
         assert node.failure_mode == entry.failure_mode
+
+
+# ----- AC-9 artefact contract: every campaign emits the four artefacts -
+
+
+def test_clean_campaign_emits_bitter_lessons_file_even_without_lessons(
+    tmp_path: Path,
+) -> None:
+    """AC-9: bitter_lessons.jsonl MUST exist after every campaign.
+
+    Round-3 Codex review flagged: ``LessonBook.add()`` was the only
+    write path, so a clean campaign whose FakeCritic never proposed a
+    ``bitter_lesson`` finished with no ``bitter_lessons.jsonl`` on
+    disk. That violates the AC-9 artefact contract ("`bitter_lessons
+    .jsonl` continues to be emitted after every campaign") and would
+    trip any resume-time consumer that assumes the file exists.
+    ``LessonBook.ensure_file()``, invoked from scheduler startup,
+    materialises an empty JSONL — the "no lessons yet" state — so
+    the file is always observable.
+    """
+    factory, _ = _build_with_node_store(
+        tmp_path,
+        FakeCritic.from_deltas({}, {}),
+        objectives=[100.0, 90.0],
+        budget=BudgetConfig(max_trials=2, budget_seconds=999.0),
+    )
+    factory.scheduler.run()  # type: ignore[attr-defined]
+
+    # LessonBook path is derived from the ledger's parent dir by
+    # ``Scheduler._resolve_lesson_book`` — read it back from the
+    # scheduler rather than hard-coding a filename convention.
+    ledger_path = factory.scheduler.ledger.path  # type: ignore[attr-defined]
+    lessons_path = ledger_path.parent / "bitter_lessons.jsonl"
+    assert lessons_path.exists(), (
+        "AC-9: bitter_lessons.jsonl must exist after every campaign"
+    )
+    # A clean campaign leaves the file present but empty. Any
+    # future consumer (resume-time reload, packaging, log
+    # collection) can therefore ``open()`` it unconditionally.
+    assert lessons_path.read_bytes() == b""
+
+
+def test_clean_campaign_emits_all_scheduler_owned_artefacts(
+    tmp_path: Path,
+) -> None:
+    """AC-9: every scheduler-owned artefact is on disk after a clean campaign.
+
+    Covers the DAG-native subset of the AC-9 artefact contract that
+    the scheduler is responsible for (as opposed to the CLI-level
+    ``best_config.yaml`` / ``best_trial.json`` / plot, covered by
+    the legacy-ledger-compat test): ``<ledger>.jsonl``,
+    ``nodes.jsonl``, ``bitter_lessons.jsonl``. Both authoritative
+    stores are populated; the lesson file exists as an empty
+    JSONL when no lesson was proposed.
+    """
+    factory, node_store = _build_with_node_store(
+        tmp_path,
+        FakeCritic.from_deltas({}, {}),
+        objectives=[100.0, 90.0],
+        budget=BudgetConfig(max_trials=2, budget_seconds=999.0),
+    )
+    factory.scheduler.run()  # type: ignore[attr-defined]
+
+    ledger_path = factory.scheduler.ledger.path  # type: ignore[attr-defined]
+    nodes_path = tmp_path / "nodes.jsonl"
+    lessons_path = ledger_path.parent / "bitter_lessons.jsonl"
+    assert ledger_path.is_file()
+    assert nodes_path.is_file()
+    assert lessons_path.is_file()
+    # Structural checks: Ledger has both trials, NodeStore has root +
+    # both trials, LessonBook file is present (empty for this
+    # zero-lesson campaign).
+    fresh_ledger = Ledger(ledger_path, fsync_on_append=False)
+    fresh_store = NodeStore(nodes_path, fsync_on_append=False)
+    assert len(fresh_ledger.load().entries) == 2
+    node_result = fresh_store.load()
+    assert len(node_result.nodes) == 3  # root + 2 launched
+    assert node_result.skipped_lines == 0
+    # Empty lesson file — a fully-clean campaign proposed no lessons.
+    assert lessons_path.read_bytes() == b""
