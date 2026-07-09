@@ -1,0 +1,199 @@
+actor:
+  enable_offload: true
+  fsdp_config:
+    amp_autocast:
+      enabled: false
+      precision: bf16
+    backward_prefetch: null
+    cpu_offload: false
+    enable_gradient_accumulation: true
+    forward_prefetch: false
+    grad_scaler:
+      enabled: false
+    gradient_checkpointing: true
+    limit_all_gathers: false
+    mixed_precision:
+      buffer_dtype: ${actor.model.precision}
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+    offload_pin_memory: false
+    reshard_after_forward: true
+    sharding_strategy: full_shard
+    strategy: fsdp
+    use_liger_kernel: false
+    use_orig_params: false
+  global_batch_size: 640
+  group_name: ActorGroup
+  micro_batch_size: 64
+  model:
+    action_dim: 7
+    add_bias_linear: false
+    add_qkv_bias: true
+    add_value_head: true
+    attn_implementation: flash_attention_2
+    center_crop: true
+    hidden_size: 4096
+    image_size:
+    - 224
+    - 224
+    is_lora: true
+    lora_rank: 32
+    low_cpu_mem_usage: true
+    max_prompt_length: 30
+    model_path: /mnt/public2/zhouyiming/RLinf_autotest_pr/model/openvla-7b-rlvla-warmup/
+    model_type: openvla
+    num_action_chunks: 1
+    policy_setup: widowx_bridge
+    precision: bf16
+    trust_remote_code: true
+    unnorm_key: bridge_orig
+    use_proprio: false
+    vocab_size: 32000
+  optim:
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    clip_grad: 10.0
+    critic_warmup_steps: 0
+    lr: 0.0001
+    value_lr: 0.003
+    weight_decay: 0.01
+  seed: 1234
+  training_backend: fsdp
+algorithm:
+  adv_type: gae
+  bootstrap_type: always
+  clip_ratio_c: 3.0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  entropy_bonus: 0
+  entropy_type: action_level
+  gae_lambda: 0.95
+  gamma: 0.99
+  group_size: 1
+  huber_delta: 10.0
+  kl_beta: 0.0
+  kl_penalty: kl
+  logprob_type: action_level
+  loss_agg_func: token-mean
+  loss_type: actor_critic
+  normalize_advantages: true
+  reward_type: action_level
+  value_clip: 0.2
+cluster:
+  component_placement:
+    actor: 0-7
+    env: 0-3
+    rollout: 4-7
+  num_nodes: 1
+critic:
+  use_critic_model: false
+env:
+  eval:
+    auto_reset: true
+    enable_offload: true
+    env_type: maniskill
+    group_size: 1
+    ignore_terminations: true
+    init_params:
+      control_mode: None
+      id: PutOnPlateInScene25Main-v3
+      max_episode_steps: 80
+      num_envs: null
+      obj_set: train
+      obs_mode: rgb+segmentation
+      render_mode: all
+      sensor_configs:
+        shader_pack: default
+      sim_backend: gpu
+      sim_config:
+        control_freq: 5
+        sim_freq: 500
+    max_episode_steps: 80
+    max_steps_per_rollout_epoch: 80
+    policy_setup: widowx_bridge
+    rollout_epoch: 1
+    seed: 0
+    total_num_envs: 16
+    use_fixed_reset_state_ids: true
+    use_rel_reward: true
+    video_cfg:
+      info_on_video: true
+      save_video: true
+      video_base_dir: ${runner.logger.log_path}/video/eval
+  group_name: EnvGroup
+  train:
+    auto_reset: true
+    enable_offload: true
+    env_type: maniskill
+    group_size: 1
+    ignore_terminations: false
+    init_params:
+      control_mode: None
+      id: PutOnPlateInScene25Main-v3
+      max_episode_steps: ${..max_episode_steps}
+      num_envs: null
+      obj_set: train
+      obs_mode: rgb+segmentation
+      render_mode: all
+      sensor_configs:
+        shader_pack: default
+      sim_backend: gpu
+      sim_config:
+        control_freq: 5
+        sim_freq: 500
+      use_multiple_plates: false
+    max_episode_steps: 80
+    max_steps_per_rollout_epoch: 160
+    rollout_epoch: 1
+    seed: 0
+    total_num_envs: 128
+    use_fixed_reset_state_ids: false
+    use_rel_reward: true
+    video_cfg:
+      info_on_video: true
+      save_video: false
+      video_base_dir: ${runner.logger.log_path}/video/train
+reward:
+  use_reward_model: false
+rollout:
+  backend: huggingface
+  enable_offload: true
+  group_name: RolloutGroup
+  model:
+    model_path: /mnt/public2/zhouyiming/RLinf_autotest_pr/model/openvla-7b-rlvla-warmup/
+    precision: ${actor.model.precision}
+  pipeline_stage_num: 2
+  sampling_params:
+    do_sample: true
+    max_new_tokens: 7
+    repetition_penalty: 1.0
+    temperature_eval: 0.6
+    temperature_train: 1.0
+    top_k: 0
+    top_p: 1.0
+runner:
+  ckpt_path: null
+  logger:
+    experiment_name: maniskill_ppo_openvla
+    log_path: ../results
+    logger_backends:
+    - tensorboard
+    project_name: rlinf
+  max_epochs: 3
+  max_steps: -1
+  only_eval: false
+  resume_dir: null
+  save_interval: -1
+  task_type: embodied
+  val_check_interval: -1
+weight_syncer:
+  patch:
+    compression: none
+    delta_encoding: true
+    init_sync:
+      bucket_size: 134217728
+      enabled: true
+      prefixes: null
+    snapshot_device: cpu
+  type: patch

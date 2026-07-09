@@ -16,7 +16,7 @@
 
 The DAG rework must not break existing consumers that read
 ``tuner_ledger.jsonl`` from a pre-DAG campaign. This test locks that
-guarantee down with three assertions:
+guarantee down with four assertions:
 
 1. A frozen pre-DAG ``tuner_ledger.jsonl`` under
    ``tests/fixtures/legacy_ledger/`` loads through the current
@@ -26,19 +26,25 @@ guarantee down with three assertions:
    byte-identical to the frozen ``expected_best_trial.json`` fixture.
    Any drift in the emit code path (JSON keys, field order, indent,
    trailing newline handling) fails this test loudly.
-3. ``_emit_best_artefacts`` writes a ``best_config.yaml`` that
-   round-trips through ``OmegaConf`` and contains the ``actor.model``
-   node (structural check — a byte-identical baseline for the YAML
-   would break every time the baseline Hydra config legitimately
-   changes).
+3. ``_emit_best_artefacts`` writes a ``best_config.yaml`` that is
+   byte-identical to the frozen ``expected_best_config.yaml``
+   fixture (captured from the current pre-DAG-compatible emit
+   output for the same legacy fixture ledger + baseline). Task18
+   requires JSON AND YAML byte identity; a structural round-trip
+   check would silently allow the exact drift task18 is meant to
+   catch.
 4. ``_emit_ledger_plot`` produces a PNG whose first four bytes are
    the canonical PNG magic ``89 50 4E 47``. File existence alone
    (Round-0's existing check) does not prove the artifact is a valid
    image.
 
-If the frozen fixture ever needs a legitimate schema bump, regenerate
-``expected_best_trial.json`` and this file's fixture ledger together
-in the SAME commit so the drift is visible in review.
+**Fixture regeneration discipline.** If the baseline Hydra config
+(``examples/embodiment/config/maniskill_ppo_openvla.yaml``) or the
+``_emit_best_artefacts`` implementation legitimately changes, both
+``expected_best_trial.json`` AND ``expected_best_config.yaml`` must
+be regenerated in the SAME commit — either matches the fixture, or
+neither does. A drift where one baseline lags the other silently
+weakens both tests.
 """
 
 from __future__ import annotations
@@ -69,6 +75,7 @@ _BASELINE = (
 _FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "legacy_ledger"
 _LEGACY_LEDGER = _FIXTURE_DIR / "tuner_ledger.jsonl"
 _EXPECTED_BEST_TRIAL = _FIXTURE_DIR / "expected_best_trial.json"
+_EXPECTED_BEST_CONFIG = _FIXTURE_DIR / "expected_best_config.yaml"
 
 # PNG magic bytes per the spec (RFC 2083 §12.11 preamble):
 # 0x89 P N G 0x0D 0x0A 0x1A 0x0A. Checking the first 4 bytes is
@@ -153,12 +160,26 @@ def test_emit_best_trial_json_is_byte_identical_to_fixture(
     )
 
 
-# ----- 3. best_config.yaml is structurally valid + contains actor block --
+# ----- 3. best_config.yaml is byte-identical to the frozen fixture -----
 
 
-def test_emit_best_config_yaml_round_trips_and_contains_actor(
+def test_emit_best_config_yaml_is_byte_identical_to_fixture(
     tmp_path: Path,
 ) -> None:
+    """AC-2 / AC-9 / task18: emitted YAML must exactly match the captured baseline.
+
+    Codex Round-2 review rejected the earlier structural-only
+    round-trip check as an unjustified deferral: the plan text
+    explicitly requires byte-identical JSON AND YAML artefacts, not
+    "valid YAML with the actor key". A byte comparison catches every
+    silent drift — key reordering, whitespace, quoting style,
+    trailing-newline changes — that a structural check would miss.
+
+    If either the fixture ledger, the baseline Hydra config, or the
+    ``_emit_best_artefacts`` implementation legitimately changes,
+    regenerate BOTH ``expected_best_config.yaml`` and
+    ``expected_best_trial.json`` in the same commit.
+    """
     _copy_fixture_ledger_to(tmp_path)
     ledger = Ledger(tmp_path / "tuner_ledger.jsonl", fsync_on_append=False)
     best = ledger.best()
@@ -176,18 +197,20 @@ def test_emit_best_config_yaml_round_trips_and_contains_actor(
 
     yaml_path = tmp_path / "best_config.yaml"
     assert yaml_path.is_file()
-    assert yaml_path.stat().st_size > 0
-    # Round-trip through PyYAML to prove the emit is valid YAML. We
-    # deliberately do NOT byte-compare the YAML because it is composed
-    # from a live Hydra config that legitimately evolves; the fixture
-    # would rot within days. The structural check catches the failure
-    # mode Codex asked for: emit produces a non-YAML or empty file.
-    parsed = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    assert isinstance(parsed, dict)
-    # Sanity: the actor knob the best entry overrode is present in the
-    # emitted config. Without this, a regression that silently emits an
-    # empty dict would still pass.
-    assert "actor" in parsed
+    written = yaml_path.read_bytes()
+    expected = _EXPECTED_BEST_CONFIG.read_bytes()
+    assert written == expected, (
+        "best_config.yaml drift vs frozen fixture. Regenerate "
+        f"{_EXPECTED_BEST_CONFIG} in the same commit as any baseline "
+        "or emit-code change."
+    )
+    # Defence in depth: parse the emitted YAML and confirm it still
+    # exposes the actor block. If the baseline is ever regenerated
+    # into an empty or actor-less structure, byte-identity would
+    # silently accept it — this parses the same bytes to add a second
+    # gate on the semantic content.
+    parsed = yaml.safe_load(written)
+    assert isinstance(parsed, dict) and "actor" in parsed
 
 
 # ----- 4. plot output starts with PNG magic bytes ----------------------
