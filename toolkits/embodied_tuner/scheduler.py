@@ -150,6 +150,33 @@ class PreflightOutcome:
     delta: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class _ResumedState:
+    """Flat scheduler state rebuilt from persisted DAG + Ledger.
+
+    Populated by :meth:`Scheduler._reconstruct_state_from_stores` and
+    unpacked by :meth:`Scheduler.run` when the process is restarting
+    against a non-empty ``NodeStore``. Every field maps 1:1 to a local
+    in ``run`` that would otherwise be reset to a fresh-campaign
+    default at process start (see AC-3).
+    """
+
+    active_leaf_id: str
+    cumulative_delta: dict[str, Any]
+    current_knobs: dict[str, Any]
+    trial_idx: int
+    oom_count: int
+    sibling_failures_at_active_parent: int
+    history: list[TrialHistoryEntry]
+    last_failure_mode: str | None
+    last_metric_summary: Mapping[str, float] | None
+    last_timeline_summary: Mapping[str, Any] | None
+    last_num_trajectories: int | None
+    last_failed_trial_idx: int | None
+    last_failed_delta: dict[str, Any] | None
+    duplicate_counter: int
+
+
 @dataclass
 class Scheduler:
     """Orchestrates the tuning trial loop.
@@ -245,12 +272,46 @@ class Scheduler:
         # regardless of ``max_trials``. Returns ``None`` when the store
         # is not configured (backward-compat mode).
         active_leaf_id: str | None = self._bootstrap_root_if_needed(start)
+        # Restart-safe reconstruction: when the persisted NodeStore
+        # carries content beyond the root (a resumed campaign), rebuild
+        # every mutable local that would otherwise reset to fresh-
+        # campaign defaults on process start (see AC-3). Fresh runs
+        # (empty store or root-only + empty ledger) return ``None`` and
+        # keep the fresh-campaign defaults unchanged.
+        if active_leaf_id is not None:
+            resumed = self._reconstruct_state_from_stores(root_id=active_leaf_id)
+            if resumed is not None:
+                active_leaf_id = resumed.active_leaf_id
+                cumulative_delta = resumed.cumulative_delta
+                current_knobs = resumed.current_knobs
+                trial_idx = resumed.trial_idx
+                oom_count = resumed.oom_count
+                sibling_failures_at_active_parent = (
+                    resumed.sibling_failures_at_active_parent
+                )
+                history = resumed.history
+                last_failure_mode = resumed.last_failure_mode
+                last_metric_summary = resumed.last_metric_summary
+                last_timeline_summary = resumed.last_timeline_summary
+                last_num_trajectories = resumed.last_num_trajectories
+                last_failed_trial_idx = resumed.last_failed_trial_idx
+                last_failed_delta = resumed.last_failed_delta
         # Load / rebuild the persistent dedup sidecar (if wired). The
         # NodeStore is the authoritative source; the sidecar rebuild
         # step ensures a lost or corrupt sidecar file is not fatal.
         # Also seeds the counter used to synthesise unique node ids
         # for duplicate-of short-circuits.
         duplicate_counter = 0
+        if active_leaf_id is not None and self.node_store is not None:
+            # Seed the counter from the resumed state so newly-synthesised
+            # DUPLICATE_OF ids never collide with previously-persisted ones.
+            # Recompute here (rather than threading through the else branch
+            # above) so a run without a resume also lands on 0.
+            duplicate_counter = sum(
+                1
+                for n in self.node_store.all_nodes()
+                if n.failure_mode == FailureMode.DUPLICATE_OF.value
+            )
         if self.dedup_index is not None:
             self.dedup_index.load_or_rebuild(self.node_store)
 
@@ -373,7 +434,24 @@ class Scheduler:
                         duplicate_seq=duplicate_counter,
                     )
                     if new_dup_id is not None:
+                        # AC-6: dup-of-OK is an OK-equivalent advance —
+                        # sync the FLAT scheduler state (active leaf +
+                        # cumulative delta + current knobs) to the
+                        # synthetic node so the next preflight builds
+                        # from the same cumulative view the DAG says
+                        # is now active. Without this the DAG advances
+                        # to the duplicate while the next round's
+                        # preflight silently runs against the previous
+                        # flat state (split-brain).
                         active_leaf_id = new_dup_id
+                        cumulative_delta = dict(effective_delta)
+                        current_knobs = self._apply_delta(
+                            dict(self.baseline_knobs), cumulative_delta
+                        )
+                        # Successful advance clears the parent's
+                        # sibling-failure counter, mirroring the OK-trial
+                        # branch below.
+                        sibling_failures_at_active_parent = 0
                     # Do not advance trial_idx; do not touch oom_count.
                     # Loop back and let the critic propose again from
                     # the updated (post-dedup-visible) active leaf.
@@ -932,10 +1010,10 @@ class Scheduler:
 
         - ``self.node_store is None``: DAG coexistence is disabled.
           Return ``None`` and skip every subsequent mirror step.
-        - Store already has a root (resumed campaign): derive the
-          active leaf id by scanning the persisted stream. Rollback
-          rules replay via :meth:`NodeStore.active_leaf`; falls back to
-          the root when no non-root node has been persisted yet.
+        - Store already has a root (resumed campaign): return the root
+          id. The rollback-aware active-leaf derivation is deferred to
+          :meth:`_reconstruct_state_from_stores`, which the caller
+          invokes when the persisted DAG has non-root content.
         - Store is empty (fresh campaign): run preflight with an empty
           delta to compute the baseline ``resolved_config_sha``, append
           a root :class:`DAGNode`, and return its id.
@@ -944,17 +1022,10 @@ class Scheduler:
             return None
         existing_root = self.node_store.root()
         if existing_root is not None:
-            # Defensive resume path: the Scheduler doesn't yet support
-            # resuming a partial campaign (that is dedicated Milestone-3
-            # / task9 work), but a stale nodes.jsonl in the ledger
-            # directory shouldn't crash startup. Use the newest
-            # appended node as the starting active leaf under
-            # linear-chain semantics (which is what Milestone-1's
-            # coexistence writer produces). Task9 will replace this
-            # with the rollback-aware ``active_leaf()`` derivation.
-            all_nodes = self.node_store.all_nodes()
-            if len(all_nodes) > 1:
-                return all_nodes[-1].node_id
+            # Return the root id unconditionally. If the store carries
+            # non-root nodes (a resumed campaign), the caller replaces
+            # this with the rollback-aware active leaf via
+            # :meth:`_reconstruct_state_from_stores`.
             return existing_root.node_id
         # Fresh campaign: compute baseline SHA via preflight so root's
         # resolved_config_sha matches the same hash the runner would
@@ -997,6 +1068,155 @@ class Scheduler:
         if self.dedup_index is not None:
             self.dedup_index.load_or_rebuild(self.node_store)
         return root_id
+
+    def _reconstruct_state_from_stores(
+        self, *, root_id: str
+    ) -> "_ResumedState | None":
+        """Rebuild the flat scheduler state from persisted DAG + Ledger.
+
+        Called from :meth:`run` after :meth:`_bootstrap_root_if_needed`
+        when the persisted ``NodeStore`` carries content beyond the
+        root. Restores every mutable variable that ``run`` would
+        otherwise reset to fresh-campaign defaults on process start:
+        ``active_leaf_id``, ``cumulative_delta``, ``current_knobs``,
+        ``trial_idx``, ``oom_count``, the sibling-failure counter, the
+        rolling ``history`` window, and the ``last_*`` failure /
+        metric / delta attribution slots.
+
+        The active leaf is derived by replaying the AC-5 rollback rules
+        via :meth:`NodeStore.active_state`. When the replay walks above
+        the root (``rollback_exhausted`` waiting to fire), the resumed
+        state anchors at the root; the next launched failure will
+        surface the stop reason on the normal path.
+
+        Returns ``None`` when there is nothing to reconstruct (store
+        has only the root and the ledger is empty), letting the caller
+        keep fresh-campaign defaults untouched.
+        """
+        if self.node_store is None:
+            return None
+        all_nodes = self.node_store.all_nodes()
+        ledger_result = self.ledger.load()
+        # Ledger and NodeStore together define "has this campaign done
+        # any work?". If both are empty apart from the root, resume is
+        # a no-op and the caller keeps fresh-campaign defaults.
+        if len(all_nodes) <= 1 and not ledger_result.entries:
+            return None
+
+        active_id, sibling_failures = self.node_store.active_state(
+            self.budget.max_siblings
+        )
+        # Climb walked above the root during replay. The next launched
+        # failure will fire ``rollback_exhausted`` on the normal path,
+        # so anchor state at the root and let the loop drive it.
+        if active_id is None:
+            active_id = root_id
+            sibling_failures = 0
+        active_node = self.node_store.get(active_id)
+        if active_node is None:
+            # Defensive: active-state replay pointed at something the
+            # store doesn't have (corrupted line skipped between the
+            # replay and this lookup). Fall back to the root and log.
+            _log.warning(
+                "resume: active id %r not found in NodeStore; anchoring"
+                " at root %r",
+                active_id,
+                root_id,
+            )
+            active_id = root_id
+            sibling_failures = 0
+            active_node = self.node_store.get(root_id)
+            if active_node is None:
+                return None
+
+        cumulative_delta = dict(active_node.cumulative_delta)
+        current_knobs = self._apply_delta(
+            dict(self.baseline_knobs), cumulative_delta
+        )
+
+        # Only launched trials (non-negative ``trial_idx``) count toward
+        # ``trial_idx`` / ``oom_count``. Root has ``trial_idx=None`` and
+        # DUPLICATE_OF nodes use negative sentinels.
+        launched_nodes = [
+            n
+            for n in all_nodes
+            if n.trial_idx is not None and n.trial_idx >= 0
+        ]
+        if launched_nodes:
+            trial_idx = max(n.trial_idx for n in launched_nodes) + 1
+        else:
+            trial_idx = 0
+        oom_count = sum(
+            1
+            for n in launched_nodes
+            if n.failure_mode == FailureMode.OOM.value
+        )
+
+        # Reconstruct the rolling history window from the flat Ledger.
+        # Ledger contains every launched trial and only launched trials
+        # (DUPLICATE_OF nodes and the root are NodeStore-only), which
+        # matches how ``history`` is populated in the live loop.
+        history: list[TrialHistoryEntry] = []
+        for entry in ledger_result.entries[-self.budget.history_window :]:
+            rationale_dict = entry.critic_rationale or {}
+            rationale = Rationale(
+                summary=str(rationale_dict.get("summary", "")),
+                metric_table_citations=tuple(
+                    rationale_dict.get("metric_table_citations", ()) or ()
+                ),
+                timeline_citations=tuple(
+                    rationale_dict.get("timeline_citations", ()) or ()
+                ),
+            )
+            history.append(
+                self._history_entry(
+                    entry, rationale, entry.proposed_delta or {}
+                )
+            )
+
+        # Attribution fields: mirror how the live loop sets them at the
+        # end of the trial iteration, using the most recent Ledger entry
+        # (which is always a launched trial).
+        last_failure_mode: str | None = None
+        last_metric_summary: Mapping[str, float] | None = None
+        last_timeline_summary: Mapping[str, Any] | None = None
+        last_num_trajectories: int | None = None
+        last_failed_trial_idx: int | None = None
+        last_failed_delta: dict[str, Any] | None = None
+        if ledger_result.entries:
+            latest = ledger_result.entries[-1]
+            last_failure_mode = latest.failure_mode
+            last_metric_summary = latest.per_component_timings
+            last_timeline_summary = latest.timeline_summary
+            last_num_trajectories = latest.num_trajectories
+            if latest.failure_mode != FailureMode.NONE.value:
+                last_failed_trial_idx = latest.trial_idx
+                last_failed_delta = dict(latest.proposed_delta or {})
+
+        # Seed the ``duplicate_counter`` so newly-synthesised DUPLICATE_OF
+        # node ids do not collide with previously-persisted duplicates.
+        duplicate_counter = sum(
+            1
+            for n in all_nodes
+            if n.failure_mode == FailureMode.DUPLICATE_OF.value
+        )
+
+        return _ResumedState(
+            active_leaf_id=active_id,
+            cumulative_delta=cumulative_delta,
+            current_knobs=current_knobs,
+            trial_idx=trial_idx,
+            oom_count=oom_count,
+            sibling_failures_at_active_parent=sibling_failures,
+            history=history,
+            last_failure_mode=last_failure_mode,
+            last_metric_summary=last_metric_summary,
+            last_timeline_summary=last_timeline_summary,
+            last_num_trajectories=last_num_trajectories,
+            last_failed_trial_idx=last_failed_trial_idx,
+            last_failed_delta=last_failed_delta,
+            duplicate_counter=duplicate_counter,
+        )
 
     def _mirror_to_node_store(
         self,

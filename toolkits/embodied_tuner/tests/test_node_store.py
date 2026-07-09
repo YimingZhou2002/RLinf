@@ -262,6 +262,64 @@ def test_load_rejects_cyclic_line(tmp_path: Path) -> None:
     assert result.nodes == ()
 
 
+def test_load_rejects_duplicate_node_id(tmp_path: Path) -> None:
+    # A duplicate id can appear only through hand-editing or a partial
+    # crash-recovery. The load-path treats the second row as corrupt so
+    # ``_by_id[<dup>]`` keeps the FIRST row's authoritative payload.
+    path = tmp_path / "nodes.jsonl"
+    root = _make_root()
+    child_a = _make_child("n1", "root", trial_idx=0, objective=1.0)
+    dup = _make_child("n1", "root", trial_idx=1, objective=99.0, log_dir="logs/dup")
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(root.to_dict(), sort_keys=True) + "\n")
+        fh.write(json.dumps(child_a.to_dict(), sort_keys=True) + "\n")
+        fh.write(json.dumps(dup.to_dict(), sort_keys=True) + "\n")
+
+    reloaded = NodeStore(path, fsync_on_append=False)
+    result = reloaded.load()
+    assert result.skipped_lines == 1
+    assert [n.node_id for n in result.nodes] == ["root", "n1"]
+    # The FIRST-written payload wins — the duplicate did not overwrite
+    # ``_by_id`` under the hood.
+    kept = reloaded.get("n1")
+    assert kept is not None
+    assert kept.objective == 1.0
+    assert kept.log_dir == "logs/trial-0"
+
+
+def test_load_rejects_persisted_running_status(tmp_path: Path) -> None:
+    # A persisted non-terminal status (RUNNING / IN_PROGRESS / "") can
+    # only arise via a partial write or hand-edit. The load-path treats
+    # it as corruption so the authoritative index is not poisoned.
+    path = tmp_path / "nodes.jsonl"
+    root = _make_root()
+    bad = _make_child("n1", "root", status="RUNNING", failure_mode="NONE")
+    tail = _make_child("n2", "root", trial_idx=1)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(root.to_dict(), sort_keys=True) + "\n")
+        fh.write(json.dumps(bad.to_dict(), sort_keys=True) + "\n")
+        fh.write(json.dumps(tail.to_dict(), sort_keys=True) + "\n")
+
+    result = NodeStore(path, fsync_on_append=False).load()
+    assert result.skipped_lines == 1
+    assert [n.node_id for n in result.nodes] == ["root", "n2"]
+
+
+def test_load_rejects_persisted_empty_status(tmp_path: Path) -> None:
+    # An empty status string is also non-terminal per _NON_TERMINAL_STATUSES.
+    path = tmp_path / "nodes.jsonl"
+    root = _make_root()
+    bad_raw = _make_child("n1", "root").to_dict()
+    bad_raw["status"] = ""
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(root.to_dict(), sort_keys=True) + "\n")
+        fh.write(json.dumps(bad_raw, sort_keys=True) + "\n")
+
+    result = NodeStore(path, fsync_on_append=False).load()
+    assert result.skipped_lines == 1
+    assert [n.node_id for n in result.nodes] == ["root"]
+
+
 # ----- Ancestor walk + children lookup --------------------------------
 
 

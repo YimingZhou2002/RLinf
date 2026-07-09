@@ -413,3 +413,163 @@ def test_scheduler_without_dedup_index_behaves_unchanged(tmp_path: Path) -> None
     scheduler.run()
     # Both trials launched (no dedup short-circuit).
     assert len(factory.runner_calls) == 2
+
+
+# ----- Duplicate-OK synchronises flat scheduler state ------------------
+
+
+def test_duplicate_of_ok_syncs_cumulative_delta_into_next_preflight(
+    tmp_path: Path,
+) -> None:
+    """After dup-OK, the NEXT proposal's preflight must see the dup's cumulative_delta.
+
+    Round-0 code advanced ``active_leaf_id`` to the synthetic node but
+    did NOT update ``cumulative_delta`` / ``current_knobs``, producing
+    split-brain state: the DAG said expansion is from the duplicate
+    (whose cumulative includes the freshly-merged delta), but the
+    scheduler's flat state still held the pre-dup cumulative. The next
+    preflight then ran against the wrong cumulative view.
+
+    Reproduction:
+      - Trial 0 real OK, effective ``{a: 1, b: 2}`` -> SHA-X. Active=t0.
+      - Trial 1 real OK, effective ``{a: 1, b: 2, c: 3}`` -> SHA-Y. Active=t1.
+      - Trial 2 real FAIL, effective ``{a: 1, b: 2, c: 0}`` -> SHA-Z.
+        Rollback to t0 -> cumulative rewinds to ``{a: 1, b: 2}``.
+      - Trial 3 proposal ``{c: 3}`` on active=t0 -> effective
+        ``{a: 1, b: 2, c: 3}`` -> SHA-Y -> DUPLICATE-OF-OK short-circuit.
+        Active moves to the dup node whose ``cumulative_delta`` is
+        ``{a: 1, b: 2, c: 3}``.
+      - Trial 4 proposal ``{d: 4}``. Post-B-2 the preflight sees
+        effective delta ``{a: 1, b: 2, c: 3, d: 4}``. Pre-B-2 it would
+        have seen ``{a: 1, b: 2, d: 4}`` (missing ``c: 3``).
+    """
+    node_store = NodeStore(tmp_path / "nodes.jsonl", fsync_on_append=False)
+    dedup = ConfigDedupIndex(tmp_path / "cdi.jsonl", fsync_on_append=False)
+    factory = _DedupFactory(
+        tmp_path=tmp_path,
+        # SHA sequence (indexed by preflight call order):
+        #   0 = bootstrap preflight ({})
+        #   1 = trial 0 preflight ({a:1, b:2})              -> SHA-X
+        #   2 = trial 1 preflight ({a:1, b:2, c:3})         -> SHA-Y
+        #   3 = trial 2 preflight ({a:1, b:2, c:0})         -> SHA-Z
+        #   4 = trial 3 preflight ({a:1, b:2, c:3})         -> SHA-Y (dup!)
+        #   5 = trial 4 preflight ({a:1, b:2, c:3, d:4})    -> SHA-W
+        shas=[
+            "sha-baseline",
+            "sha-X",
+            "sha-Y",
+            "sha-Z",
+            "sha-Y",
+            "sha-W",
+        ],
+        objectives=[1.0, 0.5, None, 0.25],
+        failure_modes=[
+            FailureMode.NONE,
+            FailureMode.NONE,
+            FailureMode.OOM,
+            FailureMode.NONE,
+        ],
+        statuses=[Status.OK, Status.OK, Status.FAILED, Status.OK],
+    )
+    scheduler = factory.build(
+        FakeCritic.from_deltas(
+            {"a": 1, "b": 2},          # trial 0
+            {"c": 3},                  # trial 1 (advances on top of t0)
+            {"c": 0},                  # trial 2 (fails, rollback to t0)
+            {"c": 3},                  # trial 3 (duplicate of trial 1!)
+            {"d": 4},                  # trial 4 (post-dup, must see c: 3 in effective delta)
+        ),
+        budget=BudgetConfig(
+            max_trials=4, budget_seconds=999.0, max_oom=99, max_siblings=99
+        ),
+        node_store=node_store,
+        dedup_index=dedup,
+    )
+    scheduler.run()
+
+    # Preflight calls: bootstrap + trial0 + trial1 + trial2 + dup + trial4.
+    # Total = 6 preflight invocations; the last is trial 4's.
+    assert len(factory.preflight_calls) == 6, factory.preflight_calls
+    trial4_preflight_delta = factory.preflight_calls[-1]
+    # The B-2 contract: trial 4 preflight must include c: 3 (from the
+    # duplicate node's cumulative state), NOT the pre-dup rolled-back
+    # {a: 1, b: 2} + {d: 4}.
+    assert trial4_preflight_delta == {"a": 1, "b": 2, "c": 3, "d": 4}, (
+        "trial 4's preflight delta should reflect the DUPLICATE node's "
+        "cumulative_delta after the dup-OK short-circuit, not the "
+        "pre-dup rolled-back cumulative"
+    )
+    # And the runner for trial 4 must have received the same view.
+    assert factory.runner_calls[-1] == (
+        3,  # trial_idx of the fourth REAL launched trial (t0/t1/t2 real + t4 real)
+        {"a": 1, "b": 2, "c": 3, "d": 4},
+    )
+
+
+def test_duplicate_of_ok_resets_sibling_counter_at_parent(
+    tmp_path: Path,
+) -> None:
+    """Dup-OK counts as an OK-equivalent advance and resets sibling failures at the parent.
+
+    Reproduction:
+      - Trial 0 real OK (advances active from root to t0).
+      - Trial 1 real FAIL (OOM), rollback to root, sibling_failures at
+        root = 1.
+      - Trial 2 real FAIL (OOM), rollback to root, sibling_failures at
+        root = 2. (max_siblings=3 -> one more would climb above root.)
+      - Trial 3 proposal duplicates trial 0's SHA -> DUPLICATE-OF-OK
+        short-circuits and (post-B-2) MUST reset sibling_failures.
+      - Trial 4 real FAIL (OOM) — post-B-2, sibling_failures starts at
+        0 again, so this failure produces counter=1 (not 3 -> climb).
+        Absent the reset, this failure would trip the sibling cap and
+        terminate the campaign with ``rollback_exhausted``.
+    """
+    node_store = NodeStore(tmp_path / "nodes.jsonl", fsync_on_append=False)
+    dedup = ConfigDedupIndex(tmp_path / "cdi.jsonl", fsync_on_append=False)
+    factory = _DedupFactory(
+        tmp_path=tmp_path,
+        # Preflight order: bootstrap, t0, t1, t2, dup (matches t0's SHA), t4
+        shas=[
+            "sha-baseline",
+            "sha-A",  # trial 0
+            "sha-B",  # trial 1 (fails)
+            "sha-C",  # trial 2 (fails)
+            "sha-A",  # trial 3 (duplicate of trial 0)
+            "sha-D",  # trial 4 (fails but MUST NOT trigger rollback_exhausted)
+        ],
+        objectives=[1.0, None, None, None],
+        failure_modes=[
+            FailureMode.NONE,
+            FailureMode.OOM,
+            FailureMode.OOM,
+            FailureMode.OOM,
+        ],
+        statuses=[
+            Status.OK,
+            Status.FAILED,
+            Status.FAILED,
+            Status.FAILED,
+        ],
+    )
+    scheduler = factory.build(
+        FakeCritic.from_deltas(
+            {"a": 1},        # trial 0
+            {"b": 2},        # trial 1
+            {"c": 3},        # trial 2
+            {"a": 1},        # trial 3 (dup)
+            {"e": 5},        # trial 4
+        ),
+        budget=BudgetConfig(
+            max_trials=4, budget_seconds=999.0, max_oom=99, max_siblings=3
+        ),
+        node_store=node_store,
+        dedup_index=dedup,
+    )
+    result = scheduler.run()
+
+    # Post-B-2: dup-OK resets the sibling counter, so trial 4's failure
+    # does not trip max_siblings. Campaign ends on max_trials, not on
+    # rollback_exhausted.
+    assert result.stop_reason == "max_trials_reached", result.stop_reason
+    # Sanity: 4 real launched trials.
+    assert len(factory.runner_calls) == 4

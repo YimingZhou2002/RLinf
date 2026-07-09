@@ -38,11 +38,15 @@ and any historical ``tuner_ledger.jsonl`` from before the DAG landed.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+_log = logging.getLogger(__name__)
 
 
 # Failure modes that trigger active-leaf rollback to the failing node's
@@ -302,24 +306,39 @@ class NodeStore:
         skipped = 0
         if self.path.is_file():
             with self.path.open("r", encoding="utf-8") as fh:
-                for line in fh:
+                for line_no, line in enumerate(fh, start=1):
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         raw = json.loads(line)
                         node = DAGNode.from_dict(raw)
-                    except (json.JSONDecodeError, NodeStoreSchemaError, TypeError):
+                    except (json.JSONDecodeError, NodeStoreSchemaError, TypeError) as exc:
                         skipped += 1
+                        _log.warning(
+                            "NodeStore load: skipping corrupt line %d of %s (%s)",
+                            line_no,
+                            self.path,
+                            exc,
+                        )
                         continue
                     # Enforce integrity on load too — a JSONL row whose
                     # ``parent_id`` does not resolve, or which cycles,
-                    # is treated as corruption and skipped rather than
-                    # poisoning the index.
+                    # or which is a duplicate ``node_id`` or persisted
+                    # ``RUNNING`` line, is treated as corruption and
+                    # skipped rather than poisoning the index.
                     try:
                         self._validate_integrity(node, on_load=True)
-                    except NodeStoreIntegrityError:
+                    except NodeStoreIntegrityError as exc:
                         skipped += 1
+                        _log.warning(
+                            "NodeStore load: skipping corrupt line %d of %s "
+                            "(node_id=%r, %s)",
+                            line_no,
+                            self.path,
+                            node.node_id,
+                            exc,
+                        )
                         continue
                     self._index(node)
                     nodes.append(node)
@@ -413,9 +432,26 @@ class NodeStore:
     def active_leaf(self, max_siblings: int) -> str | None:
         """Reconstruct the active-leaf id by replaying rollback rules from disk.
 
-        Deterministic derivation: walk every node in insertion order
-        (starting from the root) and simulate the state machine described
-        in AC-5:
+        Convenience wrapper around :meth:`active_state` that returns only
+        the active-leaf id. See :meth:`active_state` for the full replay
+        semantics and the shared implementation.
+
+        Args:
+            max_siblings: Sibling cap consulted for the climb rule
+                (matches :attr:`BudgetConfig.max_siblings`).
+
+        Returns:
+            The ``node_id`` of the active leaf, or ``None`` when the
+            store is empty or the climb has walked above the root.
+        """
+        active, _sibling_failures = self.active_state(max_siblings)
+        return active
+
+    def active_state(self, max_siblings: int) -> tuple[str | None, int]:
+        """Replay AC-5 rollback rules and return ``(active_id, sibling_failures)``.
+
+        Walks every node in insertion order (starting from the root) and
+        simulates the state machine described in AC-5:
 
         - Start at the root.
         - For each subsequent node ``n``:
@@ -426,20 +462,26 @@ class NodeStore:
             ``max_siblings`` climb one level further (with the counter
             reset for the new active).
           - Otherwise (``n`` is OK, ROOT, or DUPLICATE_OF), advance the
-            active leaf to ``n``.
+            active leaf to ``n`` and reset the sibling counter.
 
         Duplicate-of-OK nodes are treated as advances because they
         carry the original OK trial's objective. Climb-above-root
-        situations return :data:`None` — callers interpret that as
+        situations return ``(None, 0)`` — callers interpret that as
         ``rollback_exhausted``.
+
+        This is the single source of truth used both by
+        :meth:`active_leaf` and by ``Scheduler._reconstruct_state_from_stores``:
+        the scheduler needs the sibling counter to preserve
+        rollback-cap semantics across restart, not just the active id.
 
         Args:
             max_siblings: Sibling cap consulted for the climb rule
                 (matches :attr:`BudgetConfig.max_siblings`).
 
         Returns:
-            The ``node_id`` of the active leaf, or ``None`` when the
-            store is empty or the climb has walked above the root.
+            ``(active_id, sibling_failures)``. ``active_id`` is ``None``
+            when the store is empty or a climb walked above the root;
+            in that case ``sibling_failures`` is ``0`` (moot).
         """
         if max_siblings < 1:
             raise ValueError(
@@ -449,7 +491,7 @@ class NodeStore:
             self.load()
         root = self.root()
         if root is None:
-            return None
+            return None, 0
         active: str | None = root.node_id
         # Sibling failure counter is keyed by the CURRENT active id and
         # reset whenever the active leaf changes.
@@ -477,24 +519,39 @@ class NodeStore:
                 # OK / DUPLICATE_OF / any non-rollback: advance.
                 active = node.node_id
                 sibling_failures = 0
-        return active
+        if active is None:
+            # Climb walked above the root during replay. The counter is
+            # meaningless in this state; callers should treat this as
+            # rollback_exhausted on the next failure.
+            return None, 0
+        return active, sibling_failures
 
     # ----- Internals -----------------------------------------------------
 
     def _validate_integrity(self, node: DAGNode, *, on_load: bool = False) -> None:
-        """Check every store-level invariant that must hold for ``node``."""
-        if not on_load:
-            if node.status in _NON_TERMINAL_STATUSES:
-                raise NodeStoreIntegrityError(
-                    "cannot append node with non-terminal status "
-                    f"{node.status!r}; append only after final "
-                    "(status, failure_mode) is known"
-                )
-            if node.node_id in self._by_id:
-                raise NodeStoreIntegrityError(
-                    f"duplicate node_id {node.node_id!r}: no in-place "
-                    "update; nodes are appended exactly once"
-                )
+        """Check every store-level invariant that must hold for ``node``.
+
+        Runs symmetrically on append and on load. The ``on_load`` flag is
+        preserved as a hook for future load-only relaxations, but every
+        invariant enforced on append (non-terminal status, duplicate id,
+        parent-must-exist, no-cycle, single-root) is also enforced on
+        load. A persisted ``RUNNING`` line or duplicate ``node_id`` on
+        disk is therefore treated as corruption by :meth:`load` — the
+        line is skipped rather than allowed to poison the authoritative
+        cache used for restart-time active-leaf reconstruction.
+        """
+        del on_load  # retained for API stability; enforcement is symmetric
+        if node.status in _NON_TERMINAL_STATUSES:
+            raise NodeStoreIntegrityError(
+                "cannot append node with non-terminal status "
+                f"{node.status!r}; append only after final "
+                "(status, failure_mode) is known"
+            )
+        if node.node_id in self._by_id:
+            raise NodeStoreIntegrityError(
+                f"duplicate node_id {node.node_id!r}: no in-place "
+                "update; nodes are appended exactly once"
+            )
         if node.parent_id is None:
             # Root node: check we do not already have one.
             for existing in self._by_id.values():
