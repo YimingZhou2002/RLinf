@@ -191,8 +191,168 @@ def test_recent_failed_excludes_duplicate_of(tmp_path: Path) -> None:
     )
     store.append(dup)
     view = render_dag_view(store, active_leaf_id="orig")
-    failed_section = view.split("### Recent failure leaves")[1]
+    # ``### Recent failure leaves`` slice ends at the next ``###`` header
+    # (introduced by the new "Recent duplicate config attempts" section
+    # in Round 2 for AC-6/AC-7). Bound the slice so we only assert on
+    # the failure section, not the duplicate section below it.
+    after_failure_header = view.split("### Recent failure leaves")[1]
+    failed_section = after_failure_header.split("###")[0]
     assert "dup" not in failed_section
+
+
+# ----- Recent duplicate config attempts section (AC-6/AC-7 Round 2) -----
+
+
+def _dup_section(view: str) -> str:
+    """Extract the ``### Recent duplicate config attempts`` slice."""
+    return view.split("### Recent duplicate config attempts")[1]
+
+
+def test_recent_duplicate_section_header_present(tmp_path: Path) -> None:
+    store = NodeStore(tmp_path / "n.jsonl", fsync_on_append=False)
+    store.append(_make_root())
+    view = render_dag_view(store, active_leaf_id="root")
+    assert "### Recent duplicate config attempts" in view
+    # With no duplicates, the section renders a placeholder line.
+    assert "(no duplicate attempts yet)" in _dup_section(view)
+
+
+def test_recent_duplicate_section_surfaces_dup_not_ancestor_or_sibling(
+    tmp_path: Path,
+) -> None:
+    """AC-6/AC-7: a DUPLICATE_OF that is neither ancestor nor current-parent sibling still appears.
+
+    Structure:
+      root -> orig (OK, active)
+      root -> other (OK)
+      root -> dup_of_other (DUPLICATE_OF pointing back at other)
+
+    Active leaf = orig. The duplicate ``dup_of_other`` is:
+      - NOT in the ancestor chain of orig (which is [root, orig]).
+      - NOT a sibling of orig ONLY when the active leaf's parent has
+        other siblings — root does have children so ``other`` and
+        ``dup_of_other`` are both siblings of orig. Reconfigure:
+
+    Structure v2:
+      root -> orig (OK)
+      orig -> child_of_orig (OK, ACTIVE)
+      root -> other (OK)
+      root -> dup_of_other (DUPLICATE_OF -> other)
+
+    Now active = child_of_orig. Ancestor chain = [root, orig, child_of_orig].
+    Current-parent siblings = children of orig minus child_of_orig
+    (empty). ``dup_of_other`` is a child of root, not of orig, so it
+    isn't in siblings. Pre-Round-2 it disappeared from the prompt;
+    post-Round-2 it must appear in the duplicate section.
+    """
+    store = NodeStore(tmp_path / "n.jsonl", fsync_on_append=False)
+    store.append(_make_root())
+    store.append(_make_child("orig", "root", trial_idx=0, objective=1.0))
+    store.append(
+        _make_child("child_of_orig", "orig", trial_idx=1, objective=0.5)
+    )
+    store.append(_make_child("other", "root", trial_idx=2, objective=2.0))
+    dup = _make_child(
+        "dup_of_other",
+        "root",
+        trial_idx=-1,
+        status="OK",
+        failure_mode=DUPLICATE_OF_FAILURE_MODE,
+        objective=2.0,
+        duplicate_of_node_id="other",
+    )
+    store.append(dup)
+
+    view = render_dag_view(store, active_leaf_id="child_of_orig")
+    dup_section = _dup_section(view)
+    # The duplicate must appear in the dedicated section.
+    assert "dup_of_other" in dup_section
+    # Each duplicate line must render the back-reference.
+    assert "duplicate_of=other" in dup_section
+
+
+def test_recent_duplicate_section_ordered_by_recency(tmp_path: Path) -> None:
+    """Most recent duplicate appears first (matches recent-failure ordering)."""
+    store = NodeStore(tmp_path / "n.jsonl", fsync_on_append=False)
+    store.append(_make_root())
+    store.append(_make_child("orig", "root", trial_idx=0, objective=1.0))
+    older = _make_child(
+        "older_dup",
+        "root",
+        trial_idx=-1,
+        status="OK",
+        failure_mode=DUPLICATE_OF_FAILURE_MODE,
+        objective=1.0,
+        duplicate_of_node_id="orig",
+    )
+    newer = _make_child(
+        "newer_dup",
+        "root",
+        trial_idx=-2,
+        status="OK",
+        failure_mode=DUPLICATE_OF_FAILURE_MODE,
+        objective=1.0,
+        duplicate_of_node_id="orig",
+    )
+    store.append(older)
+    store.append(newer)
+    view = render_dag_view(store, active_leaf_id="orig")
+    section = _dup_section(view)
+    assert section.index("newer_dup") < section.index("older_dup")
+
+
+def test_recent_duplicate_section_shares_max_dag_nodes_budget(
+    tmp_path: Path,
+) -> None:
+    """max_dag_nodes cap applies to sections 2+3+4+5 combined."""
+    store = NodeStore(tmp_path / "n.jsonl", fsync_on_append=False)
+    store.append(_make_root())
+    store.append(_make_child("orig", "root", trial_idx=0, objective=1.0))
+    # 5 duplicates. With max_dag_nodes=1 and sibling+ok+failed sections
+    # empty (no siblings, orig is the only OK leaf which lands in top-K,
+    # no failures), the OK leaderboard consumes 1 slot leaving 0 for
+    # duplicates.
+    for i in range(5):
+        store.append(
+            _make_child(
+                f"dup_{i}",
+                "root",
+                trial_idx=-(i + 1),
+                status="OK",
+                failure_mode=DUPLICATE_OF_FAILURE_MODE,
+                objective=1.0,
+                duplicate_of_node_id="orig",
+            )
+        )
+    view = render_dag_view(store, active_leaf_id="orig", max_dag_nodes=1)
+    section = _dup_section(view)
+    # Budget exhausted by OK leaderboard; duplicate section says so.
+    assert "(budget exhausted" in section
+    # None of the actual duplicate ids leak into the duplicate section.
+    for i in range(5):
+        assert f"dup_{i}" not in section
+
+
+def test_recent_duplicate_section_absent_when_no_duplicates(tmp_path: Path) -> None:
+    """When no DUPLICATE_OF nodes exist, section still renders with placeholder."""
+    store = NodeStore(tmp_path / "n.jsonl", fsync_on_append=False)
+    store.append(_make_root())
+    store.append(_make_child("orig", "root", trial_idx=0, objective=1.0))
+    view = render_dag_view(store, active_leaf_id="orig")
+    section = _dup_section(view)
+    assert "(no duplicate attempts yet)" in section
+
+
+def test_wiki_09_dag_search_documents_duplicate_section(tmp_path: Path) -> None:
+    """AC-7: the wiki file must describe the new duplicate section for Codex."""
+    wiki = (
+        Path(__file__).resolve().parents[1]
+        / "wiki"
+        / "09-dag-search.md"
+    )
+    text = wiki.read_text(encoding="utf-8")
+    assert "Recent duplicate config attempts" in text
+    assert "duplicate_of=<node_id>" in text
 
 
 # ----- Node-identifier stability across rounds -------------------------

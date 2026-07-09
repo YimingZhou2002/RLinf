@@ -290,6 +290,46 @@ def test_rollback_exhausted_when_climb_goes_above_root(tmp_path: Path) -> None:
     assert len(factory.runner_calls) == 3
 
 
+def test_rollback_exhausted_trial_count_matches_launched_trials(
+    tmp_path: Path,
+) -> None:
+    """AC-8: ``result.trial_count`` must reflect every launched trial.
+
+    Pre-fix, ``rollback_exhausted`` returned ``trial_idx`` BEFORE the
+    post-trial ``trial_idx += 1`` bookkeeping ran, so a campaign that
+    launched N trials before exhausting rollback reported ``N-1``. The
+    fix increments explicitly on the return path so
+    ``result.trial_count == len(runner_calls) == len(ledger.entries)``.
+    """
+    factory = _RollbackFactory(
+        tmp_path=tmp_path,
+        objectives=[None, None, None],
+        failure_modes=[FailureMode.OOM, FailureMode.OOM, FailureMode.OOM],
+        statuses=[Status.FAILED, Status.FAILED, Status.FAILED],
+    )
+    sched, _ = factory.build(
+        FakeCritic.from_deltas({"a": 1}, {"a": 2}, {"a": 3}),
+        budget=BudgetConfig(
+            max_trials=10, budget_seconds=999.0, max_oom=99, max_siblings=3,
+        ),
+    )
+    result = sched.run()
+    assert result.stop_reason == "rollback_exhausted"
+    launched_count = len(factory.runner_calls)
+    # AC-8 invariant: every launched trial is counted exactly once.
+    assert result.trial_count == launched_count
+    # AC-8 cross-check: the flat Ledger, the runner, and the campaign
+    # result all agree on the launched-trial count.
+    fresh_ledger = Ledger(
+        tmp_path / "ledger.jsonl", fsync_on_append=False
+    )
+    ledger_entries = fresh_ledger.load().entries
+    assert result.trial_count == len(ledger_entries) == launched_count
+    # oom_count from the same campaign should also match — 3 OOM
+    # failures all recorded before the stop.
+    assert result.oom_count == 3
+
+
 def test_sibling_counter_resets_after_successful_trial(tmp_path: Path) -> None:
     """OOM, OOM, OK, OOM — the OK must reset the counter."""
     factory = _RollbackFactory(

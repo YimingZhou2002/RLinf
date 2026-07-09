@@ -226,12 +226,24 @@ def test_rebuild_skips_duplicate_of_nodes(tmp_path: Path) -> None:
     assert entry.origin_node_id == "n1"  # NOT "dup1"
 
 
-def test_rebuild_prefers_sidecar_over_node_store(tmp_path: Path) -> None:
-    """When the sidecar is present, it wins for entries it already knows."""
+def test_rebuild_prefers_node_store_over_stale_sidecar(tmp_path: Path) -> None:
+    """AC-6 / task6: NodeStore is authoritative; a stale sidecar row is ignored.
+
+    Round-1 (Codex-flagged) contract: when both a sidecar and a
+    NodeStore are supplied, the DAG NodeStore is the ground truth for
+    which node originated a given resolved-config SHA. A hand-edited
+    or partially rolled-back sidecar that claims a different origin
+    for a SHA that NodeStore knows about must NOT be trusted. Without
+    this, a semantic-sidecar-corruption fixture (parseable, but
+    pointing at the wrong origin) would silently break duplicate-of
+    back-references.
+    """
     store = NodeStore(tmp_path / "nodes.jsonl", fsync_on_append=False)
     store.append(_make_root(sha="sha-baseline"))
+    # NodeStore says sha-1 was first attempted by n1.
     store.append(_make_child("n1", "root", trial_idx=0, sha="sha-1", objective=2.0))
-    # Sidecar already claims origin=n0 for sha-1 (from an older run).
+    # Sidecar claims sha-1's origin is a non-existent n0 (stale from
+    # an older campaign or hand-editing accident).
     path = tmp_path / "cdi.jsonl"
     with path.open("w", encoding="utf-8") as fh:
         fh.write(
@@ -250,4 +262,38 @@ def test_rebuild_prefers_sidecar_over_node_store(tmp_path: Path) -> None:
     idx.load_or_rebuild(store)
     entry = idx.lookup("sha-1")
     assert entry is not None
-    assert entry.origin_node_id == "n0"  # sidecar wins over the node-store backfill
+    # NodeStore wins — origin_node_id is n1 (the real launched node),
+    # not n0 (the stale sidecar claim). Objective also reflects the
+    # NodeStore payload, not the sidecar's stale copy.
+    assert entry.origin_node_id == "n1"
+    assert entry.objective == 2.0
+
+
+def test_rebuild_backfills_sidecar_when_node_store_silent_for_sha(
+    tmp_path: Path,
+) -> None:
+    """A sidecar row for a SHA absent from NodeStore is retained (defensive fallback)."""
+    store = NodeStore(tmp_path / "nodes.jsonl", fsync_on_append=False)
+    store.append(_make_root(sha="sha-baseline"))
+    # Sidecar has a row for sha-orphan that NodeStore doesn't know
+    # about. Keep it — the sidecar is the only source and losing it
+    # would silently allow a re-launch of the orphan config.
+    path = tmp_path / "cdi.jsonl"
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "resolved_config_sha": "sha-orphan",
+                    "origin_node_id": "n_orphan",
+                    "status": "OK",
+                    "failure_mode": "NONE",
+                    "objective": 3.5,
+                }
+            )
+            + "\n"
+        )
+    idx = ConfigDedupIndex(path, fsync_on_append=False)
+    idx.load_or_rebuild(store)
+    entry = idx.lookup("sha-orphan")
+    assert entry is not None
+    assert entry.origin_node_id == "n_orphan"

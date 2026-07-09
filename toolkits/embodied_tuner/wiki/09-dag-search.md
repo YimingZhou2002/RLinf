@@ -24,6 +24,13 @@ identifiers are stable across rounds.
 - **Recent failure leaves:** The most recent trials whose
   `failure_mode` is not `NONE`/`DUPLICATE_OF`, ordered by recency.
   Each line shows the failure mode alongside the delta that failed.
+- **Recent duplicate config attempts:** The most recent synthetic
+  `DUPLICATE_OF` nodes, ordered by recency. A duplicate is emitted
+  whenever the resolved cumulative config of a proposal matches a
+  prior clean-OK trial, so this section surfaces repeated proposals
+  that would waste budget by re-running an already-known result. The
+  `duplicate_of=<node_id>` field points back at the original OK trial
+  whose objective the duplicate reuses.
 
 ## How to use the DAG view
 
@@ -46,6 +53,13 @@ identifiers are stable across rounds.
    Bitter lessons are one-line rules the critic wrote after past
    failures. Failed leaves in the DAG view are the actual delta +
    failure-mode observations. Both are shown; both matter.
+5. **Duplicate config attempts signal wasted budget.** Every time the
+   `Recent duplicate config attempts` section grows, it means a
+   proposal resolved to an already-attempted cumulative config. When
+   you see a duplicate you emitted appear there, deliberately shift
+   the resolved SHA on the next proposal (change a different knob,
+   change the magnitude of the change, or explicitly propose
+   `stop_requested`).
 
 ## Node line format
 

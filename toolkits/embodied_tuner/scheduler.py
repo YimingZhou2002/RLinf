@@ -543,8 +543,15 @@ class Scheduler:
                         # We were rewound to root (or above); no
                         # further climb possible. Terminate the
                         # campaign with the dedicated stop reason.
+                        # AC-8: this trial was launched (runner ran,
+                        # ledger entry appended, NodeStore mirrored),
+                        # so it counts toward the campaign's
+                        # trial_count. The post-trial ``trial_idx += 1``
+                        # bookkeeping below never runs on this stop
+                        # path, so we pass ``trial_idx + 1`` explicitly
+                        # to keep ``result.trial_count == len(runner_calls)``.
                         return self._finish(
-                            "rollback_exhausted", trial_idx, oom_count
+                            "rollback_exhausted", trial_idx + 1, oom_count
                         )
                     active_leaf_id = grandparent.node_id
                     cumulative_delta = dict(grandparent.cumulative_delta)

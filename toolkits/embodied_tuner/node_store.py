@@ -687,8 +687,14 @@ def render_dag_view(
     4. **Recent FAILED leaves** — nodes whose ``failure_mode`` is not
        ``NONE``/``DUPLICATE_OF``, ordered by recency (most recent
        first).
+    5. **Recent duplicate config attempts** — DUPLICATE_OF nodes,
+       ordered by recency. Ensures Codex sees repeated proposals of
+       already-attempted configs even when the duplicate is neither
+       an active ancestor nor a current-parent sibling. Each entry
+       renders ``node_id``, ``duplicate_of_node_id``, ``objective``,
+       and ``delta_from_parent``.
 
-    The combined budget for sections 2 + 3 + 4 is ``max_dag_nodes``.
+    The combined budget for sections 2 + 3 + 4 + 5 is ``max_dag_nodes``.
     A ``max_dag_nodes = 0`` renders only the ancestor chain plus a
     single-line note stating the leaderboard is empty; the block is
     still well-formed.
@@ -780,10 +786,35 @@ def render_dag_view(
             and not n.is_root()
         ]
         failed_leaves = failed_leaves[:remaining_budget]
+        remaining_budget -= len(failed_leaves)
         if not failed_leaves:
             lines.append("(no failures observed yet)")
         else:
             for n in failed_leaves:
+                lines.append(_fmt_node_line(n))
+
+    # --- Section 5: recent DUPLICATE_OF attempts (by recency) ----------
+    # Guarantees that Codex sees repeated proposals of already-attempted
+    # configs even when the duplicate is neither an active ancestor nor
+    # a current-parent sibling. DUPLICATE_OF remains excluded from the
+    # top-K OK leaderboard (section 3) and the recent-failure section
+    # (section 4); this dedicated section is the only place duplicates
+    # are guaranteed to surface.
+    lines.append("")
+    lines.append("### Recent duplicate config attempts")
+    if remaining_budget <= 0:
+        lines.append("(budget exhausted by failure section)")
+    else:
+        duplicate_leaves = [
+            n
+            for n in reversed(all_nodes)  # recency-first
+            if n.failure_mode == DUPLICATE_OF_FAILURE_MODE
+        ]
+        duplicate_leaves = duplicate_leaves[:remaining_budget]
+        if not duplicate_leaves:
+            lines.append("(no duplicate attempts yet)")
+        else:
+            for n in duplicate_leaves:
                 lines.append(_fmt_node_line(n))
 
     return "\n".join(lines)

@@ -1,0 +1,7 @@
+{
+  "objective": 18.5,
+  "denominator_source": "num_trajectories (final MetricTable block)",
+  "step_range_used": "steps 1..3 (all blocks averaged)",
+  "exclusion_reasons": [],
+  "source_trial_idx": 2
+}

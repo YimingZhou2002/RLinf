@@ -143,24 +143,80 @@ class ConfigDedupIndex:
     def load_or_rebuild(self, node_store: NodeStore | None = None) -> None:
         """Populate the in-memory map from disk; optionally rebuild from ``node_store``.
 
-        If the sidecar file exists, its contents are trusted as the
-        primary source. Corrupt or schema-violating lines are logged
-        and skipped rather than raising.
+        Two paths, keyed on whether a :class:`NodeStore` is supplied:
 
-        When ``node_store`` is provided, every DAG node with a non-null
-        ``resolved_config_sha`` is projected into a synthetic
-        :class:`DedupEntry` — any SHA present in the node store but
-        absent from the sidecar is added, keeping the sidecar aligned
-        with the authoritative record. When the sidecar file is missing
-        entirely and ``node_store`` is provided, the index is rebuilt
-        from scratch. Nodes with ``failure_mode == DUPLICATE_OF`` are
-        SKIPPED during rebuild so ``origin_node_id`` never points at a
-        duplicate.
+        - **NodeStore-authoritative (``node_store is not None``, the
+          production path):** The DAG store is the ground truth for
+          "which trials happened, with what SHA, in what order". Build
+          the in-memory dedup map from NodeStore first, first-write-
+          wins on SHA (so ``origin_node_id`` always points at the
+          ORIGINAL non-duplicate). Then scan the sidecar file for
+          SHAs that NodeStore does not know about (defensive; sidecar
+          should be a strict subset). For any SHA already in the map,
+          the sidecar row is IGNORED — a stale sidecar cannot
+          override the authoritative record. Disagreements are logged
+          so operators can inspect corruption.
+        - **Sidecar-only (``node_store is None``, backward-compat
+          path):** Load whatever the sidecar file contains, collapsing
+          duplicate rows to the first occurrence. Used by unit tests
+          that don't wire in a NodeStore; production always supplies
+          one.
+
+        Nodes with ``failure_mode == DUPLICATE_OF`` are SKIPPED during
+        NodeStore rebuild so ``origin_node_id`` never points at a
+        synthetic duplicate.
+
+        See :attr:`ConfigDedupIndex` docstring for the persistence
+        contract and AC-6 (chain-prevention) for the invariant.
         """
         self._entries.clear()
-        # 1. Load whatever is on disk. Duplicates in the file are
-        #    collapsed to the first occurrence — a re-add later in the
-        #    file cannot override the origin_node_id.
+
+        if node_store is not None:
+            # 1. NodeStore first — authoritative. Insertion order
+            #    naturally implements first-write-wins on SHA.
+            for node in node_store.all_nodes():
+                entry = self._maybe_entry_from_node(node)
+                if entry is None:
+                    continue
+                # setdefault so the first launched trial for this SHA
+                # wins (matches AC-6's "back-reference to ORIGINAL
+                # non-duplicate" rule).
+                self._entries.setdefault(entry.resolved_config_sha, entry)
+
+            # 2. Sidecar fallback for SHAs NodeStore doesn't know
+            #    about. For SHAs already claimed by NodeStore, IGNORE
+            #    the sidecar row — a stale or hand-edited sidecar
+            #    must never override the authoritative DAG record.
+            if self.path.is_file():
+                with self.path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            raw = json.loads(line)
+                            entry = DedupEntry.from_dict(raw)
+                        except (json.JSONDecodeError, DedupIndexSchemaError, TypeError) as exc:
+                            _log.warning(
+                                "config_dedup_index: skipping corrupt line: %s", exc
+                            )
+                            continue
+                        existing = self._entries.get(entry.resolved_config_sha)
+                        if existing is None:
+                            self._entries[entry.resolved_config_sha] = entry
+                        elif existing.origin_node_id != entry.origin_node_id:
+                            _log.warning(
+                                "config_dedup_index: sidecar row for SHA %s "
+                                "disagrees with NodeStore (sidecar_origin=%s, "
+                                "node_store_origin=%s); NodeStore wins",
+                                entry.resolved_config_sha,
+                                entry.origin_node_id,
+                                existing.origin_node_id,
+                            )
+            self._loaded = True
+            return
+
+        # Sidecar-only path (backward compat). No NodeStore to consult.
         if self.path.is_file():
             with self.path.open("r", encoding="utf-8") as fh:
                 for line in fh:
@@ -176,41 +232,32 @@ class ConfigDedupIndex:
                         )
                         continue
                     self._entries.setdefault(entry.resolved_config_sha, entry)
-
-        # 2. Backfill from the authoritative node store. Skip DUPLICATE_OF
-        #    nodes so ``origin_node_id`` always points at the true source.
-        if node_store is not None:
-            for node in node_store.all_nodes():
-                if node.resolved_config_sha is None:
-                    continue
-                if node.failure_mode == FailureMode.DUPLICATE_OF.value:
-                    continue
-                if node.is_root():
-                    # Baseline root's SHA is real but the root itself is
-                    # not a launched trial. Include it so a proposal
-                    # that resolves back to baseline can short-circuit.
-                    entry = DedupEntry(
-                        resolved_config_sha=node.resolved_config_sha,
-                        origin_node_id=node.node_id,
-                        status="OK",
-                        failure_mode=FailureMode.NONE.value,
-                        objective=node.objective,
-                    )
-                else:
-                    entry = DedupEntry(
-                        resolved_config_sha=node.resolved_config_sha,
-                        origin_node_id=node.node_id,
-                        status=node.status,
-                        failure_mode=node.failure_mode,
-                        objective=node.objective,
-                    )
-                # Only insert if this SHA is not already known (first
-                # occurrence wins — matches AC-6's "back-reference to
-                # ORIGINAL non-duplicate" rule).
-                if entry.resolved_config_sha not in self._entries:
-                    self._entries[entry.resolved_config_sha] = entry
-
         self._loaded = True
+
+    def _maybe_entry_from_node(self, node: DAGNode) -> DedupEntry | None:
+        """Project a DAGNode into a DedupEntry, or ``None`` if the node is not indexable."""
+        if node.resolved_config_sha is None:
+            return None
+        if node.failure_mode == FailureMode.DUPLICATE_OF.value:
+            return None
+        if node.is_root():
+            # Baseline root's SHA is real but the root itself is not a
+            # launched trial. Surface it so a proposal that resolves
+            # back to baseline short-circuits.
+            return DedupEntry(
+                resolved_config_sha=node.resolved_config_sha,
+                origin_node_id=node.node_id,
+                status="OK",
+                failure_mode=FailureMode.NONE.value,
+                objective=node.objective,
+            )
+        return DedupEntry(
+            resolved_config_sha=node.resolved_config_sha,
+            origin_node_id=node.node_id,
+            status=node.status,
+            failure_mode=node.failure_mode,
+            objective=node.objective,
+        )
 
     def lookup(self, resolved_config_sha: str) -> DedupEntry | None:
         """Return the entry for ``resolved_config_sha`` or ``None``."""
