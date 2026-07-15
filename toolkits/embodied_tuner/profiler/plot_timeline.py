@@ -53,8 +53,11 @@ _COMPONENT_ORDER: dict[str, int] = {
 
 _TAG_ORDER: dict[str, int] = {
     "run": 0,
+    # env onload/offload (enable_offload=True 时 env 在 step 前 onload、interact 后 offload)
+    "onload": 9,
     "interact": 10,
     "run_interact_once": 11,
+    "offload": 12,
     "generate": 20,
     "generate_one_epoch": 21,
     "recv_rollout_results": 30,
@@ -62,13 +65,18 @@ _TAG_ORDER: dict[str, int] = {
     "compute_bootstrap_rewards": 32,
     "env_interact_step": 33,
     "prefetch_train_bootstrap": 34,
+    # rollout 模型搬运（reload 在 generate 头、offload 在尾）
+    "reload_model": 35,
+    "offload_model": 36,
     "recv_rollout_trajectories": 40,
     "compute_advantages_and_returns": 41,
     "run_training": 42,
-    "actor_forward": 43,
-    "actor_policy_loss": 44,
-    "actor_backward": 45,
-    "actor_optimizer_step": 46,
+    # actor 权重/优化器搬运（run_training 内、forward 前加载）
+    "load_weight_and_optimizer": 43,
+    "actor_forward": 44,
+    "actor_policy_loss": 45,
+    "actor_backward": 46,
+    "actor_optimizer_step": 47,
 }
 
 _TAG_COLORS: dict[str, str] = {
@@ -85,6 +93,12 @@ _TAG_COLORS: dict[str, str] = {
     "recv_rollout_trajectories": "#e67e22",
     "compute_advantages_and_returns": "#f5b041",
     "run_training": "#d35400",
+    # 搬运：to-GPU 用暖色，to-CPU 用冷灰/蓝
+    "onload": "#138d75",                # env 加载回 GPU（深青）
+    "offload": "#a6acaf",               # env 卸载到 CPU（银灰）
+    "reload_model": "#ff8f40",          # rollout 模型加载回 GPU（琥珀）
+    "offload_model": "#5d6d7e",         # rollout 模型卸载到 CPU（蓝灰）
+    "load_weight_and_optimizer": "#cb4335",  # actor 权重+优化器加载回 GPU（暗红）
     "actor_forward": "#c0392b",
     "actor_policy_loss": "#f39c12",
     "actor_backward": "#8e44ad",
@@ -241,7 +255,6 @@ def plot_timeline(
         exclude_tags=exclude_tags,
     )
 
-
 def plot_timeline_png(
     timeline_dir: str,
     output_path: str | None = None,
@@ -250,6 +263,7 @@ def plot_timeline_png(
     dpi: int = 150,
     lane_mode: str = "tag",
     color_by: str = "tag",
+    target_aspect: float = 1.35,
     include_tags: set[str] | None = None,
     exclude_tags: set[str] | None = None,
     include_components: set[str] | None = None,
@@ -292,7 +306,10 @@ def plot_timeline_png(
 
     nlanes = len(lanes)
     fig_h = max(4.0, 1.2 + nlanes * 0.55)
-    fig, ax = plt.subplots(figsize=(fig_width, fig_h))
+    # Keep the chart landscape: widen with lane count so tall tag-mode timelines
+    # do not end up much taller than wide.
+    fig_w = max(fig_width, fig_h * target_aspect)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     bar_h = min(lane_height, 0.85)
     for e in events:
@@ -346,6 +363,7 @@ def plot_timeline_html(
     *,
     lane_height: float = 0.55,
     width_px: int = 1200,
+    target_aspect: float = 1.35,
     lane_mode: str = "tag",
     color_by: str = "tag",
     include_tags: set[str] | None = None,
@@ -479,7 +497,7 @@ def plot_timeline_html(
         barmode="overlay",
         bargap=0.15,
         height=max(360, int(120 + len(lanes) * 30)),
-        width=width_px,
+        width=max(width_px, int(max(360, int(120 + len(lanes) * 30)) * target_aspect)),
         title=(
             f"Timeline Gantt · {len(events)} events · "
             f"span {t_max - t_min:.2f}s · {os.path.basename(timeline_dir.rstrip(os.sep))}"
@@ -532,6 +550,12 @@ def main() -> None:
     parser.add_argument("--width", type=float, default=14.0, help="Figure width in inches")
     parser.add_argument("--dpi", type=int, default=150, help="PNG resolution")
     parser.add_argument(
+        "--target-aspect",
+        type=float,
+        default=1.35,
+        help="Target width/height ratio; width auto-grows with lane count so the chart stays landscape (avoids tall-thin Gantt charts)",
+    )
+    parser.add_argument(
         "--lane-mode",
         choices=["tag", "rank"],
         default="tag",
@@ -578,6 +602,7 @@ def main() -> None:
             output_path=args.output,
             lane_mode=args.lane_mode,
             color_by=args.color_by,
+            target_aspect=args.target_aspect,
             include_tags=include_tags or None,
             exclude_tags=exclude_tags,
             include_components=include_components or None,
@@ -593,6 +618,7 @@ def main() -> None:
             dpi=args.dpi,
             lane_mode=args.lane_mode,
             color_by=args.color_by,
+            target_aspect=args.target_aspect,
             include_tags=include_tags or None,
             exclude_tags=exclude_tags,
             include_components=include_components or None,

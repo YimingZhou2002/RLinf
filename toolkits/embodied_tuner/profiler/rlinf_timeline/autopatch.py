@@ -29,6 +29,12 @@ class PatchSpec:
 
 _INSTALLED = False
 _PATCHED: set[tuple[str, str]] = set()
+# Specs that failed to patch because their target module/class was still
+# partially initialized at import-hook time (a latent circular import in the
+# target package, e.g. rlinf.envs.maniskill). The class typically finishes
+# defining later in the same process; _retry_deferred() re-attempts these on
+# subsequent imports until they succeed.
+_DEFERRED_SPECS: list[PatchSpec] = []
 _WORKER_TIMER_PATCHED = False
 _ACTOR_TRAINING_PATCHED = False
 _WORKER_NVML_PATCHED = False
@@ -494,6 +500,8 @@ def _wrap_callable(func: Callable[..., Any], spec: PatchSpec) -> Callable[..., A
 
         @functools.wraps(func)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            if _DEFERRED_SPECS:
+                _retry_deferred()
             if args:
                 _ensure_resource_sampling_for_object(args[0])
             call_index = _next_call_index(args[0], spec.tag) if args else 0
@@ -535,6 +543,8 @@ def _wrap_callable(func: Callable[..., Any], spec: PatchSpec) -> Callable[..., A
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _DEFERRED_SPECS:
+            _retry_deferred()
         if args:
             _ensure_resource_sampling_for_object(args[0])
         call_index = _next_call_index(args[0], spec.tag) if args else 0
@@ -596,12 +606,44 @@ def _patch_one(module: ModuleType, spec: PatchSpec) -> None:
     _debug(f"patched {spec.module}:{spec.qualname} as {spec.component}/{spec.tag}")
 
 
+def _retry_deferred() -> None:
+    """Re-attempt specs that previously failed because their module was partial.
+
+    Safe to call from any import hook: it only touches modules already present
+    and fully loaded in sys.modules, and never changes import control flow.
+    """
+    if not _DEFERRED_SPECS:
+        return
+    remaining: list[PatchSpec] = []
+    for spec in _DEFERRED_SPECS:
+        module = sys.modules.get(spec.module)
+        if module is None:
+            remaining.append(spec)
+            continue
+        try:
+            _patch_one(module, spec)
+            _debug(
+                f"deferred-retry patched {spec.module}:{spec.qualname} "
+                f"as {spec.component}/{spec.tag}"
+            )
+        except Exception:
+            # Still not ready (class not yet defined); keep for a later retry.
+            remaining.append(spec)
+    _DEFERRED_SPECS[:] = remaining
+
+
 def _patch_module(module: ModuleType, specs: list[PatchSpec]) -> None:
     for spec in specs:
         try:
             _patch_one(module, spec)
         except Exception as exc:
             _debug(f"failed to patch {spec.module}:{spec.qualname}: {exc}")
+            # Target module/class likely not fully defined yet (circular import);
+            # retry opportunistically on subsequent imports.
+            if (spec.module, spec.qualname) not in _PATCHED:
+                _DEFERRED_SPECS.append(spec)
+    _retry_deferred()
+
 
 
 class _TimelineLoader(importlib.abc.Loader):
@@ -862,6 +904,46 @@ class _ScopedPatch:
         setattr(self.owner, self.name, self.original)
 
 
+class _DeferredRetryLoader(importlib.abc.Loader):
+    """Wraps any module's loader to retry deferred patches after it finishes loading.
+
+    Only active while _DEFERRED_SPECS is non-empty; the finder short-circuits
+    otherwise so there is zero overhead on the normal import path.
+    """
+
+    def __init__(self, loader: importlib.abc.Loader) -> None:
+        self.loader = loader
+
+    def create_module(self, spec):
+        create_module = getattr(self.loader, "create_module", None)
+        if create_module is None:
+            return None
+        return create_module(spec)
+
+    def exec_module(self, module: ModuleType) -> None:
+        self.loader.exec_module(module)  # type: ignore[attr-defined]
+        _retry_deferred()
+
+
+class _DeferredRetryFinder(importlib.abc.MetaPathFinder):
+    """Appended last in sys.meta_path; retries deferred specs on every later import.
+
+    Specialized finders (registered at the front of sys.meta_path) claim their
+    own modules and are never seen here, so no double-wrapping occurs.
+    """
+
+    def find_spec(self, fullname: str, path: Any, target: Any = None):
+        if not _DEFERRED_SPECS:
+            return None
+        found = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if found is None or found.loader is None:
+            return found
+        if isinstance(found.loader, (_DeferredRetryLoader, _TimelineLoader)):
+            return found
+        found.loader = _DeferredRetryLoader(found.loader)
+        return found
+
+
 def _patch_actor_training_module(module: ModuleType) -> None:
     global _ACTOR_TRAINING_PATCHED
     if _ACTOR_TRAINING_PATCHED:
@@ -1058,6 +1140,11 @@ def _patch_worker_nvml_module(module: ModuleType) -> None:
     @functools.wraps(original_init)
     def init_wrapper(self, *args, **kwargs):
         result = original_init(self, *args, **kwargs)
+        # Publish RLINF_LOG_DIR from the worker's cfg so PatchSpec-wrapped
+        # methods whose `self` is not a Worker (e.g. ManiskillOffloadEnv, whose
+        # .cfg is env.train without runner.logger.log_path) still resolve the
+        # correct run timeline dir via default_timeline_dir().
+        _set_log_dir_env_from_cfg(getattr(self, "cfg", None))
         rank = _rank_from_context((self,))
         if rank >= 0:
             _start_local_resource_samplers(
@@ -1176,6 +1263,11 @@ def _patch_resource_worker_init_module(module: ModuleType) -> None:
         @functools.wraps(original_init)
         def init_wrapper(self, *args, __original_init=original_init, **kwargs):
             result = __original_init(self, *args, **kwargs)
+            # Set RLINF_LOG_DIR right at worker construction (self.cfg is now set)
+            # so init-time PatchSpec events whose `self` isn't this Worker (e.g.
+            # ManiskillOffloadEnv.onload/offload fired during _init_env, before
+            # any timer event) still resolve the run timeline dir.
+            _set_log_dir_env_from_cfg(getattr(self, "cfg", None))
             _ensure_resource_sampling_for_object(self)
             return result
 
@@ -1215,6 +1307,10 @@ def _patch_worker_timer_module(module: ModuleType) -> None:
 
                 @functools.wraps(timed_func)
                 async def async_wrapper(self, *args, **kwargs):
+                    if _DEFERRED_SPECS:
+                        _retry_deferred()
+                    if "RLINF_LOG_DIR" not in os.environ:
+                        _set_log_dir_env_from_cfg(getattr(self, "cfg", None))
                     _ensure_resource_sampling_for_object(self)
                     call_index = _next_call_index(self, timer_tag)
                     t0 = time.time()
@@ -1258,6 +1354,10 @@ def _patch_worker_timer_module(module: ModuleType) -> None:
 
             @functools.wraps(timed_func)
             def wrapper(self, *args, **kwargs):
+                if _DEFERRED_SPECS:
+                    _retry_deferred()
+                if "RLINF_LOG_DIR" not in os.environ:
+                    _set_log_dir_env_from_cfg(getattr(self, "cfg", None))
                 _ensure_resource_sampling_for_object(self)
                 call_index = _next_call_index(self, timer_tag)
                 t0 = time.time()
@@ -1405,8 +1505,17 @@ def install_from_env() -> None:
             _patch_module(module, module_specs)
 
     sys.meta_path.insert(0, _TimelineFinder(by_module))
-    _INSTALLED = True
+    # Catch-all retry hook: fires on every later import so specs that failed at
+    # import-hook time (circular-import targets like maniskill_offload_env) get
+    # retried once their class finishes defining. No-op when nothing is deferred.
+    # Inserted ahead of PathFinder so it actually sees normal file imports.
+    try:
+        _pf_idx = sys.meta_path.index(importlib.machinery.PathFinder)
+    except ValueError:
+        _pf_idx = len(sys.meta_path)
+    sys.meta_path.insert(_pf_idx, _DeferredRetryFinder())
     _debug(f"installed import hook for {len(by_module)} modules")
+    _INSTALLED = True
 
 
 def patch_now(spec_text: str) -> None:

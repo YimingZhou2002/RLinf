@@ -294,6 +294,18 @@ def _fmt(value: float | None, unit: str = "") -> str:
     return f"{value:.3f}{suffix}"
 
 
+def _mem_occ_percent(mem_gib: float | None, total_gib: float | None) -> float | None:
+    """Memory occupancy ratio (used / total) as a percent.
+
+    Distinct from NVML's ``memory_util_percent`` (memory-controller busy ratio):
+    this is how full the device's memory actually got. Returns ``None`` when
+    either side is missing or the total is non-positive.
+    """
+    if mem_gib is None or not total_gib or total_gib <= 0:
+        return None
+    return mem_gib / total_gib * 100.0
+
+
 def _summary_stats(values: list[Any]) -> dict[str, float | None]:
     cleaned = _clean_values(values)
     if not cleaned:
@@ -305,16 +317,34 @@ def _summary_stats(values: list[Any]) -> dict[str, float | None]:
     }
 
 
-def write_nvitop_summary(
-    nvitop_dir: str,
+def _compute_nvitop_summary(
     samples: list[dict[str, Any]],
     *,
     include_gpus: set[int] | None = None,
     aggregate_bin_s: float = 1.0,
-    output_path: str | None = None,
-) -> str:
+    source_dir: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate raw nvitop samples into a structured, machine-readable dict.
+
+    This is the single source of truth for the nvitop summary: both the
+    human-readable ``nvitop_summary.log`` (via :func:`write_nvitop_summary`)
+    and the ``nvitop_summary.json`` sidecar are derived from this dict so
+    they can never drift apart. The auto-tuner parser
+    (:func:`toolkits.embodied_tuner.parser._load_memory_summary`) reads the
+    JSON sidecar directly instead of re-parsing the text log.
+
+    Returns a dict with ``samples`` / ``span_s`` / ``aggregate_bin_s`` /
+    ``gpu_total_gib`` (device cap from ``memory_total_gib``) / ``per_gpu``
+    (per-GPU avg+max mem & util, plus each GPU's ``memory_total_gib`` and the
+    occupancy ratios ``avg_mem_occ_percent`` / ``max_mem_occ_percent`` — the
+    used/total memory ratio, distinct from NVML's controller-busy
+    ``mem_util``) / ``overall`` / ``active`` (each also carrying
+    ``avg_mem_occ_percent`` / ``max_mem_occ_percent``) / ``per_process``
+    (per-(component,rank,pid) avg+max rss / cpu / process_gpu_mem /
+    process_gpu_util + ``gpu_indices``).
+    """
     if not samples:
-        raise ValueError("Cannot write nvitop summary without samples")
+        raise ValueError("Cannot compute nvitop summary without samples")
 
     t0 = min(rec["ts"] for rec in samples)
     t1 = max(rec["ts"] for rec in samples)
@@ -335,19 +365,25 @@ def write_nvitop_summary(
             if gpu_index in include_gpus
         }
 
-    lines = [
-        "nvitop resource summary",
-        f"source_dir: {nvitop_dir}",
-        f"samples: {len(samples)}",
-        f"span_s: {t1 - t0:.3f}",
-        f"aggregate_bin_s: {aggregate_bin_s:.3f}",
-        "",
-        "global_gpu_summary:",
-    ]
+    # Device cap (per-GPU memory_total_gib is a constant for the run).
+    # Take the max across every GPU seen in the first sample that carries
+    # any; hetero setups get the largest device's cap (conservative for the
+    # peak/cap soft-pressure ratio).
+    gpu_total_gib: float | None = None
+    for rec in samples:
+        for gpu in rec.get("gpus", []) or []:
+            total = _to_float(gpu.get("memory_total_gib"))
+            if total is None and "memory_total_bytes" in gpu:
+                total = float(gpu["memory_total_bytes"]) / (2**30)
+            if total is not None and (gpu_total_gib is None or total > gpu_total_gib):
+                gpu_total_gib = total
+        if gpu_total_gib is not None:
+            break
 
-    all_gpu_mem = []
-    all_gpu_util = []
-    all_gpu_mem_util = []
+    per_gpu: list[dict[str, Any]] = []
+    all_gpu_mem: list[Any] = []
+    all_gpu_util: list[Any] = []
+    all_gpu_mem_util: list[Any] = []
     for gpu_index, records in sorted(gpu_series.items()):
         mem_stats = _summary_stats([row.get("memory_used_gib") for row in records])
         util_stats = _summary_stats([row.get("gpu_util_percent") for row in records])
@@ -357,23 +393,45 @@ def write_nvitop_summary(
         all_gpu_mem.extend(row.get("memory_used_gib") for row in records)
         all_gpu_util.extend(row.get("gpu_util_percent") for row in records)
         all_gpu_mem_util.extend(row.get("memory_util_percent") for row in records)
-        lines.append(
-            "  "
-            f"gpu{gpu_index}: "
-            f"avg_mem={_fmt(mem_stats['avg'], 'GiB')}, "
-            f"max_mem={_fmt(mem_stats['max'], 'GiB')}, "
-            f"avg_gpu_util={_fmt(util_stats['avg'], '%')}, "
-            f"max_gpu_util={_fmt(util_stats['max'], '%')}, "
-            f"avg_mem_util={_fmt(mem_util_stats['avg'], '%')}, "
-            f"max_mem_util={_fmt(mem_util_stats['max'], '%')}"
+        per_gpu.append(
+            {
+                "index": gpu_index,
+                "avg_mem": mem_stats["avg"],
+                "max_mem": mem_stats["max"],
+                "avg_gpu_util": util_stats["avg"],
+                "max_gpu_util": util_stats["max"],
+                "avg_mem_util": mem_util_stats["avg"],
+                "max_mem_util": mem_util_stats["max"],
+                "memory_total_gib": gpu_total_gib,
+                # Occupancy (used/total) ratios — how full the device's memory
+                # actually got. NOT the same as mem_util (controller busy ratio).
+                "avg_mem_occ_percent": _mem_occ_percent(mem_stats["avg"], gpu_total_gib),
+                "max_mem_occ_percent": _mem_occ_percent(mem_stats["max"], gpu_total_gib),
+            }
         )
 
-    overall_mem = _summary_stats(all_gpu_mem)
+    overall = _summary_stats(all_gpu_mem)
     overall_util = _summary_stats(all_gpu_util)
     overall_mem_util = _summary_stats(all_gpu_mem_util)
-    active_gpu_mem = []
-    active_gpu_util = []
-    active_gpu_mem_util = []
+    # Occupancy (used/total) ratios pooled across every (gpu, bin) sample.
+    all_gpu_mem_occ = [
+        _mem_occ_percent(v, gpu_total_gib) for v in all_gpu_mem
+    ]
+    overall_mem_occ = _summary_stats(all_gpu_mem_occ)
+    overall_summary = {
+        "avg_mem": overall["avg"],
+        "max_mem": overall["max"],
+        "avg_gpu_util": overall_util["avg"],
+        "max_gpu_util": overall_util["max"],
+        "avg_mem_util": overall_mem_util["avg"],
+        "max_mem_util": overall_mem_util["max"],
+        "avg_mem_occ_percent": overall_mem_occ["avg"],
+        "max_mem_occ_percent": overall_mem_occ["max"],
+    }
+
+    active_gpu_mem: list[Any] = []
+    active_gpu_util: list[Any] = []
+    active_gpu_mem_util: list[Any] = []
     for records in gpu_series.values():
         mem_values = _clean_values([row.get("memory_used_gib") for row in records])
         util_values = _clean_values([row.get("gpu_util_percent") for row in records])
@@ -391,30 +449,26 @@ def write_nvitop_summary(
     active_mem = _summary_stats(active_gpu_mem)
     active_util = _summary_stats(active_gpu_util)
     active_mem_util = _summary_stats(active_gpu_mem_util)
-    lines.extend(
-        [
-            "  overall_across_selected_gpus: "
-            f"avg_mem={_fmt(overall_mem['avg'], 'GiB')}, "
-            f"max_mem={_fmt(overall_mem['max'], 'GiB')}, "
-            f"avg_gpu_util={_fmt(overall_util['avg'], '%')}, "
-            f"max_gpu_util={_fmt(overall_util['max'], '%')}, "
-            f"avg_mem_util={_fmt(overall_mem_util['avg'], '%')}, "
-            f"max_mem_util={_fmt(overall_mem_util['max'], '%')}",
-            "  overall_active_gpus: "
-            f"avg_mem={_fmt(active_mem['avg'], 'GiB')}, "
-            f"max_mem={_fmt(active_mem['max'], 'GiB')}, "
-            f"avg_gpu_util={_fmt(active_util['avg'], '%')}, "
-            f"max_gpu_util={_fmt(active_util['max'], '%')}, "
-            f"avg_mem_util={_fmt(active_mem_util['avg'], '%')}, "
-            f"max_mem_util={_fmt(active_mem_util['max'], '%')}",
-            "",
-            "process_summary:",
-        ]
-    )
+    # Occupancy (used/total) ratios pooled across active (gpu, bin) samples.
+    active_gpu_mem_occ = [
+        _mem_occ_percent(v, gpu_total_gib) for v in active_gpu_mem
+    ]
+    active_mem_occ = _summary_stats(active_gpu_mem_occ)
+    active_summary = {
+        "avg_mem": active_mem["avg"],
+        "max_mem": active_mem["max"],
+        "avg_gpu_util": active_util["avg"],
+        "max_gpu_util": active_util["max"],
+        "avg_mem_util": active_mem_util["avg"],
+        "max_mem_util": active_mem_util["max"],
+        "avg_mem_occ_percent": active_mem_occ["avg"],
+        "max_mem_occ_percent": active_mem_occ["max"],
+    }
 
+    per_process: list[dict[str, Any]] = []
     for key in process_keys:
         records = by_process[key]
-        label = _process_label(key)
+        component, rank, pid = key
         rss_stats = _summary_stats([rec.get("process_rss_gib") for rec in records])
         cpu_stats = _summary_stats([rec.get("process_cpu_percent") for rec in records])
         proc_gpu_stats = _summary_stats(
@@ -430,25 +484,156 @@ def write_nvitop_summary(
                 for gpu_index in (rec.get("process_gpu_indices") or [])
             }
         )
+        per_process.append(
+            {
+                "label": _process_label(key),
+                "component": component,
+                "rank": rank,
+                "pid": pid,
+                "avg_rss": rss_stats["avg"],
+                "max_rss": rss_stats["max"],
+                "avg_cpu": cpu_stats["avg"],
+                "max_cpu": cpu_stats["max"],
+                "avg_process_gpu_mem": proc_gpu_stats["avg"],
+                "max_process_gpu_mem": proc_gpu_stats["max"],
+                "avg_process_gpu_util": proc_gpu_util_stats["avg"],
+                "max_process_gpu_util": proc_gpu_util_stats["max"],
+                "gpu_indices": gpu_indices,
+            }
+        )
+
+    return {
+        "source_dir": source_dir,
+        "samples": len(samples),
+        "span_s": t1 - t0,
+        "aggregate_bin_s": aggregate_bin_s,
+        "gpu_total_gib": gpu_total_gib,
+        "per_gpu": per_gpu,
+        "overall": overall_summary,
+        "active": active_summary,
+        "per_process": per_process,
+    }
+
+
+def _summary_to_log_lines(summary: dict[str, Any]) -> list[str]:
+    """Format a :func:`_compute_nvitop_summary` dict as the ``.log`` text.
+
+    Mirrors the legacy inline formatting; the ``avg_mem_occ`` / ``max_mem_occ``
+    fields are appended after ``max_mem_util`` on each GPU and overall line.
+    They report the used/total occupancy ratio (how full device memory got),
+    distinct from NVML's ``mem_util`` (memory-controller busy ratio).
+    """
+    def _f(value: Any, unit: str = "") -> str:
+        return _fmt(value, unit)
+
+    lines = [
+        "nvitop resource summary",
+        f"source_dir: {summary.get('source_dir') or ''}",
+        f"samples: {summary['samples']}",
+        f"span_s: {summary['span_s']:.3f}",
+        f"aggregate_bin_s: {summary['aggregate_bin_s']:.3f}",
+        "",
+        "global_gpu_summary:",
+    ]
+    for gpu in summary["per_gpu"]:
         lines.append(
             "  "
-            f"{label}: "
-            f"avg_rss={_fmt(rss_stats['avg'], 'GiB')}, "
-            f"max_rss={_fmt(rss_stats['max'], 'GiB')}, "
-            f"avg_cpu={_fmt(cpu_stats['avg'], '%')}, "
-            f"max_cpu={_fmt(cpu_stats['max'], '%')}, "
-            f"avg_process_gpu_mem={_fmt(proc_gpu_stats['avg'], 'GiB')}, "
-            f"max_process_gpu_mem={_fmt(proc_gpu_stats['max'], 'GiB')}, "
-            f"avg_process_gpu_util={_fmt(proc_gpu_util_stats['avg'], '%')}, "
-            f"max_process_gpu_util={_fmt(proc_gpu_util_stats['max'], '%')}, "
+            f"gpu{gpu['index']}: "
+            f"avg_mem={_f(gpu['avg_mem'], 'GiB')}, "
+            f"max_mem={_f(gpu['max_mem'], 'GiB')}, "
+            f"avg_gpu_util={_f(gpu['avg_gpu_util'], '%')}, "
+            f"max_gpu_util={_f(gpu['max_gpu_util'], '%')}, "
+            f"avg_mem_util={_f(gpu['avg_mem_util'], '%')}, "
+            f"max_mem_util={_f(gpu['max_mem_util'], '%')}, "
+            f"avg_mem_occ={_f(gpu.get('avg_mem_occ_percent'), '%')}, "
+            f"max_mem_occ={_f(gpu.get('max_mem_occ_percent'), '%')}"
+        )
+    overall = summary["overall"]
+    active = summary["active"]
+    lines.extend(
+        [
+            "  overall_across_selected_gpus: "
+            f"avg_mem={_f(overall['avg_mem'], 'GiB')}, "
+            f"max_mem={_f(overall['max_mem'], 'GiB')}, "
+            f"avg_gpu_util={_f(overall['avg_gpu_util'], '%')}, "
+            f"max_gpu_util={_f(overall['max_gpu_util'], '%')}, "
+            f"avg_mem_util={_f(overall['avg_mem_util'], '%')}, "
+            f"max_mem_util={_f(overall['max_mem_util'], '%')}, "
+            f"avg_mem_occ={_f(overall.get('avg_mem_occ_percent'), '%')}, "
+            f"max_mem_occ={_f(overall.get('max_mem_occ_percent'), '%')}",
+            "  overall_active_gpus: "
+            f"avg_mem={_f(active['avg_mem'], 'GiB')}, "
+            f"max_mem={_f(active['max_mem'], 'GiB')}, "
+            f"avg_gpu_util={_f(active['avg_gpu_util'], '%')}, "
+            f"max_gpu_util={_f(active['max_gpu_util'], '%')}, "
+            f"avg_mem_util={_f(active['avg_mem_util'], '%')}, "
+            f"max_mem_util={_f(active['max_mem_util'], '%')}, "
+            f"avg_mem_occ={_f(active.get('avg_mem_occ_percent'), '%')}, "
+            f"max_mem_occ={_f(active.get('max_mem_occ_percent'), '%')}",
+            "",
+            "process_summary:",
+        ]
+    )
+    for proc in summary["per_process"]:
+        gpu_indices = proc["gpu_indices"]
+        lines.append(
+            "  "
+            f"{proc['label']}: "
+            f"avg_rss={_f(proc['avg_rss'], 'GiB')}, "
+            f"max_rss={_f(proc['max_rss'], 'GiB')}, "
+            f"avg_cpu={_f(proc['avg_cpu'], '%')}, "
+            f"max_cpu={_f(proc['max_cpu'], '%')}, "
+            f"avg_process_gpu_mem={_f(proc['avg_process_gpu_mem'], 'GiB')}, "
+            f"max_process_gpu_mem={_f(proc['max_process_gpu_mem'], 'GiB')}, "
+            f"avg_process_gpu_util={_f(proc['avg_process_gpu_util'], '%')}, "
+            f"max_process_gpu_util={_f(proc['max_process_gpu_util'], '%')}, "
             f"gpu_indices={gpu_indices or 'n/a'}"
         )
+    return lines
+
+
+def write_nvitop_summary(
+    nvitop_dir: str,
+    samples: list[dict[str, Any]],
+    *,
+    include_gpus: set[int] | None = None,
+    aggregate_bin_s: float = 1.0,
+    output_path: str | None = None,
+    write_json_sidecar: bool = True,
+) -> str:
+    """Write ``nvitop_summary.log`` (and a ``nvitop_summary.json`` sidecar).
+
+    The structured sidecar is the machine-readable twin of the text log —
+    both produced from :func:`_compute_nvitop_summary` so they cannot drift.
+    The auto-tuner reads the JSON sidecar; humans read the log.
+    """
+    summary = _compute_nvitop_summary(
+        samples,
+        include_gpus=include_gpus,
+        aggregate_bin_s=aggregate_bin_s,
+        source_dir=nvitop_dir,
+    )
 
     if output_path is None:
         output_path = os.path.join(nvitop_dir, "nvitop_summary.log")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+    lines = _summary_to_log_lines(summary)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+    if write_json_sidecar:
+        log_path = os.path.abspath(output_path)
+        if log_path.endswith(".log"):
+            json_path = log_path[:-4] + ".json"
+        else:
+            json_path = log_path + ".json"
+        # Strip runtime-only fields (source_dir is absolute) before dumping
+        # so the sidecar is stable across machines. Keep everything else.
+        sidecar = {k: v for k, v in summary.items() if k != "source_dir"}
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, indent=2, sort_keys=True)
+            f.write("\n")
+
     return output_path
 
 
