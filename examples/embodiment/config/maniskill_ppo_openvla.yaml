@@ -28,12 +28,12 @@ runner:
     experiment_name: "maniskill_ppo_openvla"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 1
   max_steps: -1
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 40
+  save_interval: -1
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -107,7 +107,7 @@ rollout:
   pipeline_stage_num: 2
 
   model:
-    model_path: "/path/to/model/rl4vla/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
+    model_path: "/mnt/public2/zhouyiming/RLinf_autotest_pr/model/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
     precision: ${actor.model.precision}
 
 actor:
@@ -120,7 +120,7 @@ actor:
 
   # Override the default values in model/openvla
   model:
-    model_path: "/path/to/model/rl4vla/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
+    model_path: "/mnt/public2/zhouyiming/RLinf_autotest_pr/model/openvla-7b-rlvla-warmup/" # https://huggingface.co/gen-robot/openvla-7b-rlvla-warmup
     model_type: "openvla"
     add_value_head: True
     is_lora: True

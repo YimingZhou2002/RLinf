@@ -48,9 +48,17 @@ fi
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 
 echo "Using Python at $(which python)"
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
+# Prefer a caller-supplied log dir (e.g. batch_run.py passes the per-run dir so
+# stdout, snapshot and rl-logger outputs all land in one place). Fall back to a
+# timestamped dir for standalone invocations.
+LOG_DIR="${RUN_LOG_DIR:-${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}}" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+# Publish the run log dir so the timeline/nvitop/nvml sidecar profiler
+# (RLINF_TIMELINE_DIR=auto) resolves its output under this run's dir. RLinf's
+# scheduler propagates this to Ray workers, so env workers—whose cfg is env.train
+# and lacks runner.logger.log_path—stop falling back to <cwd>/timeline.
+export RLINF_LOG_DIR="${LOG_DIR}"
+CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} ${EXTRA_OVERRIDES}"
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}

@@ -1,0 +1,20 @@
+# Verification batch for the tuner offload-patch fix.
+# Purpose: confirm the timeline now captures actor + env offload actions.
+#   - baseline         : all three offload switches = true  -> expect actor/env/rollout offload events
+#   - offload_actor_false: actor offload off            -> expect NO actor offload events, env/rollout still present
+#   - offload_env_false   : env offload off             -> expect NO env offload events, actor/rollout still present
+config_name: maniskill_ppo_openvla
+robot_platform: LIBERO
+
+runs:
+  - name: baseline
+    component_placement: {actor: "0-7", env: "0-3", rollout: "4-7"}
+    rollout: {enable_offload: true}
+    env_train: {enable_offload: true, total_num_envs: 128, rollout_epoch: 1}
+    actor: {enable_offload: true, micro_batch_size: 80}
+
+  - name: offload_actor_false
+    actor: {enable_offload: false}
+
+  - name: offload_env_false
+    env_train: {enable_offload: false}

@@ -1,0 +1,12 @@
+# Verification run for the tuner offload-patch fix (baseline only, fast).
+# Expect: actor offload (offload_param_and_grad/offload_optimizer/load_param_and_grad/load_optimizer)
+# AND env onload/offload events all captured in this run's timeline/ dir.
+config_name: maniskill_ppo_openvla
+robot_platform: LIBERO
+
+runs:
+  - name: baseline
+    component_placement: {actor: "0-7", env: "0-3", rollout: "4-7"}
+    rollout: {enable_offload: true}
+    env_train: {enable_offload: true, total_num_envs: 128, rollout_epoch: 1}
+    actor: {enable_offload: true, micro_batch_size: 80}

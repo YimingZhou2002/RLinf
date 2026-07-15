@@ -1,0 +1,39 @@
+# Batch run driver config for `run_embodiment.sh`.
+# Edit the `runs` list below, then launch with:
+#   bash toolkits/batch_run/run_batch.sh [path/to/another_batch_runs.yaml]
+#
+# Each entry drives one serial invocation of run_embodiment.sh. Fields that are
+# omitted fall back to the config yaml defaults (no override is emitted).
+#
+# Recognized per-run fields (the "minimal set"):
+#   name                  : required, short label used as the per-run log subdir
+#   component_placement   : {actor, env, rollout}  -> cluster.component_placement.*
+#   rollout               : {enable_offload}        -> rollout.enable_offload
+#   env_train             : {total_num_envs, rollout_epoch}
+#                                                -> env.train.total_num_envs / env.train.rollout_epoch
+#   actor                 : {micro_batch_size}      -> actor.micro_batch_size
+#   extra                 : free-form list of raw Hydra dotted overrides (optional, escape hatch)
+
+config_name: maniskill_ppo_openvla
+robot_platform: LIBERO   # passed to run_embodiment.sh as $2 (LIBERO/ALOHA/BRIDGE)
+
+runs:
+  - name: baseline
+    component_placement: {actor: "0-7", env: "0-3", rollout: "4-7"}
+    rollout: {enable_offload: true}
+    env_train: {total_num_envs: 128, rollout_epoch: 1}
+
+  - name: no_offload_big_env
+    component_placement: {actor: "0-7", env: "0-3", rollout: "4-7"}
+    rollout: {enable_offload: false}
+    env_train: {total_num_envs: 256, rollout_epoch: 2}
+    actor: {micro_batch_size: 40}
+
+  # Short smoke run: uncomment to validate the harness end-to-end without full training.
+  # - name: smoke
+  #   component_placement: {actor: "0-7", env: "0-3", rollout: "4-7"}
+  #   rollout: {enable_offload: true}
+  #   env_train: {total_num_envs: 32, rollout_epoch: 1}
+  #   extra:
+  #     - "runner.max_steps=10"
+  #     - "runner.max_epochs=1"

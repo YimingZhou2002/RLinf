@@ -1,0 +1,94 @@
+# OFAT 参数影响分析 batch 配置
+#
+# 用法:
+#   bash toolkits/batch_run/run_batch.sh toolkits/batch_run/batch_runs_ofat.yaml
+#
+# 设计: 控制变量法 (OFAT, One-Factor-At-A-Time)。每条 run 只改一个变量,
+#       其余保持默认 (见下方 DEFAULT 块), 便于把耗时 / 显存 / 收敛差异归因到单一变量。
+#       跑完后查看 logs/batch_<ts>/summary.md 横向对比各维影响。
+#
+# ── DEFAULT (来自 maniskill_ppo_openvla.yaml, 8 卡 0-7) ──────────────────────
+#   cluster.component_placement.actor   = 0-7
+#   cluster.component_placement.env     = 0-3
+#   cluster.component_placement.rollout = 4-7
+#   rollout.enable_offload              = true
+#   env.train.enable_offload            = true
+#   actor.enable_offload                = true
+#   env.train.total_num_envs            = 128
+#   env.train.rollout_epoch             = 1
+#   actor.micro_batch_size              = 80
+# ──────────────────────────────────────────────────────────────────────────────
+# 注: offload 有三处独立开关 (rollout / env.train / actor), 默认都是 true。
+#     本 batch 把它拆成三个独立 OFAT 子维, 各自只扫 false (true 由 baseline 覆盖),
+#     以单独观察关闭每个组件 offload 的影响。
+#     每条 run 不显式写的字段 = 上面默认值。各维的"默认值点"保留作单维内部对照,
+#     全表共享同一 baseline, 横向即可读出趋势。如需最短跑可注释掉带 "(=default)" 的条目。
+
+config_name: maniskill_ppo_openvla
+robot_platform: LIBERO
+
+runs:
+  # ===== 全默认参照 =====
+  - name: baseline  # 全默认, 全表对照基准
+    component_placement: {actor: "0-7", env: "0-3", rollout: "4-7"}
+    rollout: {enable_offload: true}
+    env_train: {enable_offload: true, total_num_envs: 128, rollout_epoch: 1}
+    actor: {enable_offload: true, micro_batch_size: 80}
+
+  # ===== 维度 1: component_placement (2 点) =====
+  # 调三种 component 的 GPU 划分, 其余默认。
+  #   - default     : actor=0-7, env=0-3, rollout=4-7 (原状; 与 baseline 等价, 内部对照)
+  #   - allshared   : 三个 component 都占 0-7, 最大化重叠共享 (env 与 actor 共卡, 观察显存/算力争用)
+  - name: placement_default  # (=default) 单维内部对照
+    component_placement: {actor: "0-7", env: "0-3", rollout: "4-7"}
+  - name: placement_allshared
+    component_placement: {actor: "0-7", env: "0-7", rollout: "0-7"}
+
+  # ===== 维度 2: enable_offload (3 个独立子维, 各 1 点) =====
+  # offload 有三处独立开关 (rollout / env.train / actor), 默认都是 true。
+  # 每条只关闭一处, 其余保持 true, 单独观察该组件 offload 的影响。
+  - name: offload_rollout_false
+    rollout: {enable_offload: false}
+  - name: offload_env_false
+    env_train: {enable_offload: false}
+  - name: offload_actor_false
+    actor: {enable_offload: false}
+
+  # ===== 维度 3: env.train.total_num_envs (5 点) =====
+  # 默认 128。取 2 的幂贴合 env 并行度。其余默认 (rollout_epoch=1)。
+  - name: tne_32
+    env_train: {total_num_envs: 32, rollout_epoch: 1}
+  - name: tne_64
+    env_train: {total_num_envs: 64, rollout_epoch: 1}
+  - name: tne_128  # (=default) 单维内部对照
+    env_train: {total_num_envs: 128, rollout_epoch: 1}
+  - name: tne_256
+    env_train: {total_num_envs: 256, rollout_epoch: 1}
+  # - name: tne_512  # 边界: 可能变慢或显存吃紧
+  #   env_train: {total_num_envs: 512, rollout_epoch: 1}
+
+  # ===== 维度 4: env.train.rollout_epoch (5 点) =====
+  # 默认 1。其余默认 (total_num_envs=128)。
+  - name: re_1  # (=default) 单维内部对照
+    env_train: {total_num_envs: 128, rollout_epoch: 1}
+  - name: re_2
+    env_train: {total_num_envs: 128, rollout_epoch: 2}
+  - name: re_3
+    env_train: {total_num_envs: 128, rollout_epoch: 3}
+  # - name: re_4
+  #   env_train: {total_num_envs: 128, rollout_epoch: 4}
+  # - name: re_5
+  #   env_train: {total_num_envs: 128, rollout_epoch: 5}
+
+  # ===== 维度 5: actor.micro_batch_size (5 点) =====
+  # 默认 80。取显存阶梯点。160/320 可能 OOM —— 这是预期要观察的可行上界, FAIL 会被驱动器记录后继续。
+  - name: mbs_20
+    actor: {micro_batch_size: 20}
+  - name: mbs_40
+    actor: {micro_batch_size: 40}
+  - name: mbs_80  # (=default) 单维内部对照
+    actor: {micro_batch_size: 80}
+  - name: mbs_160  # 边界: 可能 OOM
+    actor: {micro_batch_size: 160}
+  # - name: mbs_320  # 边界: 大概率 OOM
+  #   actor: {micro_batch_size: 320}
