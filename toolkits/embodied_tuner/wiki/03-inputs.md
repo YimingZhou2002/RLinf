@@ -16,10 +16,12 @@ Rendered top-to-bottom by `CriticPrompt.__str__`
 4. Current knobs + legal ranges (§5).
 5. Hard constraints reminder (§6).
 6. Memory pressure block — conditional (§7).
-7. Metric summary compact (§8).
-8. Timeline verbose (§9).
-9. Rationale schema — the output shape the critic must emit.
-10. Feedback block — appended on retry only.
+7. GPU memory summary block (§7.5) — present when the last trial has nvitop data.
+8. Metric summary compact (§8).
+9. Timeline verbose (§9).
+10. GPU memory verbose block — reserved slot, raw nvitop JSONL; default empty (§7.5).
+11. Rationale schema — the output shape the critic must emit.
+12. Feedback block — appended on retry only.
 
 The wiki is always at the top, so every later block builds on the
 definitions in `01-concepts.md`.
@@ -96,12 +98,142 @@ Authoritative for: nothing new — it is a redundancy safeguard. Consult
 
 ## 7. Memory pressure block
 
-Header: `## Memory pressure (last trial failed with OOM)`. Emitted
-only when `last_failure_mode == "OOM"`. Directs the critic toward
+Header: `## Memory pressure (last trial failed with OOM)`. Emitted only
+when `last_failure_mode == "OOM"`. Directs the critic toward
 memory-reducing knobs.
 
-Authoritative for: the "next delta must reduce memory" gate. Also see
-`06-playbook.md §8` (memory-triage cascade) and `08-gotchas.md §5`.
+**`last_failure_mode` is the expand-from parent's mode, not the most
+recent trial's.** The scheduler derives this slot from the
+`## Search DAG` active leaf — the config your next delta is layered on
+(`09-dag-search.md §2`). On a rollback failure the scheduler rewinds
+the active leaf to the *parent*, and `last_failure_mode` reverts with
+it: a reverted sibling's OOM does **not** fire this block. Concretely,
+after `root → OK(A) → OOM(B)`, the active leaf is `A`; this block fires
+only if `A` itself failed with OOM, not because `B` did. `B`'s OOM is
+surfaced as a `Recent failure leaf` in the DAG view + a required
+`bitter_lesson`, never as current memory pressure. So if this block
+is present, the config you are expanding from genuinely crashed on
+memory — follow the triage cascade. If it is absent, the memory you
+see in §7.1 is the parent's honest baseline, and a near-cap reading
+there is a soft-pressure hint (`max_mem_occ >= 85%`), not a mandate.
+
+Authoritative for: the "next delta must reduce memory" gate — but only
+for pressure that belongs to the expand-from config, not a reverted
+sibling. Also see `06-playbook.md §8` (memory-triage cascade) and
+`08-gotchas.md §5`.
+
+## 7.1. GPU memory summary block
+
+Header: `## Last trial — GPU memory (from nvitop summary)`. Present
+whenever the expand-from trial produced nvitop data (the parser builds
+a `MemorySummary` from the `nvitop_summary.json` sidecar that
+`profiler/plot_nvitop.py` writes alongside `nvitop_summary.log`; for
+older trials it falls back to parsing the text log). Survives
+`CriticPrompt.to_debug_text()` so a human debugger sees the same
+memory numbers the critic acted on.
+
+**"Last trial" here = the expand-from parent, not the most recent
+launched trial.** Like `last_failure_mode` (§7), the scheduler sources
+this block from the `## Search DAG` active leaf. On a rollback failure
+the active leaf rewinds to the parent, so this block reverts to the
+parent's nvitop data — the failed sibling's inflated numbers (e.g.
+occupancy from the very delta that was reverted) do NOT appear here.
+After `root → OK(A) → OOM(B)`, this block shows `A`'s memory; `B`'s
+memory is visible only as the `Recent failure leaf` line + the OOM
+traceback in `## Trial History`, never as the "current" memory state.
+
+Carries: total sample count + span, the device cap
+(`gpu_total_gib`), the global peak process GPU memory, peak memory
+occupancy (`max_mem_occ` — used/total ratio), and peak `max_mem_util`
+(NVML memory-controller busy ratio, kept as a diagnostic), a per-GPU
+row (index / `max_mem` / `max_mem_occ` / `max_mem_util` /
+`max_gpu_util`), a per-process row
+(`<component>/r<rank>/pid…` / `max_process_gpu_mem` / `gpu_indices`),
+and a pointer to the nvitop curve render — `nvitop_resources.png` /
+`nvitop_resources.html` written by `profiler/plot_nvitop.py` (the
+legacy `nvitop_curves.png` name is also discovered); text-only
+transport, the image is not embedded.
+
+**`max_mem_occ` vs `max_mem_util` — do not confuse them.**
+`max_mem_occ` is the *occupancy* ratio (used / device-cap): how full
+device memory actually got. `max_mem_util` is NVML's
+memory-controller *busy* ratio (bandwidth): what fraction of the
+sample window the memory controller was active. A near-full card can
+report low `max_mem_util` if memory is not being actively read or
+written at that instant — so only `max_mem_occ` is a reliable
+pressure signal. Example from a real trial: peak occupancy
+`63.6 / 80 = 79.5%` while `max_mem_util` was only `57%`.
+
+**Soft-pressure signal.** A `WARNING: memory pressure …` line appears
+when `peak_mem_occ_percent >= 85%` — i.e. peak used/total crossed the
+threshold — *even if the trial did not OOM*. (Occupancy subsumes the
+legacy `peak_gpu_mem_gib / gpu_total_gib >= 0.85` clause, since
+occupancy IS used/total, so the two collapsed into one check.) This
+is the new signal the OOM-only §7 block could not provide: it lets
+you tighten the memory envelope *before* a crash. When this warning is
+present, prefer memory-reducing knobs (`enable_offload` flips, lower
+`total_num_envs` / `micro_batch_size`) exactly as in the §8 triage
+cascade — the difference is you are acting on a near-miss rather than
+a failure.
+
+Authoritative for: how close the last trial came to the device cap,
+and which component/GPU is the memory hog (per-process +
+`gpu_indices`). The legacy scalar `peak_gpu_mem` in the ledger is a
+convenience; the per-GPU / per-process breakdown here is the truth.
+
+**Per-rank attribution.** The per-process row attributes a rank's
+device-level `max_mem` / `max_mem_occ` to the components that share
+that rank: filter the per-process rows by `gpu_indices` containing
+the rank index, and their `max_process_gpu_mem` is each component's
+own peak footprint on it. The relationship is additive *only when
+the components are co-resident at the peak instant*:
+
+> sum of per-process `max_process_gpu_mem` on a rank **≥** the
+> rank's device `max_mem`, with equality iff every component sharing
+> the rank is simultaneously resident at the device-peak instant —
+> i.e. none of them is offloaded *and* their phases overlap.
+
+Why the inequality: each `max_process_gpu_mem` is the component's own
+peak, sampled at its own instant; peaks of different components on a
+shared rank need not coincide. A component whose
+`<component>.enable_offload=true` moves its weights/state to CPU
+between phases, so it is **absent from the rank during the other
+component's peak** and contributes nothing to the device peak at that
+instant — even though its own `max_process_gpu_mem` is unchanged.
+Consequence: the device peak is `max over time of (sum of the
+components resident at that instant)`, which is ≤ the naive sum of
+all per-process peaks. This is exactly how offload rescues a shared
+rank (see `06-playbook.md §8.4`).
+
+Real example (hybrid, `rollout.enable_offload=true`): on gpu2, actor
+`r2` peaks at 62.7 GiB and rollout `r0` at 21.6 GiB. The naive sum
+is 84.3 GiB — above the 80 GiB cap — yet the device peak is only
+63.87 GiB, because rollout is offloaded and not resident during
+actor's peak. On gpu0 by contrast, actor (`63.0`) + env (`0.6`) are
+both always resident, so the sum (63.6) equals the device peak.
+Read the per-process rows + `gpu_indices` together with the offload
+flags in the current-knobs block before attributing a rank's peak to
+a component.
+
+### 7.2 GPU memory verbose block (reserved, default empty)
+
+Header: `## Last trial — raw nvitop JSONL`. Mirrors the timeline raw
+JSONL slot (§9.6): one fenced block per selected
+`<component>_rank<N>_pid<PID>.jsonl` trace from `<log_dir>/nvitop/`,
+each line one sample
+`{ts, global_step, gpus:[{memory_used_gib, gpu_util_percent,
+memory_util_percent, …}], process_gpu_memory_gib, …}`. Excluded
+from `to_debug_text()`.
+
+**Default: NOT injected.** The parser's `NvitopFeedMode` defaults to
+`NONE`, so the critic sees only the aggregated §7.5 block. Raw nvitop
+traces are large (≈0.7–0.8 MB each; actor traces run larger than
+rollout/env), so raw injection is opt-in via the
+`--nvitop-feed-mode {none,per_component_latest,all}` CLI flag.
+`per_component_latest` picks the straggler rank per component; `all`
+dumps every file (long-context critics only). Cite raw lines by file
+stem + line number when the aggregated block is not enough to justify
+a delta.
 
 ## 8. Metric summary compact
 

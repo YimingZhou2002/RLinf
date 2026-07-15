@@ -684,3 +684,113 @@ def test_bitter_lesson_signature_uses_incremental_proposal(tmp_path: Path) -> No
     assert lessons[0].delta_signature == canonical_delta_signature(
         {"rollout.enable_offload": False}
     )
+
+
+# ---------------------------------------------------------------------------
+# DAG rollback: evidence fed to the post-OOM proposal must come from the
+# expand-from parent, not the failed sibling (the bug that made the critic
+# do memory triage against a reverted OOM's 98% occupancy).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CapturingCritic(FakeCritic):
+    """FakeCritic that records the ``last_*`` kwargs of every ``propose``."""
+
+    seen: list[dict[str, Any]] = field(default_factory=list)
+
+    def propose(self, **kwargs: Any) -> CriticOutput:
+        self.seen.append(
+            {
+                "last_failure_mode": kwargs.get("last_failure_mode"),
+                "last_sibling_failure_mode": kwargs.get("last_sibling_failure_mode"),
+                "last_memory_summary": kwargs.get("last_memory_summary"),
+            }
+        )
+        return super().propose(**kwargs)
+
+
+def test_rollback_feeds_parent_evidence_not_failed_sibling(tmp_path: Path) -> None:
+    """Live-loop rollback: the proposal after an OOM sibling sees the parent.
+
+    Trial 0 (A): OK. Trial 1 (B): OOM -> scheduler rolls back to A. The
+    NEXT proposal (C) must therefore see A's evidence -- ``last_failure_mode
+    == NONE`` and A's ``last_memory_summary`` -- so the memory-pressure
+    block does NOT fire for B's reverted OOM, while B still drives the
+    bitter-lesson requirement via ``last_sibling_failure_mode == OOM``.
+    """
+    from toolkits.embodied_tuner.node_store import NodeStore
+    from toolkits.embodied_tuner.parser import MemorySummary
+
+    ledger = Ledger(tmp_path / "ledger.jsonl", fsync_on_append=False)
+    node_store = NodeStore(tmp_path / "nodes.jsonl", fsync_on_append=False)
+    # Per-trial memory marker so we can tell parent A's evidence from
+    # failed sibling B's: A peaks at 10 GiB, B at 99 GiB, C (post-rollback
+    # recovery) at 20 GiB. Only A's marker (10) must reach the post-OOM
+    # proposal -- not B's reverted 99.
+    mem_markers = [10.0, 99.0, 20.0]
+
+    def runner_fn(delta, preflight, trial_idx):  # noqa: ANN001
+        log_dir = tmp_path / f"trial-{trial_idx}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return _fake_outcome(log_dir)
+
+    def parser_fn(outcome):  # noqa: ANN001
+        idx = int(outcome.log_dir.name.split("-")[-1])
+        ok = idx != 1  # trial 1 (B) is the OOM; trials 0 and 2 are OK
+        ms = MemorySummary(
+            samples=10,
+            span_s=5.0,
+            gpu_total_gib=80.0,
+            peak_gpu_mem_gib=mem_markers[idx],
+            per_gpu=(
+                {"index": 0, "max_mem": mem_markers[idx], "memory_total_gib": 80.0},
+            ),
+        )
+        return TrialResult(
+            log_dir=outcome.log_dir,
+            status=Status.OK if ok else Status.FAILED,
+            failure_mode=FailureMode.NONE if ok else FailureMode.OOM,
+            objective=1.0 if ok else None,
+            step_time_seconds=1.0 if ok else None,
+            num_trajectories=10 if ok else None,
+            memory_summary=ms,
+        )
+
+    def preflight_fn(delta):  # noqa: ANN001
+        return _ok_preflight(delta, tmp_path / f"pf-{delta}")
+
+    critic = _CapturingCritic.from_outputs(
+        CriticOutput(delta={"a": 1}, rationale=Rationale(summary="A")),          # trial 0
+        CriticOutput(delta={"b": 2}, rationale=Rationale(summary="B-oom")),       # trial 1 (OOM)
+        _output_with_lesson(
+            {"c": 3},
+            trigger="B OOM",
+            rule="do not repeat b",
+        ),  # trial 2 proposal (post-rollback)
+    )
+    scheduler = Scheduler(
+        critic=critic,
+        runner_fn=runner_fn,
+        parser_fn=parser_fn,
+        preflight_fn=preflight_fn,
+        ledger=ledger,
+        budget=BudgetConfig(max_trials=3, budget_seconds=999, max_oom=99),
+        baseline_knobs={},
+        node_store=node_store,
+    )
+    scheduler.run()
+
+    # 3 proposals: trial 0, trial 1, trial 2 (after B's OOM rolled back).
+    assert len(critic.seen) == 3
+    post_oom = critic.seen[2]
+    # Memory-pressure signal reflects the expand-from parent A (NONE), not
+    # the failed sibling B (OOM).
+    assert post_oom["last_failure_mode"] == FailureMode.NONE.value
+    # B's OOM still drives the bitter-lesson requirement.
+    assert post_oom["last_sibling_failure_mode"] == FailureMode.OOM.value
+    # Memory evidence is A's marker (10), not B's reverted 99.
+    assert post_oom["last_memory_summary"] is not None
+    assert (
+        post_oom["last_memory_summary"]["peak_gpu_mem_gib"] == 10.0
+    )

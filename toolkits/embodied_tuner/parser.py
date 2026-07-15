@@ -56,6 +56,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from toolkits.embodied_tuner.nvitop_feed import (
+    NvitopFeedMode,
+    collect_raw_nvitop_jsonl,
+    discover_curve_plots,
+    render_nvitop_summary,
+)
 from toolkits.embodied_tuner.timeline_feed import (
     JsonlFeedMode,
     collect_raw_jsonl,
@@ -201,6 +207,42 @@ class TimelineSummary:
 
 
 @dataclass(frozen=True)
+class MemorySummary:
+    """Aggregated GPU-memory summary for one trial (mirrors TimelineSummary).
+
+    Built by :func:`_load_memory_summary` from the structured
+    ``nvitop_summary.json`` sidecar produced by
+    :func:`profiler.plot_nvitop.write_nvitop_summary` (with a text-log
+    fallback for older trials). Unlike the legacy single-scalar
+    ``peak_gpu_mem_gib``, this carries per-GPU / per-component breakdowns
+    and a soft-pressure signal so the critic can reason quantitatively
+    about memory — not just the boolean "OOM happened".
+
+    The ``raw_nvitop_jsonl`` slot is a reserved insertion point for raw
+    per-sample nvitop traces; it is ``{}`` by default (NvitopFeedMode.NONE)
+    so raw traces do NOT enter the critic prompt unless explicitly opted
+    into — exactly mirroring ``TimelineSummary.raw_jsonl``.
+    """
+
+    samples: int | None = None
+    span_s: float | None = None
+    aggregate_bin_s: float | None = None
+    gpu_total_gib: float | None = None
+    peak_gpu_mem_gib: float | None = None
+    peak_mem_util_percent: float | None = None
+    # Peak memory occupancy ratio (used/total) across all GPUs. This is the
+    # "how full did device memory get" signal, distinct from
+    # ``peak_mem_util_percent`` which is NVML's memory-controller busy ratio
+    # (bandwidth). Soft-pressure logic keys off this field, not the
+    # controller-util one.
+    peak_mem_occ_percent: float | None = None
+    per_gpu: tuple[dict, ...] = ()
+    per_process: tuple[dict, ...] = ()
+    raw_nvitop_jsonl: dict[str, str] = field(default_factory=dict)
+    plot_paths: dict[str, Path] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class TrialResult:
     """Outcome of parsing a single trial directory.
 
@@ -219,6 +261,7 @@ class TrialResult:
     per_step: tuple[MetricStep, ...] = ()
     timeline_summary: TimelineSummary | None = None
     peak_gpu_mem_gib: float | None = None
+    memory_summary: MemorySummary | None = None
     returncode: int | None = None
     # Short (~40-line) tail-around-error slice for OOM / WORKER_CRASH /
     # DIVISIBILITY_VIOLATION / METRICS_MISSING trials. Empty for OK
@@ -282,6 +325,7 @@ def parse_trial(
     stderr_path: Path | str | None = None,
     enable_offload: Mapping[str, bool] | None = None,
     jsonl_feed_mode: JsonlFeedMode | None = None,
+    nvitop_feed_mode: NvitopFeedMode | None = None,
     plot_formats: Iterable[str] = ("png",),
 ) -> TrialResult:
     """Parse a trial directory and return a :class:`TrialResult`.
@@ -312,6 +356,16 @@ def parse_trial(
             (keeps prior behaviour). ``ALL`` dumps every file (may be
             hundreds of KB per trial — only viable for long-context
             critics).
+        nvitop_feed_mode: Which raw nvitop JSONL files to load into
+            ``MemorySummary.raw_nvitop_jsonl`` for the critic's
+            ``memory_verbose_block``. ``None`` (default) means
+            :attr:`~toolkits.embodied_tuner.nvitop_feed.NvitopFeedMode.NONE`
+            — raw per-sample GPU traces do NOT enter the prompt; the critic
+            sees only the aggregated :class:`MemorySummary` (per-GPU /
+            per-component peak+avg, device cap, soft-pressure flag). Unlike
+            the timeline, raw nvitop traces are large (~660 KB each), so raw
+            injection is opt-in. ``PER_COMPONENT_LATEST`` picks the
+            straggler rank per component; ``ALL`` dumps every file.
         plot_formats: Which Gantt formats to render alongside the trial
             via :func:`profiler.plot_timeline`. Defaults to ``("png",)``
             because that is what critics can attach as an image. Pass
@@ -337,6 +391,28 @@ def parse_trial(
             returncode=returncode,
         )
 
+    # GPU-memory summary is best-effort and computed once, early, so EVERY
+    # downstream branch (TIMEOUT / OOM / WORKER_CRASH / METRICS_MISSING /
+    # OK) can carry it. An OOM-killed trial that ran for a while still has
+    # nvitop samples up to the crash — the critic needs that pre-crash
+    # peak, so we do NOT gate this on success.
+    nvitop_dir = log_dir / "nvitop"
+    memory_summary = _load_memory_summary(nvitop_dir)
+    active_nvitop_mode = (
+        nvitop_feed_mode
+        if nvitop_feed_mode is not None
+        else NvitopFeedMode.NONE
+    )
+    if memory_summary is not None and active_nvitop_mode is not NvitopFeedMode.NONE:
+        raw_nvitop = collect_raw_nvitop_jsonl(nvitop_dir, mode=active_nvitop_mode)
+        if raw_nvitop:
+            memory_summary = dataclasses.replace(
+                memory_summary, raw_nvitop_jsonl=raw_nvitop
+            )
+    peak_mem = (
+        memory_summary.peak_gpu_mem_gib if memory_summary is not None else None
+    )
+
     if timed_out:
         return TrialResult(
             log_dir=log_dir,
@@ -344,6 +420,7 @@ def parse_trial(
             failure_mode=FailureMode.TIMEOUT,
             reason="runner timed out the trial",
             returncode=returncode,
+            memory_summary=memory_summary,
         )
 
     metrics_path = log_dir / "metrics.log"
@@ -378,6 +455,8 @@ def parse_trial(
                 reason=f"detected via {effective_stderr_path}",
                 returncode=returncode,
                 per_step=per_step_for_failure,
+                peak_gpu_mem_gib=peak_mem,
+                memory_summary=memory_summary,
                 error_excerpt=_extract_error_excerpt(effective_stderr_path, oom_mode),
             )
 
@@ -389,6 +468,8 @@ def parse_trial(
             failure_mode=FailureMode.METRICS_MISSING,
             reason=f"metrics.log not found at {metrics_path}",
             returncode=returncode,
+            peak_gpu_mem_gib=peak_mem,
+            memory_summary=memory_summary,
             error_excerpt=_extract_error_excerpt(
                 effective_stderr_path, FailureMode.METRICS_MISSING
             ),
@@ -402,6 +483,8 @@ def parse_trial(
             failure_mode=FailureMode.METRICS_MISSING,
             reason=f"failed to parse metrics.log: {exc}",
             returncode=returncode,
+            peak_gpu_mem_gib=peak_mem,
+            memory_summary=memory_summary,
             error_excerpt=_extract_error_excerpt(
                 effective_stderr_path, FailureMode.METRICS_MISSING
             ),
@@ -422,6 +505,8 @@ def parse_trial(
             reason="metrics.log contained no MetricTable blocks",
             returncode=returncode,
             per_step=(),
+            peak_gpu_mem_gib=peak_mem,
+            memory_summary=memory_summary,
             error_excerpt=_extract_error_excerpt(
                 effective_stderr_path, FailureMode.METRICS_MISSING
             ),
@@ -472,8 +557,6 @@ def parse_trial(
     if final_num_traj is None:
         reasons.append("final MetricTable block has no num_trajectories field")
 
-    peak_mem = _read_peak_gpu_mem(log_dir / "nvitop")
-
     if returncode not in (None, 0):
         # Non-OOM, non-crash failure with usable metrics → WORKER_CRASH.
         return TrialResult(
@@ -485,6 +568,7 @@ def parse_trial(
             per_step=per_step,
             timeline_summary=timeline_summary,
             peak_gpu_mem_gib=peak_mem,
+            memory_summary=memory_summary,
             error_excerpt=_extract_error_excerpt(
                 effective_stderr_path, FailureMode.WORKER_CRASH
             ),
@@ -502,6 +586,7 @@ def parse_trial(
             per_step=per_step,
             timeline_summary=timeline_summary,
             peak_gpu_mem_gib=peak_mem,
+            memory_summary=memory_summary,
             returncode=returncode,
         )
 
@@ -515,6 +600,7 @@ def parse_trial(
         per_step=per_step,
         timeline_summary=timeline_summary,
         peak_gpu_mem_gib=peak_mem,
+        memory_summary=memory_summary,
         returncode=returncode,
     )
 
@@ -859,21 +945,240 @@ def _extract_error_excerpt(
     return excerpt
 
 
-def _read_peak_gpu_mem(nvitop_dir: Path) -> float | None:
-    """Best-effort peak-GPU-memory read; ``None`` when ``nvitop/`` is absent."""
-    summary = nvitop_dir / "nvitop_summary.log"
-    if not summary.is_file():
+def _parse_nvitop_summary_log_text(text: str) -> MemorySummary | None:
+    """Back-compat fallback: parse a legacy ``nvitop_summary.log`` text.
+
+    Used only when the structured ``nvitop_summary.json`` sidecar is absent
+    (trials produced before the sidecar existed). Parses the
+    ``global_gpu_summary`` and ``process_summary`` sections into the same
+    :class:`MemorySummary` shape the sidecar would have yielded, and —
+    unlike the legacy ``_read_peak_gpu_mem`` regex — takes the true global
+    peak as ``max`` across ALL per-process ``max_process_gpu_mem`` lines
+    (not just the first one, which was component-order-dependent and could
+    silently report the wrong component).
+    """
+    if not text:
         return None
-    try:
-        text = summary.read_text(errors="replace")
-    except OSError:
+
+    def _num(token: str) -> float | None:
+        token = token.strip()
+        if not token or token == "n/a":
+            return None
+        try:
+            return float(token)
+        except ValueError:
+            return None
+
+    per_gpu: list[dict] = []
+    per_process: list[dict] = []
+    samples: int | None = None
+    span_s: float | None = None
+    aggregate_bin_s: float | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("samples:"):
+            try:
+                samples = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("span_s:"):
+            span_s = _num(line.split(":", 1)[1])
+        elif line.startswith("aggregate_bin_s:"):
+            aggregate_bin_s = _num(line.split(":", 1)[1])
+        elif line.startswith("gpu") and ":" in line and "avg_mem=" in line:
+            kv = dict(
+                _kv_pair(part)
+                for part in line.split(",")
+                if "=" in part
+            )
+            try:
+                index = int(line.split(":", 1)[0].replace("gpu", "").strip())
+            except ValueError:
+                continue
+            per_gpu.append(
+                {
+                    "index": index,
+                    "avg_mem": _num(kv.get("avg_mem", "")),
+                    "max_mem": _num(kv.get("max_mem", "")),
+                    "avg_gpu_util": _num(kv.get("avg_gpu_util", "")),
+                    "max_gpu_util": _num(kv.get("max_gpu_util", "")),
+                    "avg_mem_util": _num(kv.get("avg_mem_util", "")),
+                    "max_mem_util": _num(kv.get("max_mem_util", "")),
+                    # Occupancy (used/total) ratio. Absent on legacy logs → None,
+                    # which the soft-pressure path tolerates.
+                    "avg_mem_occ_percent": _num(kv.get("avg_mem_occ", "")),
+                    "max_mem_occ_percent": _num(kv.get("max_mem_occ", "")),
+                    "memory_total_gib": None,
+                }
+            )
+        elif "/" in line and line.split(":", 1)[0].count("/") >= 2 and ":" in line:
+            # process_summary line: "component/rN/pidM: avg_rss=..., ..."
+            label_part, _, rest = line.partition(":")
+            label = label_part.strip()
+            kv = dict(_kv_pair(part) for part in rest.split(",") if "=" in part)
+            component_rank_pid = label.split("/")
+            if len(component_rank_pid) != 3:
+                continue
+            component = component_rank_pid[0]
+            try:
+                rank = int(component_rank_pid[1].replace("r", ""))
+            except ValueError:
+                rank = -1
+            try:
+                pid = int(component_rank_pid[2].replace("pid", ""))
+            except ValueError:
+                pid = -1
+            gpu_idx_token = kv.get("gpu_indices", "n/a")
+            if gpu_idx_token and gpu_idx_token != "n/a":
+                try:
+                    gpu_indices = [
+                        int(x.strip())
+                        for x in gpu_idx_token.strip("[]").split(",")
+                        if x.strip()
+                    ]
+                except ValueError:
+                    gpu_indices = []
+            else:
+                gpu_indices = []
+            per_process.append(
+                {
+                    "label": label,
+                    "component": component,
+                    "rank": rank,
+                    "pid": pid,
+                    "avg_rss": _num(kv.get("avg_rss", "")),
+                    "max_rss": _num(kv.get("max_rss", "")),
+                    "avg_cpu": _num(kv.get("avg_cpu", "")),
+                    "max_cpu": _num(kv.get("max_cpu", "")),
+                    "avg_process_gpu_mem": _num(kv.get("avg_process_gpu_mem", "")),
+                    "max_process_gpu_mem": _num(kv.get("max_process_gpu_mem", "")),
+                    "avg_process_gpu_util": _num(kv.get("avg_process_gpu_util", "")),
+                    "max_process_gpu_util": _num(kv.get("max_process_gpu_util", "")),
+                    "gpu_indices": gpu_indices,
+                }
+            )
+
+    if not per_gpu and not per_process:
         return None
-    # nvitop_summary.log contains lines like ``max_process_gpu_mem=25.3 GiB``;
-    # tolerate either form to keep this parser robust to schema drift.
-    match = re.search(r"max_process_gpu_mem[\s:=]+([0-9.]+)\s*GiB", text, re.IGNORECASE)
-    if match is None:
+
+    peak = _safe_max([p.get("max_process_gpu_mem") for p in per_process])
+    peak_util = _safe_max([g.get("max_mem_util") for g in per_gpu])
+    peak_occ = _safe_max([g.get("max_mem_occ_percent") for g in per_gpu])
+    return MemorySummary(
+        samples=samples,
+        span_s=span_s,
+        aggregate_bin_s=aggregate_bin_s,
+        gpu_total_gib=None,
+        peak_gpu_mem_gib=peak,
+        peak_mem_util_percent=peak_util,
+        peak_mem_occ_percent=peak_occ,
+        per_gpu=tuple(per_gpu),
+        per_process=tuple(per_process),
+    )
+
+
+def _kv_pair(part: str) -> tuple[str, str]:
+    """Split ``avg_mem=24.231 GiB`` -> ``("avg_mem", "24.231")``."""
+    key, _, value = part.partition("=")
+    # Strip the unit suffix (``GiB`` / ``%``); _num tolerates bare numbers.
+    value = value.strip().split()[0] if value.strip() else ""
+    return key.strip(), value
+
+
+def _safe_max(values: list) -> float | None:
+    nums = [v for v in values if v is not None]
+    return max(nums) if nums else None
+
+
+def _load_memory_summary(nvitop_dir: Path) -> MemorySummary | None:
+    """Build a :class:`MemorySummary` for a trial's ``nvitop/`` dir.
+
+    Resolution order (mirrors the timeline sidecar pattern, but with a
+    text-log back-compat fallback):
+
+    1. Read the structured ``nvitop_summary.json`` sidecar (produced by
+       :func:`profiler.plot_nvitop.write_nvitop_summary`). Zero regex,
+       zero drift, carries ``gpu_total_gib`` (device cap).
+    2. If the sidecar is absent (legacy trial), parse the
+       ``nvitop_summary.log`` text via :func:`_parse_nvitop_summary_log_text`.
+    3. If neither exists but raw ``*.jsonl`` traces do, call
+       :func:`nvitop_feed.render_nvitop_summary` to generate the sidecar
+       on the fly, then read it.
+
+    Returns ``None`` when no nvitop data exists at all. Best-effort: never
+    raises — a missing memory summary must not change trial classification.
+    """
+    if not nvitop_dir.is_dir():
         return None
-    try:
-        return float(match.group(1))
-    except ValueError:
-        return None
+
+    plot_paths = discover_curve_plots(nvitop_dir)
+
+    sidecar = nvitop_dir / "nvitop_summary.json"
+    if sidecar.is_file():
+        try:
+            import json
+
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if data is not None:
+            return _memory_summary_from_sidecar(data, plot_paths)
+
+    log_path = nvitop_dir / "nvitop_summary.log"
+    if log_path.is_file():
+        try:
+            text = log_path.read_text(errors="replace")
+        except OSError:
+            text = ""
+        summary = _parse_nvitop_summary_log_text(text)
+        if summary is not None:
+            return dataclasses.replace(summary, plot_paths=plot_paths)
+
+    # Last resort: generate the sidecar from raw traces, then read it.
+    generated = render_nvitop_summary(nvitop_dir)
+    if generated is not None and sidecar.is_file():
+        try:
+            import json
+
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if data is not None:
+            return _memory_summary_from_sidecar(data, plot_paths)
+
+    return None
+
+
+def _memory_summary_from_sidecar(
+    data: dict, plot_paths: dict
+) -> MemorySummary:
+    """Build a :class:`MemorySummary` from a ``nvitop_summary.json`` dict."""
+    per_gpu = tuple(data.get("per_gpu", ()))
+    per_process = tuple(data.get("per_process", ()))
+    peak = _safe_max([p.get("max_process_gpu_mem") for p in per_process])
+    peak_util = _safe_max([g.get("max_mem_util") for g in per_gpu])
+    # True occupancy peak (used/total); falls back to deriving it from
+    # max_mem / memory_total_gib when the sidecar predates the
+    # max_mem_occ_percent field.
+    peak_occ = _safe_max([g.get("max_mem_occ_percent") for g in per_gpu])
+    if peak_occ is None:
+        for g in per_gpu:
+            mm = g.get("max_mem")
+            tot = g.get("memory_total_gib")
+            if mm is not None and tot:
+                occ = mm / tot * 100.0
+                if peak_occ is None or occ > peak_occ:
+                    peak_occ = occ
+    return MemorySummary(
+        samples=data.get("samples"),
+        span_s=data.get("span_s"),
+        aggregate_bin_s=data.get("aggregate_bin_s"),
+        gpu_total_gib=data.get("gpu_total_gib"),
+        peak_gpu_mem_gib=peak,
+        peak_mem_util_percent=peak_util,
+        peak_mem_occ_percent=peak_occ,
+        per_gpu=per_gpu,
+        per_process=per_process,
+        plot_paths=plot_paths,
+    )

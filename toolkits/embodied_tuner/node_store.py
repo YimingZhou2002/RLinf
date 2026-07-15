@@ -125,6 +125,7 @@ _REQUIRED_FIELDS: tuple[str, ...] = (
 _OPTIONAL_FIELDS: tuple[str, ...] = (
     "error_excerpt",
     "duplicate_of_node_id",
+    "memory_summary",
 )
 
 # Statuses that must never be persisted. Everything else (including any
@@ -193,6 +194,14 @@ class DAGNode:
     ts_end: float
     cleanup_outcome: str
     error_excerpt: str = ""
+    # Full nvitop ``MemorySummary`` projection (per-GPU / per-process
+    # breakdown + soft-pressure fields), mirroring
+    # :attr:`LedgerEntry.memory_summary`. Optional for backward compat:
+    # nodes persisted before this field was added load as ``None``. The
+    # scheduler reverts the critic's ``last_memory_summary`` to the parent
+    # node's value on a rollback failure, so the critic sees the
+    # expand-from parent's memory — not the failed sibling's.
+    memory_summary: Mapping[str, Any] | None = None
     duplicate_of_node_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:

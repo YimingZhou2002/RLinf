@@ -216,3 +216,57 @@ def test_resolved_config_sha_round_trips(tmp_path: Path) -> None:
     ledger = Ledger(tmp_path / "ledger.jsonl")
     ledger.append(_entry(sha="a" * 64))
     assert ledger.load().entries[0].resolved_config_sha == "a" * 64
+
+
+def test_memory_summary_round_trips_through_ledger(tmp_path: Path) -> None:
+    """The optional memory_summary field persists and reloads intact."""
+    memory = {
+        "samples": 2722,
+        "span_s": 1045.784,
+        "gpu_total_gib": 80.0,
+        "peak_gpu_mem_gib": 61.182,
+        "peak_mem_util_percent": 57.0,
+        "per_gpu": [{"index": 0, "max_mem": 61.74, "max_mem_util": 57.0}],
+        "per_process": [
+            {"label": "actor/r0/pid1", "component": "actor", "rank": 0, "pid": 1,
+             "max_process_gpu_mem": 61.182, "gpu_indices": [0]},
+        ],
+        "raw_nvitop_jsonl": {},
+        "plot_paths": {},
+    }
+    entry = make_entry(
+        trial_idx=0,
+        delta={"actor.micro_batch_size": 64},
+        resolved_config_sha="deadbeef",
+        log_dir="/tmp/trial-0",
+        returncode=0,
+        status="OK",
+        failure_mode="NONE",
+        objective=18.5,
+        step_time=200.0,
+        num_trajectories=18,
+        per_component_timings={"env/interact": 100.0},
+        timeline_summary=None,
+        peak_gpu_mem=61.182,
+        memory_summary=memory,
+        critic_rationale={"summary": "x", "metric_table_citations": [], "timeline_citations": []},
+        ts_start=1.0,
+        ts_end=2.0,
+        cleanup_outcome="ok",
+    )
+    ledger = Ledger(tmp_path / "tuner_ledger.jsonl", fsync_on_append=False)
+    ledger.append(entry)
+    loaded = ledger.load().entries
+    assert len(loaded) == 1
+    assert loaded[0].memory_summary == memory
+    assert loaded[0].peak_gpu_mem == 61.182  # legacy scalar preserved
+
+
+def test_legacy_ledger_without_memory_summary_loads_as_none(tmp_path: Path) -> None:
+    """Older ledger lines (pre-memory_summary) load with the field as None."""
+    entry = _entry(0)  # _entry does not set memory_summary
+    raw = entry.to_dict()
+    # Simulate a pre-memory_summary ledger line: drop the key entirely.
+    raw.pop("memory_summary", None)
+    restored = LedgerEntry.from_dict(raw)
+    assert restored.memory_summary is None

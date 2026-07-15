@@ -59,6 +59,7 @@ from toolkits.embodied_tuner.fake_critic import FakeCritic
 from toolkits.embodied_tuner.ledger import Ledger
 from toolkits.embodied_tuner.config_dedup_index import ConfigDedupIndex
 from toolkits.embodied_tuner.node_store import NodeStore
+from toolkits.embodied_tuner.nvitop_feed import NvitopFeedMode
 from toolkits.embodied_tuner.override_wrapper import LaunchSpec, OverrideWrapper
 from toolkits.embodied_tuner.parser import TrialResult, parse_trial
 from toolkits.embodied_tuner.preflight import (
@@ -73,6 +74,9 @@ from toolkits.embodied_tuner.scheduler import (
     Scheduler,
 )
 from toolkits.embodied_tuner.schema import KnobSchema
+from toolkits.embodied_tuner.utils.emit_all_responses import (
+    emit_all_responses,
+)
 from toolkits.embodied_tuner.utils.plot_step_time_vs_trajectories import (
     plot_ledger_dir,
 )
@@ -103,6 +107,7 @@ class CLIArgs:
     epsilon: float
     max_epochs: int
     collect_memory: bool
+    nvitop_feed_mode: str
     use_profiler: bool
     dry_run_preflight: bool
     fake_critic_path: Path | None
@@ -149,9 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trial-timeout-seconds",
         type=float,
-        default=2700.0,
+        default=7200,
         help=(
-            "Per-trial wall-clock budget in seconds (default 2700 = 45min). "
+            "Per-trial wall-clock budget in seconds (default 7200 = 120min). "
             "When a trial exceeds this, the runner escalates SIGTERM → SIGKILL "
             "and the trial is classified (FAILED, TIMEOUT)."
         ),
@@ -161,8 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--epsilon",
         type=float,
-        default=0.02,
-        help="Plateau improvement threshold (default 0.02 = 2%%).",
+        default=0.01,
+        help="Plateau improvement threshold (default 0.01 = 1%%).",
     )
     parser.add_argument(
         "--max-epochs",
@@ -197,6 +202,21 @@ def build_parser() -> argparse.ArgumentParser:
         dest="collect_memory",
         action="store_false",
         help="Skip NVITOP/NVML memory telemetry.",
+    )
+    parser.add_argument(
+        "--nvitop-feed-mode",
+        dest="nvitop_feed_mode",
+        choices=["none", "per_component_latest", "all"],
+        default="none",
+        help=(
+            "Which raw nvitop JSONL traces to inject into the critic's "
+            "memory_verbose_block. 'none' (default): the critic sees only "
+            "the aggregated GPU-memory summary (per-GPU/per-process peak+avg, "
+            "device cap, soft-pressure flag), never raw per-sample traces. "
+            "'per_component_latest': one representative (straggler) rank per "
+            "component. 'all': every nvitop trace (large; long-context "
+            "critics only)."
+        ),
     )
     parser.add_argument(
         "--no-profiler",
@@ -307,6 +327,7 @@ def parse_cli_args(argv: list[str] | None = None) -> CLIArgs:
         epsilon=ns.epsilon,
         max_epochs=ns.max_epochs,
         collect_memory=ns.collect_memory,
+        nvitop_feed_mode=ns.nvitop_feed_mode,
         use_profiler=not ns.no_profiler,
         dry_run_preflight=ns.dry_run_preflight,
         fake_critic_path=ns.fake_critic,
@@ -431,7 +452,9 @@ def _run_campaign(args: CLIArgs) -> int:
         ledger_dir=args.ledger_dir,
         campaign_id=campaign_id,
     )
-    parser_fn = functools.partial(_parser_adapter)
+    parser_fn = functools.partial(
+        _parser_adapter, nvitop_feed_mode=args.nvitop_feed_mode
+    )
 
     baseline_knobs = _extract_baseline_knobs(args.baseline, schema)
     scheduler = Scheduler(
@@ -448,6 +471,7 @@ def _run_campaign(args: CLIArgs) -> int:
     campaign = scheduler.run()
     _emit_best_artefacts(campaign, args)
     _emit_ledger_plot(args.ledger_dir)
+    _emit_all_responses(args.ledger_dir)
     _LOGGER.info(
         "embodied_tuner: stop_reason=%s trials=%d oom=%d",
         campaign.stop_reason,
@@ -528,16 +552,34 @@ def _runner_adapter(
     return runner.launch(spec)
 
 
-def _parser_adapter(outcome: TrialOutcome) -> TrialResult:
+def _parser_adapter(
+    outcome: TrialOutcome,
+    *,
+    nvitop_feed_mode: str | None = None,
+) -> TrialResult:
     enable_offload = _extract_trial_context(outcome.log_dir)
+    feed_mode = _resolve_nvitop_feed_mode(nvitop_feed_mode)
     return parse_trial(
         outcome.log_dir,
         returncode=outcome.returncode,
         timed_out=outcome.timed_out,
         stderr_path=outcome.stdout_path,
         enable_offload=enable_offload,
+        nvitop_feed_mode=feed_mode,
         plot_formats=("png", "html"),
     )
+
+
+def _resolve_nvitop_feed_mode(
+    raw: str | None,
+) -> "NvitopFeedMode | None":
+    """Map the CLI string to :class:`NvitopFeedMode`; ``None``→NONE default."""
+    if raw is None:
+        return None
+    try:
+        return NvitopFeedMode(raw)
+    except ValueError:
+        return None
 
 
 def _extract_trial_context(
@@ -695,6 +737,30 @@ def _emit_ledger_plot(ledger_dir: Path) -> None:
         _LOGGER.info(
             "embodied_tuner: skipped step_time/num_trajectories plot "
             "(no successful trials in %s)",
+            ledger_dir,
+        )
+    else:
+        _LOGGER.info("embodied_tuner: wrote %s", out)
+
+
+def _emit_all_responses(ledger_dir: Path) -> None:
+    """Aggregate every critic response into ``all_responses.txt``.
+
+    Same log-and-swallow contract as ``_emit_ledger_plot``: this is a
+    best-effort side artefact and must never fail the campaign.
+    """
+    try:
+        out = emit_all_responses(ledger_dir)
+    except Exception:  # noqa: BLE001 — best-effort side artefact
+        _LOGGER.warning(
+            "embodied_tuner: failed to aggregate critic responses",
+            exc_info=True,
+        )
+        return
+    if out is None:
+        _LOGGER.info(
+            "embodied_tuner: skipped all_responses.txt "
+            "(no critic responses found in %s)",
             ledger_dir,
         )
     else:

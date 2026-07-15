@@ -95,6 +95,7 @@ def _stub_args(tmp_path: Path) -> CLIArgs:
         epsilon=0.02,
         max_epochs=3,
         collect_memory=False,
+        nvitop_feed_mode="none",
         use_profiler=False,
         dry_run_preflight=False,
         fake_critic_path=None,

@@ -190,6 +190,19 @@ shrinks after offload has failed to rescue, since those shrinks change
 the batching regime and directly reduce `num_trajectories` or
 arithmetic intensity.
 
+**Applies to the expand-from parent's pressure, not a reverted
+sibling's.** Run this cascade only when the `## Memory pressure`
+block (§7) is present OR §7.1's soft-pressure `WARNING` fires on the
+expand-from parent's own nvitop data. A `Recent failure leaf` in the
+DAG view whose OOM already rolled back is **not** a trigger: the
+scheduler has already reverted the config, so the parent you are
+expanding from is not under that failed delta's pressure. Treat the
+reverted sibling as a `bitter_lesson` (do not repeat its delta) and
+otherwise resume forward optimization from the parent — exactly as
+`09-dag-search.md §2` says. Do not collapse the two cases into
+"something OOMed, so lower memory": that is the mistake that turns a
+reverted sibling OOM into a needless `micro_batch_size` shrink.
+
 ### 8.2 Rebalance under hybrid
 
 When the timeline shows env-rollout stall imbalance ≥ 0.3, move GPUs
@@ -216,6 +229,52 @@ and `rollout.enable_offload` (if either is on and actor-rollout share
 GPU ranks) before growing the batch size — offload is often the
 reason `T_act` is bloated in the first place, and turning it off frees
 the shared GPUs' memory so a larger `micro_batch_size` fits.
+
+### 8.4 Per-rank memory residency and offload
+
+A rank's device peak (`max_mem` / `max_mem_occ` in `03-inputs.md §7.1`)
+is not the sum of every component's peak on that rank — it is the max
+over time of the components resident at each instant. A component
+whose `<component>.enable_offload=true` is moved to CPU between
+phases, so it is **absent from the rank during the other component's
+peak**. Therefore:
+
+> `max_mem` on a rank ≤ sum of per-process `max_process_gpu_mem`
+> sharing it; equality holds only when every sharing component is
+> co-resident at the peak instant (none offloaded + phases overlap).
+
+This is the mechanism behind the §8.1 triage cascade's first step and
+the §6 "enable rollout offload on actor OOM when actor+rollout share
+ranks" rule: offload does not shrink any single component's footprint,
+it removes one component's footprint from the instant another peaks,
+dropping the device peak from (A+B) to (A) — enough to escape an OOM
+that (A+B) > cap would cause.
+
+Decision rule when a rank is near the cap (soft-pressure WARNING, or
+`FailureMode=OOM`) and shared by several components:
+
+1. Read the per-process rows of the §7.1 block, filter by
+   `gpu_indices` containing the pressed rank, and identify which
+   components' `max_process_gpu_mem` are large there.
+2. Read the offload flags in the current-knobs block. The components
+   already offloaded are not resident at the others' peak — exclude
+   them from the rescue target.
+3. Offload the **non-critical-path** component among the resident
+   ones. It releases the rank at the critical-path component's peak,
+   lowering the device peak without widening the critical-path term's
+   wall time. Offloading the critical-path component itself only
+   bloats `T_env` / `T_rol` / `T_act` — the anti-pattern in
+   `08-gotchas.md §5`.
+
+Real example (hybrid, `rollout.enable_offload=true`, 80 GiB cards):
+on gpu2, actor `r2` peaks at 62.7 GiB and rollout `r0` at 21.6 GiB.
+Naive sum 84.3 GiB > cap, yet device peak is 63.87 GiB — rollout is
+offloaded, so it is not resident during actor's peak, and the rank
+fits. Disabling `rollout.enable_offload` here would push the device
+peak toward 84.3 GiB and OOM; disabling `actor.enable_offload`
+instead (if on) would widen `T_act`. The resident, critical-path
+component is the actor — so the safe memory rescue is to *keep*
+rollout offloaded, not to reclaim its footprint.
 
 ## 9. Pinned knobs (do not touch in this loop)
 

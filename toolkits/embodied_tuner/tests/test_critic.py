@@ -948,3 +948,137 @@ def test_build_prompt_forwards_bitter_lessons_arg_default_is_empty() -> None:
         last_timeline_summary=None,
     )
     assert prompt.bitter_lessons_block == ""
+
+
+# ---------------------------------------------------------------------------
+# GPU-memory prompt blocks (memory_summary_block / memory_verbose_block)
+# ---------------------------------------------------------------------------
+
+def _mem_summary(**overrides):
+    base = {
+        "samples": 100,
+        "span_s": 50.0,
+        "gpu_total_gib": 80.0,
+        "peak_gpu_mem_gib": 61.0,
+        "peak_mem_util_percent": 57.0,
+        "per_gpu": (
+            {"index": 0, "avg_mem": 24.0, "max_mem": 61.0, "avg_gpu_util": 69.0,
+             "max_gpu_util": 100.0, "avg_mem_util": 15.0, "max_mem_util": 57.0,
+             "memory_total_gib": 80.0},
+        ),
+        "per_process": (
+            {"label": "actor/r0/pid1", "component": "actor", "rank": 0, "pid": 1,
+             "avg_rss": 5.7, "max_rss": 7.8, "avg_cpu": 46.0, "max_cpu": 102.0,
+             "avg_process_gpu_mem": 17.9, "max_process_gpu_mem": 61.0,
+             "avg_process_gpu_util": 33.0, "max_process_gpu_util": 100.0,
+             "gpu_indices": [0]},
+        ),
+        "raw_nvitop_jsonl": {},
+        "plot_paths": {},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_memory_summary_block_rendered_when_supplied() -> None:
+    schema = KnobSchema()
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        last_memory_summary=_mem_summary(),
+    )
+    txt = str(prompt)
+    # Assert on body text unique to the rendered block — the wiki
+    # (03-inputs.md §7.5) quotes the headers verbatim, so a header-only
+    # substring can't tell "block rendered" from "wiki describes block"
+    # (same gotcha the OOM memory-pressure test calls out).
+    assert "peak_process_gpu_mem=61.000 GiB" in txt
+    assert "device_cap=80.000 GiB" in txt
+    assert "actor/r0/pid1" in txt
+    # 57% util < 85% threshold -> no soft-pressure WARNING for this trial.
+    # (Use the rendered form — the wiki §7.5 describes the warning prefix
+    # verbatim, so the bare prefix matches the wiki too.)
+    assert "WARNING: memory pressure — peak=" not in txt
+    # Default NONE -> raw nvitop block absent (no fenced raw dump).
+    assert "### actor_rank0_pid1" not in txt
+
+
+def test_memory_summary_block_soft_pressure_warning() -> None:
+    schema = KnobSchema()
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,  # NOT OOM — soft pressure must fire anyway
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        last_memory_summary=_mem_summary(
+            peak_mem_util_percent=90.0, peak_gpu_mem_gib=72.0,
+        ),
+    )
+    txt = str(prompt)
+    assert "WARNING: memory pressure — peak=" in txt
+    assert "90% of cap" in txt
+    assert "did not OOM" in txt
+
+
+def test_memory_summary_block_absent_when_none() -> None:
+    schema = KnobSchema()
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode="OOM",
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        last_memory_summary=None,
+    )
+    txt = str(prompt)
+    # OOM directive still present.
+    assert "Prefer memory-reducing knobs in the next delta" in txt
+    # But no numeric memory block (body marker unique to the rendered
+    # block; the wiki does not quote the rendered line format).
+    assert "peak_process_gpu_mem=" not in txt
+    assert "device_cap=" not in txt
+
+
+def test_memory_verbose_block_only_when_raw_nvitop_present() -> None:
+    schema = KnobSchema()
+    raw = {"actor_rank0_pid1": '{"ts": 1.0, "gpus": []}\n'}
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        last_memory_summary=_mem_summary(raw_nvitop_jsonl=raw),
+    )
+    txt = str(prompt)
+    # The fenced raw dump + per-stem heading only appear when raw is injected.
+    assert "```jsonl" in txt
+    assert "### actor_rank0_pid1" in txt
+
+
+def test_to_debug_text_keeps_memory_summary_drops_verbose() -> None:
+    schema = KnobSchema()
+    raw = {"actor_rank0_pid1": '{"ts": 1.0, "gpus": []}\n'}
+    prompt = build_prompt(
+        history=(),
+        current_knobs={},
+        schema=schema,
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+        last_memory_summary=_mem_summary(raw_nvitop_jsonl=raw),
+    )
+    debug = prompt.to_debug_text()
+    # Compact summary survives (debugger needs the peak signal).
+    assert "peak_process_gpu_mem=61.000 GiB" in debug
+    # Verbose raw dump dropped (mirrors timeline_verbose_block).
+    assert "### actor_rank0_pid1" not in debug
+    assert "```jsonl" not in debug

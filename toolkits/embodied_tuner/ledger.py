@@ -71,6 +71,7 @@ _REQUIRED_FIELDS = (
 _OPTIONAL_FIELDS = (
     "error_excerpt",
     "proposed_delta",
+    "memory_summary",
 )
 
 
@@ -112,6 +113,11 @@ class LedgerEntry:
     # lines predate accumulation and only carry the per-round proposal
     # under ``delta``; on those, treat ``delta`` itself as the proposal.
     proposed_delta: Mapping[str, Any] | None = None
+    # Structured GPU-memory summary (per-GPU / per-process peak+avg, device
+    # cap, soft-pressure flag) — the ``MemorySummary``-shaped dict from the
+    # parser. Optional for backward compat with pre-existing ledgers; the
+    # legacy scalar ``peak_gpu_mem`` above remains for cheap queries.
+    memory_summary: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain ``dict`` suitable for ``json.dumps``."""
@@ -239,6 +245,7 @@ def make_entry(
     cleanup_outcome: str = "ok",
     error_excerpt: str = "",
     proposed_delta: Mapping[str, Any] | None = None,
+    memory_summary: Mapping[str, Any] | None = None,
 ) -> LedgerEntry:
     """Construct a :class:`LedgerEntry` with sensible defaults for missing fields.
 
@@ -267,6 +274,9 @@ def make_entry(
         error_excerpt=error_excerpt,
         proposed_delta=(
             dict(proposed_delta) if proposed_delta is not None else None
+        ),
+        memory_summary=(
+            dict(memory_summary) if memory_summary is not None else None
         ),
     )
 

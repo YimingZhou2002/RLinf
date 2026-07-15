@@ -263,7 +263,13 @@ def test_restart_after_ok_then_oom_rolls_back_to_ok_child(tmp_path: Path) -> Non
     # One OOM sibling has hit the OK parent so far; sibling cap == 3
     # means one more failure will accumulate to 2 (still under cap).
     assert resumed.sibling_failures_at_active_parent == 1
-    assert resumed.last_failure_mode == FailureMode.OOM.value
+    # Expand-from evidence reflects the OK parent A, NOT the failed
+    # sibling B: the critic expands from A, so ``last_failure_mode`` is
+    # NONE (the memory-pressure block must not fire for B's reverted
+    # OOM). The failed sibling B is carried separately so the
+    # bitter-lesson requirement still fires.
+    assert resumed.last_failure_mode == FailureMode.NONE.value
+    assert resumed.last_sibling_failure_mode == FailureMode.OOM.value
     assert resumed.last_failed_trial_idx == 1
     assert resumed.last_failed_delta == {"actor.micro_batch_size": 64}
 

@@ -227,7 +227,9 @@ class CriticPrompt:
     constraints_block: str = ""
     memory_pressure_block: str = ""
     metric_summary_block: str = ""  # compact: MetricTable time keys + stall fractions
+    memory_summary_block: str = ""  # compact: per-GPU/per-process peak+avg mem + soft-pressure flag
     timeline_verbose_block: str = ""  # verbose: critical path / bubble / outliers / raw excerpts
+    memory_verbose_block: str = ""  # verbose: raw nvitop JSONL excerpts (reserved slot, default empty)
     feedback_block: str = ""  # appended on retries
 
     def __str__(self) -> str:
@@ -239,8 +241,10 @@ class CriticPrompt:
             self.current_knobs_block,
             self.constraints_block,
             self.memory_pressure_block,
+            self.memory_summary_block,
             self.metric_summary_block,
             self.timeline_verbose_block,
+            self.memory_verbose_block,
             self.schema_doc,
         ]
         if self.feedback_block:
@@ -250,12 +254,14 @@ class CriticPrompt:
     def to_debug_text(self) -> str:
         """Render only the sections a human debugger needs.
 
-        Excludes the static wiki block, the schema doc, and the
-        verbose per-step timeline dump (critical path,
-        per-GPU bubble, outliers, raw JSONL excerpts). Keeps the
+        Excludes the static wiki block, the schema doc, the verbose
+        per-step timeline dump (critical path, per-GPU bubble, outliers,
+        raw JSONL excerpts), and the verbose raw-nvitop dump. Keeps the
         compact ``metric_summary_block`` because a debugger reading
         the round's decision without those keys is missing the
-        primary signal the critic saw, and keeps
+        primary signal the critic saw, keeps ``memory_summary_block``
+        for the same reason (per-GPU / per-component peak + soft-pressure
+        flag), and keeps
         ``bitter_lessons_block`` because it is the permanent memory
         the critic acts on. The DAG view is also kept because it
         explains why Codex is being expanded from a particular parent
@@ -267,6 +273,7 @@ class CriticPrompt:
             self.history_block,
             self.current_knobs_block,
             self.memory_pressure_block,
+            self.memory_summary_block,
             self.metric_summary_block,
         ]
         if self.feedback_block:
@@ -295,6 +302,7 @@ def build_prompt(
     last_failure_mode: str | None,
     last_metric_summary: Mapping[str, float] | None,
     last_timeline_summary: Mapping[str, Any] | None,
+    last_memory_summary: Mapping[str, Any] | None = None,
     last_num_trajectories: int | None = None,
     bitter_lessons: Sequence[BitterLesson] = (),
     feedback: str | None = None,
@@ -314,6 +322,13 @@ def build_prompt(
             successful trial (``env/interact``, ``actor/run_training``, etc.).
         last_timeline_summary: ``TimelineSummary``-shaped dict (per-rank
             stats + stall fractions) from the last successful trial.
+        last_memory_summary: ``MemorySummary``-shaped dict (per-GPU /
+            per-process peak+avg GPU memory, device cap, soft-pressure
+            flag) from the last trial. ``None`` omits the memory block.
+            Unlike ``last_timeline_summary`` (which carries raw JSONL by
+            default), the raw-nvitop slot defaults to empty so raw traces
+            only enter the prompt when explicitly opted into on the parser
+            side (``NvitopFeedMode`` != NONE).
         last_num_trajectories: ``num_trajectories`` from the final
             MetricTable block of the last successful trial. Rendered as a
             sibling ``## Last trial — MetricTable Environment-section keys``
@@ -345,10 +360,12 @@ def build_prompt(
         current_knobs_block=_render_current_knobs(current_knobs, schema),
         constraints_block=_render_constraints(),
         memory_pressure_block=_render_memory_pressure(last_failure_mode),
+        memory_summary_block=_render_memory_summary(last_memory_summary),
         metric_summary_block=_render_metric_summary_compact(
             last_metric_summary, last_timeline_summary, last_num_trajectories
         ),
         timeline_verbose_block= _render_timeline_verbose(last_timeline_summary),
+        memory_verbose_block=_render_memory_verbose(last_memory_summary),
         feedback_block=combined_feedback,
     )
 
@@ -443,6 +460,178 @@ def _render_memory_pressure(last_failure_mode: str | None) -> str:
         "actor.micro_batch_size. Avoid placement deltas that grow the actor or "
         "rollout GPU footprint.\n"
     )
+
+
+# Soft memory-pressure threshold. When the last trial did NOT OOM but GPU
+# memory occupancy (used/total, ``max_mem_occ``) reached this fraction of the
+# device cap, the critic should still prefer memory-reducing deltas
+# proactively — the OOM block above only fires after a crash. Mirrors the
+# "~85% of the device cap" rule of thumb in wiki/06-playbook.md §2.
+# (Earlier this also kept a separate peak/cap-ratio clause; the occupancy
+# ratio subsumes it, since occupancy IS used/total, so the two collapsed
+# into one check.)
+MEMORY_PRESSURE_UTIL_THRESHOLD = 85.0
+
+
+def _fmt_gib(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f} GiB"
+
+
+def _fmt_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
+def _gpu_occ_percent(gpu: Mapping[str, Any]) -> float | None:
+    """Per-GPU memory occupancy ratio (used/total) as a percent.
+
+    Prefers the sidecar's ``max_mem_occ_percent``; falls back to deriving it
+    from ``max_mem / memory_total_gib`` so legacy sidecars (and test fixtures
+    that omit the field) still show a real occupancy number. This is the
+    "how full did device memory get" signal — distinct from NVML's
+    ``max_mem_util`` (memory-controller busy ratio / bandwidth).
+    """
+    occ = gpu.get("max_mem_occ_percent")
+    if occ is not None:
+        return float(occ)
+    max_mem = gpu.get("max_mem")
+    total = gpu.get("memory_total_gib")
+    if max_mem is not None and total:
+        return float(max_mem) / float(total) * 100.0
+    return None
+
+
+def _render_memory_summary(
+    memory_summary: Mapping[str, Any] | None,
+) -> str:
+    """Compact GPU-memory block: peak + per-GPU + per-process + soft pressure.
+
+    Always-on when the last trial has nvitop data (survives
+    :meth:`CriticPrompt.to_debug_text`). The soft-pressure line is the new
+    signal the OOM-only ``memory_pressure_block`` could not provide: even
+    a successful trial that peaked at, say, 57 GiB on 80 GiB cards is
+    flagged when the memory *occupancy* ratio (used/total, ``max_mem_occ``)
+    crosses the threshold, so the critic can tighten the memory envelope
+    BEFORE a crash rather than only after. ``max_mem_util`` (NVML
+    memory-controller busy ratio) is shown alongside as a diagnostic, but
+    is NOT the pressure trigger — a near-full card can report low
+    controller util if memory is not being actively read/written that instant.
+    """
+    if not memory_summary:
+        return ""
+
+    gpu_total = memory_summary.get("gpu_total_gib")
+    peak = memory_summary.get("peak_gpu_mem_gib")
+    peak_util = memory_summary.get("peak_mem_util_percent")
+    peak_occ = memory_summary.get("peak_mem_occ_percent")
+    # Derive occupancy from peak/cap when the sidecar predates the field.
+    if peak_occ is None and gpu_total and peak and gpu_total > 0:
+        peak_occ = peak / gpu_total * 100.0
+    samples = memory_summary.get("samples")
+    span_s = memory_summary.get("span_s")
+
+    lines = ["## Last trial — GPU memory (from nvitop summary)"]
+    meta_parts: list[str] = []
+    if samples is not None:
+        meta_parts.append(f"samples={samples}")
+    if span_s is not None:
+        meta_parts.append(f"span={span_s:.1f}s")
+    if gpu_total is not None:
+        meta_parts.append(f"device_cap={_fmt_gib(gpu_total)}")
+    if meta_parts:
+        lines.append("- " + ", ".join(meta_parts))
+    lines.append(
+        f"- peak_process_gpu_mem={_fmt_gib(peak)}  "
+        f"peak_mem_occ={_fmt_pct(peak_occ)}  "
+        f"peak_mem_util={_fmt_pct(peak_util)}"
+    )
+
+    # Soft pressure: memory occupancy (used/total) above threshold.
+    # peak_occ already incorporates the peak/cap ratio (derived above when
+    # absent), so the single occupancy check subsumes the legacy
+    # peak/cap >= 0.85 clause.
+    soft = peak_occ is not None and peak_occ >= MEMORY_PRESSURE_UTIL_THRESHOLD
+    if soft:
+        ratio = (peak / gpu_total) if (gpu_total and peak) else None
+        ratio_str = f" ({peak / gpu_total:.0%} of cap)" if ratio is not None else ""
+        lines.append(
+            f"- WARNING: memory pressure — peak={_fmt_gib(peak)}{ratio_str}, "
+            f"peak_mem_occ={_fmt_pct(peak_occ)} "
+            f"(>= {MEMORY_PRESSURE_UTIL_THRESHOLD:.0f}% of cap). "
+            "Prefer memory-reducing knobs (enable_offload flips, lower "
+            "total_num_envs / micro_batch_size) even though the trial did not OOM."
+        )
+
+    per_gpu = memory_summary.get("per_gpu") or ()
+    if per_gpu:
+        lines.append(
+            "- per-GPU (index / max_mem / max_mem_occ / max_mem_util / max_gpu_util):"
+        )
+        for gpu in per_gpu[:16]:
+            lines.append(
+                f"  - gpu{gpu.get('index')}: "
+                f"max_mem={_fmt_gib(gpu.get('max_mem'))}, "
+                f"max_mem_occ={_fmt_pct(_gpu_occ_percent(gpu))}, "
+                f"max_mem_util={_fmt_pct(gpu.get('max_mem_util'))}, "
+                f"max_gpu_util={_fmt_pct(gpu.get('max_gpu_util'))}"
+            )
+
+    per_process = memory_summary.get("per_process") or ()
+    if per_process:
+        lines.append(
+            "- per-process (component/rank / max_process_gpu_mem / gpu_indices):"
+        )
+        for proc in per_process[:24]:
+            idx = proc.get("gpu_indices")
+            idx_str = ", ".join(str(i) for i in idx) if idx else "n/a"
+            lines.append(
+                f"  - {proc.get('label') or proc.get('component')}: "
+                f"max_process_gpu_mem={_fmt_gib(proc.get('max_process_gpu_mem'))} "
+                f"[gpu {idx_str}]"
+            )
+
+    plot_paths = memory_summary.get("plot_paths") or {}
+    if plot_paths:
+        lines.append("- nvitop curves: " + ", ".join(
+            f"{fmt}={path}" for fmt, path in sorted(plot_paths.items())
+        ))
+    return "\n".join(lines) + "\n"
+
+
+def _render_memory_verbose(
+    memory_summary: Mapping[str, Any] | None,
+) -> str:
+    """Verbose raw-nvitop JSONL block (reserved slot, default empty).
+
+    Mirrors :func:`_render_raw_jsonl`. Only rendered when the parser
+    populated ``raw_nvitop_jsonl`` (i.e. ``NvitopFeedMode`` != NONE on the
+    parser side). Default is empty, so raw per-sample traces do NOT enter
+    the critic prompt unless explicitly opted into — the same shape as the
+    timeline ``raw_jsonl`` slot. Excluded from :meth:`CriticPrompt.to_debug_text`.
+    """
+    if not memory_summary:
+        return ""
+    raw_nvitop_jsonl = memory_summary.get("raw_nvitop_jsonl") or {}
+    if not raw_nvitop_jsonl:
+        return ""
+    lines = [
+        "## Last trial — raw nvitop JSONL",
+        (
+            "Each fenced block below is the verbatim contents of one "
+            "`<component>_rank<N>_pid<PID>.jsonl` file from "
+            "`<log_dir>/nvitop/`. Every line is one sample "
+            "`{ts, global_step, gpus:[{memory_used_gib, gpu_util_percent, "
+            "memory_util_percent, ...}], process_gpu_memory_gib, ...}`. "
+            "Cite specific lines by file stem and line number when the "
+            "aggregated memory summary above is not enough to justify a delta."
+        ),
+    ]
+    for name in raw_nvitop_jsonl:  # insertion-ordered
+        body = raw_nvitop_jsonl[name].rstrip()
+        lines.append(f"\n### {name}")
+        lines.append("```jsonl")
+        lines.append(body)
+        lines.append("```")
+    return "\n".join(lines) + "\n"
 
 
 def _render_metric_summary_compact(
@@ -927,10 +1116,12 @@ class Critic(Protocol):
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        last_memory_summary: Mapping[str, Any] | None = None,
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
         dag_block: str = "",
+        last_sibling_failure_mode: str | None = None,
     ) -> CriticOutput:
         ...
 
@@ -976,14 +1167,28 @@ class CodexCritic:
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        last_memory_summary: Mapping[str, Any] | None = None,
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
         dag_block: str = "",
+        last_sibling_failure_mode: str | None = None,
     ) -> CriticOutput:
         active_schema = schema or self.schema
+        # The bitter-lesson requirement keys on the most recent FAILED
+        # trial (``last_sibling_failure_mode``) so a reverted sibling OOM
+        # still forces a lesson even though the memory-pressure block
+        # below keys on the expand-from parent's ``last_failure_mode``
+        # (which is ``NONE`` after a rollback). Flat campaigns never set
+        # the sibling field, so they fall back to ``last_failure_mode``
+        # (parent == most-recent there) and behave as before.
+        lesson_failure_mode = (
+            last_sibling_failure_mode
+            if last_sibling_failure_mode is not None
+            else last_failure_mode
+        )
         validator = CriticOutputValidator(
-            schema=active_schema, last_failure_mode=last_failure_mode
+            schema=active_schema, last_failure_mode=lesson_failure_mode
         )
         feedback: str | None = None
         last_error: str = ""
@@ -999,6 +1204,7 @@ class CodexCritic:
                 last_failure_mode=last_failure_mode,
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
+                last_memory_summary=last_memory_summary,
                 last_num_trajectories=last_num_trajectories,
                 bitter_lessons=bitter_lessons,
                 feedback=feedback,

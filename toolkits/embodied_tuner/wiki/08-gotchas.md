@@ -80,14 +80,24 @@ See `05-recipe.md §7`.
 
 ## 7. Do not reach for placement in the OOM branch
 
-Under memory pressure (last trial `FailureMode=OOM`), follow the
-memory triage cascade in `06-playbook.md §8.1` first:
+Under memory pressure (the `## Memory pressure` block present, i.e. the
+expand-from parent itself failed with OOM — see `03-inputs.md §7` for
+why a reverted sibling OOM does NOT count), follow the memory triage
+cascade in `06-playbook.md §8.1` first:
 `enable_offload=true` on the OOM component (or on rollout if actor
 OOMed and actor-rollout share GPU ranks) → shrink
 `actor.micro_batch_size` → shrink `env.train.total_num_envs`.
 
 Placement moves are the highest-variance change in the toolkit and
 rarely fix an OOM by themselves.
+
+**Distinguish a reverted sibling OOM from current pressure.** If the
+only OOM you see is a `Recent failure leaf` whose delta the scheduler
+already rolled back (the `## Current knobs` reflect the parent, not
+the failed sibling), you are NOT in the OOM branch — the config you
+are expanding from did not OOM. Record the failure as a `bitter_lesson`
+and propose forward from the parent; do not run the triage cascade and
+do not reach for placement.
 
 See `05-recipe.md §4` (rules of thumb).
 

@@ -63,8 +63,16 @@ Views produced:
    uses when reasoning about whether a knob affected the *typical* call
    or only the warmup call.
 
+8. ``compute_offload_cost``
+   Per-component CPU<->GPU transfer cost when ``enable_offload=True``:
+   buckets every :data:`OFFLOAD_TAGS` event into onload (CPU->GPU, paid
+   before real work) vs offload (GPU->CPU, paid to free the device) and
+   reports count + total/mean/median/min/max per direction, plus the
+   combined total as a fraction of wall time. Answers "how much of
+   this trial's wall was spent just moving weights around?".
+
 The public entry point :func:`process_timeline` loads a timeline dir
-and runs (3)/(4)/(5)/(6)/(7); the parser calls (1)/(2) directly against
+and runs (3)/(4)/(5)/(6)/(7)/(8); the parser calls (1)/(2) directly against
 the loaded events. All component-oriented views exclude the ``runner``
 component — its single ``run`` event spans the whole trial and adds no
 signal to per-component analysis.
@@ -138,6 +146,43 @@ OUTLIER_MIN_SECONDS: float = 1.0  # ignore sub-second "outliers"
 # init) which otherwise inflates the mean by orders of magnitude.
 DEFAULT_CALL_AVERAGE_COMPONENTS: tuple[str, ...] = ("env", "rollout")
 DEFAULT_SKIP_FIRST_CALLS: int = 2
+
+
+# Tags that move weights/state between CPU and GPU under
+# ``enable_offload=True``. Each maps to a ``direction``:
+# - ``"onload"``  : CPU -> GPU, the cost paid BEFORE real work resumes
+#   (env subprocess respawn / state restore, rollout HF model reload,
+#   actor FSDP param+optimizer load).
+# - ``"offload"`` : GPU -> CPU, the cost paid to FREE the device after the
+#   component's work phase ends.
+#
+# Keep this map explicit: a tag here is the ONLY thing
+# :func:`compute_offload_cost` keys on, so the critic prompt and the
+# summary txt show exactly these movements. Add a line here whenever a
+# new offload-bearing worker method is instrumented in the timeline
+# patch file.
+OFFLOAD_TAGS: dict[str, str] = {
+    # env (env-class onload/offload; e.g. ManiSkillOffloadEnv)
+    "onload": "onload",
+    "offload": "offload",
+    # rollout (HF model reload/offload)
+    "reload_model": "onload",
+    "offload_model": "offload",
+    # actor (FSDP param/optimizer load/offload)
+    "load_weight_and_optimizer": "onload",
+    "load_param_and_grad": "onload",
+    "load_optimizer": "onload",
+    "offload_param_and_grad": "offload",
+    "offload_optimizer": "offload",
+}
+
+
+def _offload_direction(event: Mapping[str, Any]) -> str | None:
+    """Return ``"onload"``/``"offload"`` for an offload-bearing event, else ``None``."""
+    tag = event.get("tag")
+    if tag is None:
+        return None
+    return OFFLOAD_TAGS.get(str(tag))
 
 
 # Fields kept on raw-excerpt records. The full JSONL line can be very
@@ -645,6 +690,106 @@ def compute_component_call_averages(
 
 
 # ---------------------------------------------------------------------------
+# Per-component onload/offload cost
+# ---------------------------------------------------------------------------
+
+
+def _stat_block(durs: list[float]) -> dict[str, Any]:
+    """Count + min/median/mean/max/total for a list of durations (seconds)."""
+    return {
+        "count": len(durs),
+        "total_s": round(sum(durs), 3),
+        "mean_s": round(sum(durs) / len(durs), 3) if durs else 0.0,
+        "median_s": round(statistics.median(durs), 3) if durs else 0.0,
+        "min_s": round(min(durs), 3) if durs else 0.0,
+        "max_s": round(max(durs), 3) if durs else 0.0,
+    }
+
+
+def compute_offload_cost(
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Per-component onload/offload CPU<->GPU transfer cost.
+
+    For every event whose tag is in :data:`OFFLOAD_TAGS`, bucket it by
+    ``(component, direction)`` where direction is ``"onload"`` (CPU->GPU,
+    paid before real work) or ``"offload"`` (GPU->CPU, paid to free the
+    device). For each bucket report count + total/mean/median/min/max
+    seconds; for each component also report the combined onload+offload
+    total and its fraction of the observation window (``wall_s``) so the
+    critic can see "this trial spent 8% of wall on weight搬运".
+
+    Returns ``{}`` when there are no events or the wall window is
+    degenerate. Components with no onload/offload events at all are
+    omitted from ``per_component`` but still contribute nothing to the
+    grand totals. :data:`EXCLUDED_COMPONENTS` (``runner``) is dropped —
+    its single ``run`` event is not an offload movement.
+    """
+    if not events:
+        return {}
+    t_min = min(float(e["t0"]) for e in events)
+    t_max = max(float(e["t1"]) for e in events)
+    wall = t_max - t_min
+    if wall <= 0:
+        return {}
+
+    # (component, direction) -> list[dur]
+    buckets: dict[tuple[str, str], list[float]] = {}
+    for event in events:
+        if _is_excluded(event.get("component")):
+            continue
+        direction = _offload_direction(event)
+        if direction is None:
+            continue
+        try:
+            rank = int(event.get("rank"))
+        except (TypeError, ValueError):
+            continue
+        buckets.setdefault((str(event["component"]), direction), []).append(
+            float(event.get("dur", 0.0))
+        )
+
+    if not buckets:
+        return {"wall_s": round(wall, 1), "per_component": {}, "totals": {
+            "onload_total_s": 0.0,
+            "offload_total_s": 0.0,
+            "combined_total_s": 0.0,
+            "combined_frac_of_wall": 0.0,
+        }}
+
+    components = sorted({c for (c, _) in buckets})
+    per_component: dict[str, dict[str, Any]] = {}
+    onload_grand = 0.0
+    offload_grand = 0.0
+    for component in components:
+        onload_durs = buckets.get((component, "onload"), [])
+        offload_durs = buckets.get((component, "offload"), [])
+        onload_stats = _stat_block(onload_durs)
+        offload_stats = _stat_block(offload_durs)
+        combined = onload_stats["total_s"] + offload_stats["total_s"]
+        onload_grand += onload_stats["total_s"]
+        offload_grand += offload_stats["total_s"]
+        per_component[component] = {
+            "onload": onload_stats,
+            "offload": offload_stats,
+            "combined_total_s": round(combined, 3),
+            "combined_frac_of_wall": round(combined / wall, 3),
+        }
+
+    combined_grand = onload_grand + offload_grand
+    return {
+        "wall_s": round(wall, 1),
+        "per_component": per_component,
+        "totals": {
+            "onload_total_s": round(onload_grand, 3),
+            "offload_total_s": round(offload_grand, 3),
+            "combined_total_s": round(combined_grand, 3),
+            "combined_frac_of_wall": round(combined_grand / wall, 3),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # High-level entry point
 # ---------------------------------------------------------------------------
 
@@ -672,4 +817,5 @@ def process_timeline(
         "per_component_bubble": compute_per_component_bubble(events),
         "raw_excerpts": list(extract_raw_excerpts(events)),
         "component_call_averages": compute_component_call_averages(events),
+        "offload_cost": compute_offload_cost(events),
     }

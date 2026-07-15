@@ -43,7 +43,14 @@ identifiers are stable across rounds.
    back; your next proposal is layered on top of the parent context
    the scheduler chose. Do not try to explicitly change the parent —
    simply propose a delta on top of `current_knobs` and the
-   scheduler will thread the parent for you.
+   scheduler will thread the parent for you. This rewind is also why
+   the `## Memory pressure` (§7) and `## Last trial — GPU memory`
+   (§7.1) blocks reflect the *parent's* state after a rollback, not
+   the failed sibling's: the sibling's OOM / inflated occupancy was
+   produced by the very delta that was reverted, so it is shown only
+   as a `Recent failure leaf` + a required `bitter_lesson`, never as
+   current pressure. Propose forward from the parent; do not "fix" the
+   reverted sibling by lowering memory.
 3. **Watch the top-K OK leaderboard.** If your proposal would resolve
    to the same cumulative config as an entry there, the scheduler
    will short-circuit to a `DUPLICATE_OF` DAG node rather than

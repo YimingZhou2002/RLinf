@@ -64,18 +64,22 @@ class FakeCritic:
         last_failure_mode: str | None = None,
         last_metric_summary: Mapping[str, float] | None = None,
         last_timeline_summary: Mapping[str, Any] | None = None,
+        last_memory_summary: Mapping[str, Any] | None = None,
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         preflight_feedback: str | None = None,
         dag_block: str = "",
+        last_sibling_failure_mode: str | None = None,
     ) -> CriticOutput:
         del (
             schema,
             last_failure_mode,
             last_metric_summary,
             last_timeline_summary,
+            last_memory_summary,
             last_num_trajectories,
             dag_block,
+            last_sibling_failure_mode,
         )
         self.calls.append(
             (len(history), dict(current_knobs), preflight_feedback, len(bitter_lessons))

@@ -171,7 +171,9 @@ class _ResumedState:
     last_failure_mode: str | None
     last_metric_summary: Mapping[str, float] | None
     last_timeline_summary: Mapping[str, Any] | None
+    last_memory_summary: Mapping[str, Any] | None
     last_num_trajectories: int | None
+    last_sibling_failure_mode: str | None
     last_failed_trial_idx: int | None
     last_failed_delta: dict[str, Any] | None
     duplicate_counter: int
@@ -249,7 +251,18 @@ class Scheduler:
         last_failure_mode: str | None = None
         last_metric_summary: Mapping[str, float] | None = None
         last_timeline_summary: Mapping[str, Any] | None = None
+        last_memory_summary: Mapping[str, Any] | None = None
         last_num_trajectories: int | None = None
+        # The most recent FAILED trial's failure mode, kept SEPARATE from
+        # ``last_failure_mode`` so the bitter-lesson requirement still
+        # fires after a rollback. On a rollback failure, the expand-from
+        # parent is OK so ``last_failure_mode`` becomes ``"NONE"`` (the
+        # memory-pressure block must NOT fire for a reverted sibling), but
+        # ``last_sibling_failure_mode`` carries the failed sibling's mode
+        # (e.g. ``"OOM"``) so the validator still demands a bitter_lesson.
+        # Flat campaigns (no node_store) never roll back, so the two stay
+        # in lockstep there.
+        last_sibling_failure_mode: str | None = None
         # Track the delta that produced last_failure_mode so a lesson
         # emitted in the NEXT round can be attributed to the right
         # trial and delta signature. Cleared once folded into a lesson.
@@ -301,7 +314,9 @@ class Scheduler:
                 last_failure_mode = resumed.last_failure_mode
                 last_metric_summary = resumed.last_metric_summary
                 last_timeline_summary = resumed.last_timeline_summary
+                last_memory_summary = resumed.last_memory_summary
                 last_num_trajectories = resumed.last_num_trajectories
+                last_sibling_failure_mode = resumed.last_sibling_failure_mode
                 last_failed_trial_idx = resumed.last_failed_trial_idx
                 last_failed_delta = resumed.last_failed_delta
         # Load / rebuild the persistent dedup sidecar (if wired). The
@@ -343,9 +358,11 @@ class Scheduler:
                     last_failure_mode=last_failure_mode,
                     last_metric_summary=last_metric_summary,
                     last_timeline_summary=last_timeline_summary,
+                    last_memory_summary=last_memory_summary,
                     last_num_trajectories=last_num_trajectories,
                     bitter_lessons=lessons,
                     active_leaf_id=active_leaf_id,
+                    last_sibling_failure_mode=last_sibling_failure_mode,
                 )
             except CriticError as exc:
                 self._record_critic_failure(trial_idx, str(exc), start)
@@ -365,22 +382,25 @@ class Scheduler:
                 critic_output.bitter_lesson is not None
                 and last_failed_trial_idx is not None
                 and last_failed_delta is not None
-                and last_failure_mode is not None
+                and last_sibling_failure_mode is not None
             ):
                 inserted = self._record_bitter_lesson(
                     lesson_book=lesson_book,
                     lessons=lessons,
                     proposed=critic_output.bitter_lesson,
                     trial_idx=last_failed_trial_idx,
-                    failure_mode=last_failure_mode,
+                    failure_mode=last_sibling_failure_mode,
                     delta=last_failed_delta,
                 )
                 if inserted:
                     # A single failure yields one lesson at most; clear
                     # the pointer so a re-emission on a later round
-                    # does not double-count.
+                    # does not double-count. Clear the sibling-failure
+                    # mode too so the validator stops demanding a lesson
+                    # for this failure on subsequent proposals.
                     last_failed_trial_idx = None
                     last_failed_delta = None
+                    last_sibling_failure_mode = None
 
             if critic_output.stop_requested:
                 consecutive_stop_requests += 1
@@ -522,6 +542,14 @@ class Scheduler:
             # above via ``preflight_exhausted`` and never reach this
             # block — they do not create a DAG node.
             is_rollback_failure = entry.failure_mode in ROLLBACK_FAILURE_MODES
+            # ``evidence_node`` is the DAG node whose metrics / timeline /
+            # memory the NEXT proposal must react to — i.e. the config we
+            # are expanding from. On a rollback failure the scheduler
+            # rewinds to the parent (or grandparent on a sibling-cap
+            # climb), so the critic must see THAT node's evidence, not the
+            # failed sibling's. Stays ``None`` on OK / flat, where the
+            # just-run trial is the new expand-from parent (use the entry).
+            evidence_node = None
             if self.node_store is not None and new_node_id is not None and is_rollback_failure:
                 # Rewind: undo the tentative advance and reset the
                 # flat accumulators to the parent's cumulative state.
@@ -532,6 +560,7 @@ class Scheduler:
                     current_knobs = self._apply_delta(
                         dict(self.baseline_knobs), cumulative_delta
                     )
+                    evidence_node = parent
                 else:
                     # Should be unreachable — every launched trial's
                     # parent is at least the root — but degrade safely.
@@ -566,6 +595,7 @@ class Scheduler:
                     current_knobs = self._apply_delta(
                         dict(self.baseline_knobs), cumulative_delta
                     )
+                    evidence_node = grandparent
                     sibling_failures_at_active_parent = 0
             else:
                 # OK trial (or backward-compat mode without node_store):
@@ -584,10 +614,41 @@ class Scheduler:
             )
             history = history[-self.budget.history_window :]
             trial_idx += 1
-            last_failure_mode = entry.failure_mode
-            last_metric_summary = entry.per_component_timings
-            last_timeline_summary = entry.timeline_summary
-            last_num_trajectories = entry.num_trajectories
+            # Evidence for the next proposal: the trial whose config we
+            # are expanding from. On a rollback failure the scheduler
+            # rewound to ``evidence_node`` (parent / grandparent), so the
+            # critic sees THAT node's metrics / timeline / memory and
+            # failure_mode — not the failed sibling's. This is what keeps
+            # a reverted OOM sibling from masquerading as current memory
+            # pressure (see wiki/03-inputs.md §7 + 09-dag-search.md §2).
+            if evidence_node is not None:
+                last_failure_mode = evidence_node.failure_mode
+                last_metric_summary = dict(evidence_node.per_component_timings)
+                last_timeline_summary = (
+                    dict(evidence_node.timeline_summary)
+                    if evidence_node.timeline_summary is not None
+                    else None
+                )
+                last_memory_summary = (
+                    dict(evidence_node.memory_summary)
+                    if evidence_node.memory_summary is not None
+                    else None
+                )
+                last_num_trajectories = evidence_node.num_trajectories
+            else:
+                last_failure_mode = entry.failure_mode
+                last_metric_summary = entry.per_component_timings
+                last_timeline_summary = entry.timeline_summary
+                last_memory_summary = entry.memory_summary
+                last_num_trajectories = entry.num_trajectories
+            # The most recent FAILED trial's mode, independent of the
+            # expand-from parent's mode: drives the bitter-lesson
+            # requirement so a reverted sibling OOM still forces a lesson.
+            last_sibling_failure_mode = (
+                entry.failure_mode
+                if entry.failure_mode != FailureMode.NONE.value
+                else None
+            )
             if entry.failure_mode != FailureMode.NONE.value:
                 last_failed_trial_idx = entry.trial_idx
                 last_failed_delta = dict(critic_output.delta)
@@ -610,9 +671,11 @@ class Scheduler:
         last_failure_mode: str | None,
         last_metric_summary: Mapping[str, float] | None,
         last_timeline_summary: Mapping[str, Any] | None,
+        last_memory_summary: Mapping[str, Any] | None = None,
         last_num_trajectories: int | None = None,
         bitter_lessons: Sequence[BitterLesson] = (),
         active_leaf_id: str | None = None,
+        last_sibling_failure_mode: str | None = None,
     ) -> tuple[CriticOutput, PreflightOutcome]:
         """Ask the critic, run preflight, retry on preflight failures.
 
@@ -653,10 +716,12 @@ class Scheduler:
                 last_failure_mode=last_failure_mode,
                 last_metric_summary=last_metric_summary,
                 last_timeline_summary=last_timeline_summary,
+                last_memory_summary=last_memory_summary,
                 last_num_trajectories=last_num_trajectories,
                 bitter_lessons=bitter_lessons,
                 preflight_feedback=preflight_feedback,
                 dag_block=dag_block,
+                last_sibling_failure_mode=last_sibling_failure_mode,
             )
             if critic_output.stop_requested:
                 return critic_output, PreflightOutcome(
@@ -905,6 +970,23 @@ class Scheduler:
             if result.per_step
             else {}
         )
+        memory_dict: dict[str, Any] | None = None
+        if result.memory_summary is not None:
+            ms = result.memory_summary
+            memory_dict = {
+                "samples": ms.samples,
+                "span_s": ms.span_s,
+                "aggregate_bin_s": ms.aggregate_bin_s,
+                "gpu_total_gib": ms.gpu_total_gib,
+                "peak_gpu_mem_gib": ms.peak_gpu_mem_gib,
+                "peak_mem_util_percent": ms.peak_mem_util_percent,
+                "per_gpu": [dict(g) for g in ms.per_gpu],
+                "per_process": [dict(p) for p in ms.per_process],
+                "raw_nvitop_jsonl": dict(ms.raw_nvitop_jsonl),
+                "plot_paths": {
+                    fmt: str(path) for fmt, path in ms.plot_paths.items()
+                },
+            }
         return make_entry(
             trial_idx=trial_idx,
             delta=delta,
@@ -920,6 +1002,7 @@ class Scheduler:
             per_component_timings=per_component,
             timeline_summary=timeline_dict,
             peak_gpu_mem=result.peak_gpu_mem_gib,
+            memory_summary=memory_dict,
             critic_rationale=rationale.to_dict(),
             ts_start=ts_start,
             ts_end=ts_end,
@@ -1190,21 +1273,41 @@ class Scheduler:
             )
 
         # Attribution fields: mirror how the live loop sets them at the
-        # end of the trial iteration, using the most recent Ledger entry
-        # (which is always a launched trial).
+        # end of the trial iteration. The expand-from evidence (metrics /
+        # timeline / memory / failure_mode) comes from ``active_node`` —
+        # the node the scheduler is expanding from, which ``active_state``
+        # already rewound to the parent on a rollback failure — NOT from
+        # the most-recent ledger entry (which may be the failed sibling).
+        # The sibling-failure mode (for the bitter-lesson requirement)
+        # comes from the most-recent FAILED ledger entry, if any.
         last_failure_mode: str | None = None
         last_metric_summary: Mapping[str, float] | None = None
         last_timeline_summary: Mapping[str, Any] | None = None
+        last_memory_summary: Mapping[str, Any] | None = None
         last_num_trajectories: int | None = None
+        last_sibling_failure_mode: str | None = None
         last_failed_trial_idx: int | None = None
         last_failed_delta: dict[str, Any] | None = None
+        if active_node is not None:
+            last_failure_mode = active_node.failure_mode
+            last_metric_summary = dict(active_node.per_component_timings)
+            last_timeline_summary = (
+                dict(active_node.timeline_summary)
+                if active_node.timeline_summary is not None
+                else None
+            )
+            last_memory_summary = (
+                dict(active_node.memory_summary)
+                if active_node.memory_summary is not None
+                else None
+            )
+            last_num_trajectories = active_node.num_trajectories
         if ledger_result.entries:
+            # Most recent FAILED launched trial — drives the bitter-lesson
+            # requirement independently of the expand-from parent's mode.
             latest = ledger_result.entries[-1]
-            last_failure_mode = latest.failure_mode
-            last_metric_summary = latest.per_component_timings
-            last_timeline_summary = latest.timeline_summary
-            last_num_trajectories = latest.num_trajectories
             if latest.failure_mode != FailureMode.NONE.value:
+                last_sibling_failure_mode = latest.failure_mode
                 last_failed_trial_idx = latest.trial_idx
                 last_failed_delta = dict(latest.proposed_delta or {})
 
@@ -1227,7 +1330,9 @@ class Scheduler:
             last_failure_mode=last_failure_mode,
             last_metric_summary=last_metric_summary,
             last_timeline_summary=last_timeline_summary,
+            last_memory_summary=last_memory_summary,
             last_num_trajectories=last_num_trajectories,
+            last_sibling_failure_mode=last_sibling_failure_mode,
             last_failed_trial_idx=last_failed_trial_idx,
             last_failed_delta=last_failed_delta,
             duplicate_counter=duplicate_counter,
@@ -1286,6 +1391,11 @@ class Scheduler:
                 else None
             ),
             peak_gpu_mem=entry.peak_gpu_mem,
+            memory_summary=(
+                dict(entry.memory_summary)
+                if entry.memory_summary is not None
+                else None
+            ),
             critic_rationale=(
                 dict(entry.critic_rationale)
                 if entry.critic_rationale is not None

@@ -580,3 +580,178 @@ def test_parse_timeline_excludes_runner_from_stall_fractions(tmp_path):
     ts = parse_timeline(timeline)
     assert "runner" not in ts.stall_fraction_by_component
     assert "runner" not in ts.per_component_bubble.get("per_component", {})
+
+
+# ---------------------------------------------------------------------------
+# GPU-memory summary (MemorySummary / nvitop sidecar)
+# ---------------------------------------------------------------------------
+
+def _sample_record(ts, component, rank, pid, mem_gib, util=50.0, mem_util=40.0,
+                   gpu_index=0, total_gib=80.0):
+    """One normalized nvitop JSONL record (post-_normalize_sample shape)."""
+    return {
+        "ts": float(ts),
+        "component": component,
+        "rank": rank,
+        "pid": pid,
+        "global_step": 0,
+        "process_rss_gib": 1.0,
+        "gpus": [
+            {
+                "gpu_index": gpu_index,
+                "memory_total_gib": total_gib,
+                "memory_used_gib": mem_gib,
+                "gpu_util_percent": util,
+                "memory_util_percent": mem_util,
+                "processes": [
+                    {
+                        "pid": pid,
+                        "gpu_memory_gib": mem_gib,
+                        "gpu_sm_util_percent": util,
+                        "gpu_memory_util_percent": mem_util,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _write_nvitop_dir(nvitop_dir: Path, records_by_stem: dict) -> None:
+    nvitop_dir.mkdir(parents=True, exist_ok=True)
+    for stem, records in records_by_stem.items():
+        with (nvitop_dir / f"{stem}.jsonl").open("w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+
+
+def test_write_nvitop_summary_emits_json_sidecar_with_device_cap(tmp_path):
+    from toolkits.embodied_tuner.profiler import plot_nvitop
+
+    nvitop_dir = tmp_path / "nvitop"
+    _write_nvitop_dir(
+        nvitop_dir,
+        {
+            "actor_rank0_pid1": [_sample_record(1, "actor", 0, 1, 60.0, 100.0, 57.0)],
+            "rollout_rank0_pid2": [_sample_record(1, "rollout", 0, 2, 25.0, 72.0, 30.0, gpu_index=4)],
+        },
+    )
+    samples = plot_nvitop._load_samples(str(nvitop_dir))
+    plot_nvitop.write_nvitop_summary(str(nvitop_dir), samples)
+
+    log_path = nvitop_dir / "nvitop_summary.log"
+    json_path = nvitop_dir / "nvitop_summary.json"
+    assert log_path.is_file()
+    assert json_path.is_file()
+    side = json.loads(json_path.read_text())
+    assert side["gpu_total_gib"] == 80.0
+    assert side["samples"] == len(samples)
+    components = {p["component"] for p in side["per_process"]}
+    assert components == {"actor", "rollout"}
+    # actor peak (60) > rollout peak (25) -> global peak is the actor's
+    peaks = [p["max_process_gpu_mem"] for p in side["per_process"]]
+    assert max(peaks) == 60.0
+
+
+def test_load_memory_summary_prefers_json_sidecar(tmp_path):
+    from toolkits.embodied_tuner.profiler import plot_nvitop
+    from toolkits.embodied_tuner.parser import _load_memory_summary
+
+    nvitop_dir = tmp_path / "nvitop"
+    _write_nvitop_dir(
+        nvitop_dir,
+        {
+            "actor_rank0_pid1": [
+                _sample_record(1, "actor", 0, 1, 60.0, 100.0, 57.0),
+                _sample_record(2, "actor", 0, 1, 61.0, 100.0, 57.0),
+            ],
+            "env_rank0_pid3": [_sample_record(1, "env", 0, 3, 0.5, 16.0, 1.0)],
+        },
+    )
+    # Generate the sidecar (mirrors what a real run leaves on disk).
+    plot_nvitop.write_nvitop_summary(
+        str(nvitop_dir), plot_nvitop._load_samples(str(nvitop_dir))
+    )
+    ms = _load_memory_summary(nvitop_dir)
+    assert ms is not None
+    assert ms.gpu_total_gib == 80.0
+    assert ms.peak_gpu_mem_gib == 61.0  # true global max, NOT the first line
+    assert ms.peak_mem_util_percent == 57.0
+    assert len(ms.per_gpu) >= 1
+    assert {p["component"] for p in ms.per_process} == {"actor", "env"}
+
+
+def test_load_memory_summary_falls_back_to_log_text_without_sidecar(tmp_path):
+    """Older trials have no nvitop_summary.json; the .log text must still parse."""
+    from toolkits.embodied_tuner.parser import _load_memory_summary
+
+    nvitop_dir = tmp_path / "nvitop"
+    nvitop_dir.mkdir()
+    # Two process lines; the SECOND has the higher peak. The legacy regex
+    # grabbed the FIRST only (component-order bug). The text fallback must
+    # take the global max across both.
+    (nvitop_dir / "nvitop_summary.log").write_text(
+        "nvitop resource summary\n"
+        "samples: 10\nspan_s: 5.000\naggregate_bin_s: 1.000\n\n"
+        "global_gpu_summary:\n"
+        "  gpu0: avg_mem=20.000 GiB, max_mem=25.000 GiB, avg_gpu_util=40.000 %, "
+        "max_gpu_util=90.000 %, avg_mem_util=30.000 %, max_mem_util=57.000 %\n\n"
+        "process_summary:\n"
+        "  actor/r0/pid1: avg_rss=1.000 GiB, max_rss=1.000 GiB, avg_cpu=10.000 %, "
+        "max_cpu=10.000 %, avg_process_gpu_mem=10.000 GiB, max_process_gpu_mem=10.000 GiB, "
+        "avg_process_gpu_util=33.000 %, max_process_gpu_util=100.000 %, gpu_indices=[0]\n"
+        "  rollout/r0/pid2: avg_rss=1.000 GiB, max_rss=1.000 GiB, avg_cpu=10.000 %, "
+        "max_cpu=10.000 %, avg_process_gpu_mem=40.000 GiB, max_process_gpu_mem=40.000 GiB, "
+        "avg_process_gpu_util=33.000 %, max_process_gpu_util=72.000 %, gpu_indices=[4]\n"
+    )
+    ms = _load_memory_summary(nvitop_dir)
+    assert ms is not None
+    # rollout (40) > actor (10): global peak must be rollout's, not actor's.
+    assert ms.peak_gpu_mem_gib == 40.0
+    assert ms.peak_mem_util_percent == 57.0
+    assert ms.gpu_total_gib is None  # text log has no device cap
+    assert len(ms.per_process) == 2
+
+
+def test_parse_trial_carries_memory_summary_on_all_branches(tmp_path):
+    """An OOM-killed trial still has nvitop data; the result must carry it."""
+    from toolkits.embodied_tuner.profiler import plot_nvitop
+    from toolkits.embodied_tuner.nvitop_feed import NvitopFeedMode
+
+    nvitop_dir = tmp_path / "nvitop"
+    _write_nvitop_dir(
+        nvitop_dir,
+        {"actor_rank0_pid1": [_sample_record(1, "actor", 0, 1, 60.0, 100.0, 57.0)]},
+    )
+    plot_nvitop.write_nvitop_summary(
+        str(nvitop_dir), plot_nvitop._load_samples(str(nvitop_dir))
+    )
+    # metrics.log absent + OOM stderr -> METRICS_MISSING/OOM path.
+    (tmp_path / "run_embodiment.log").write_text("CUDA out of memory\n")
+    result = parse_trial(tmp_path, returncode=1, stderr_path=tmp_path / "run_embodiment.log")
+    assert result.failure_mode is FailureMode.OOM
+    assert result.memory_summary is not None
+    assert result.peak_gpu_mem_gib == 60.0
+
+
+def test_parse_trial_raw_nvitop_default_off_per_component_latest_opt_in(tmp_path):
+    from toolkits.embodied_tuner.nvitop_feed import NvitopFeedMode
+
+    nvitop_dir = tmp_path / "nvitop"
+    _write_nvitop_dir(
+        nvitop_dir,
+        {
+            "actor_rank0_pid1": [_sample_record(1, "actor", 0, 1, 60.0)],
+            "actor_rank1_pid2": [_sample_record(1, "actor", 1, 2, 55.0)],
+            "rollout_rank0_pid3": [_sample_record(1, "rollout", 0, 3, 25.0)],
+        },
+    )
+    # Default NONE: no raw traces in the prompt.
+    result_none = parse_trial(tmp_path, nvitop_feed_mode=NvitopFeedMode.NONE)
+    assert result_none.memory_summary is not None
+    assert result_none.memory_summary.raw_nvitop_jsonl == {}
+
+    # PER_COMPONENT_LATEST: one rank per component.
+    result_latest = parse_trial(tmp_path, nvitop_feed_mode=NvitopFeedMode.PER_COMPONENT_LATEST)
+    raw = result_latest.memory_summary.raw_nvitop_jsonl
+    assert len(raw) == 2  # one actor rank + one rollout rank
+    assert {s.split("_rank")[0] for s in raw} == {"actor", "rollout"}
