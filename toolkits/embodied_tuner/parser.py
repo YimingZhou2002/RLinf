@@ -191,6 +191,13 @@ class TimelineSummary:
             (drops bootstrap warmup). Produced by
             :func:`~toolkits.embodied_tuner.timeline_processor.compute_component_call_averages`.
             Empty ``{}`` when a component has <=2 non-blocking events.
+        offload_cost: Per-component onload/offload (CPU<->GPU transfer)
+            cost, plus the combined total as a fraction of wall. Produced
+            by :func:`~toolkits.embodied_tuner.timeline_processor.compute_offload_cost`.
+            Empty ``{}`` when no offload-bearing events exist
+            (``enable_offload`` likely False). Surfaced near the top of the
+            critic timeline block because "how much wall went to weight
+            movement" is a first-order signal for the offload knobs.
     """
 
     per_tag: tuple[TagStats, ...] = ()
@@ -204,6 +211,7 @@ class TimelineSummary:
     raw_jsonl: dict[str, str] = field(default_factory=dict)
     plot_paths: dict[str, Path] = field(default_factory=dict)
     component_call_averages: dict[str, dict] = field(default_factory=dict)
+    offload_cost: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -808,6 +816,7 @@ def parse_timeline(
     from toolkits.embodied_tuner.timeline_processor import (
         compute_component_call_averages,
         compute_critical_path,
+        compute_offload_cost,
         compute_outliers,
         compute_per_component_bubble,
         compute_stall_fractions,
@@ -838,6 +847,7 @@ def parse_timeline(
         per_component_bubble=compute_per_component_bubble(events),
         raw_excerpts=extract_raw_excerpts(events),
         component_call_averages=compute_component_call_averages(events),
+        offload_cost=compute_offload_cost(events),
     )
 
 

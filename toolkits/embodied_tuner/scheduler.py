@@ -365,7 +365,21 @@ class Scheduler:
                     last_sibling_failure_mode=last_sibling_failure_mode,
                 )
             except CriticError as exc:
-                self._record_critic_failure(trial_idx, str(exc), start)
+                # Persist whatever the critic captured before it gave up
+                # (every retry's prompt + response, plus any transport
+                # error) so a human can see *why* it failed. A failed
+                # proposal has no trial log dir of its own, so dump it
+                # under a dedicated directory beside the ledger.
+                failure_dir = (
+                    self.ledger.path.parent / f"critic-failure-trial-{trial_idx:02d}"
+                )
+                persisted = self._persist_critic_transactions(failure_dir)
+                self._record_critic_failure(
+                    trial_idx,
+                    str(exc),
+                    start,
+                    log_dir=failure_dir if persisted else Path(""),
+                )
                 return self._finish("critic_failure", trial_idx, oom_count)
 
             # Persist the critic's per-attempt prompt+response under the
@@ -811,7 +825,7 @@ class Scheduler:
                 return False
         return True
 
-    def _persist_critic_transactions(self, log_dir: Path) -> None:
+    def _persist_critic_transactions(self, log_dir: Path) -> Path | None:
         """Dump the critic's per-attempt prompt + response under ``log_dir``.
 
         Reads ``self.critic.transaction_log`` (present on ``CodexCritic``
@@ -820,12 +834,15 @@ class Scheduler:
         stop-requested branch supplies ``Path("")``). Any IO error is
         swallowed with a log line — persisting the transcript is a
         debugging convenience, not a correctness requirement.
+
+        Returns the ``<log_dir>/critic`` directory when transactions were
+        written, else ``None`` (nothing to persist / disabled / IO error).
         """
         log = getattr(self.critic, "transaction_log", None)
         if not log:
-            return
+            return None
         if log_dir == Path(""):
-            return
+            return None
         try:
             critic_dir = Path(log_dir) / "critic"
             critic_dir.mkdir(parents=True, exist_ok=True)
@@ -851,16 +868,20 @@ class Scheduler:
                 response_path.write_text(
                     record.get("response", ""), encoding="utf-8"
                 )
+            return critic_dir
         except OSError as exc:
             _log.warning("failed to persist critic transactions to %s: %s", log_dir, exc)
+            return None
 
-    def _record_critic_failure(self, trial_idx: int, reason: str, start: float) -> None:
+    def _record_critic_failure(
+        self, trial_idx: int, reason: str, start: float, log_dir: Path = Path("")
+    ) -> None:
         """Persist a ledger entry capturing critic exhaustion."""
         entry = make_entry(
             trial_idx=trial_idx,
             delta={},
             resolved_config_sha=None,
-            log_dir="",
+            log_dir=str(log_dir) if log_dir != Path("") else "",
             returncode=None,
             status=Status.FAILED.value,
             failure_mode=FailureMode.LAUNCH_FAILURE.value,
@@ -964,6 +985,7 @@ class Scheduler:
                 "component_call_averages": dict(
                     result.timeline_summary.component_call_averages
                 ),
+                "offload_cost": dict(result.timeline_summary.offload_cost),
             }
         per_component = (
             dict(result.per_step[-1].time_keys)

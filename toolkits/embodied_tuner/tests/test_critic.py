@@ -311,6 +311,31 @@ def test_codex_critic_returns_first_valid_output() -> None:
     assert output.delta == {KNOB_ACTOR_OFFLOAD: True}
 
 
+def test_codex_critic_forwards_session_flag(monkeypatch) -> None:
+    """codex_session is passed through to ask-codex.sh as --codex-session;
+    left unset, the flag is absent (default one-shot behaviour)."""
+    import types
+
+    from toolkits.embodied_tuner import critic as critic_mod
+
+    response = _make_codex_response({KNOB_ACTOR_OFFLOAD: True}, "s")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(argv, **_kwargs):
+        seen["argv"] = argv
+        return types.SimpleNamespace(returncode=0, stdout=response, stderr="")
+
+    monkeypatch.setattr(critic_mod.subprocess, "run", fake_run)
+    schema = KnobSchema()
+
+    CodexCritic(schema=schema, codex_session="camp-1")._invoke_transport("p")
+    assert "--codex-session" in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--codex-session") + 1] == "camp-1"
+
+    CodexCritic(schema=schema)._invoke_transport("p")
+    assert "--codex-session" not in seen["argv"]
+
+
 def test_codex_critic_retries_after_malformed_json() -> None:
     schema = KnobSchema()
     responses = [
@@ -386,9 +411,89 @@ def test_codex_critic_gives_up_after_max_retries() -> None:
     assert "attempts" in str(exc.value)
 
 
-# ---------------------------------------------------------------------------
-# Prompt construction (snapshot-style assertions on section presence)
-# ---------------------------------------------------------------------------
+def test_codex_critic_records_transport_failure_in_transaction_log() -> None:
+    schema = KnobSchema()
+
+    def transport(_prompt: str) -> str:
+        raise CriticError("ask-codex.sh exited with code 1: InvalidParameter")
+
+    critic = CodexCritic(
+        schema=schema, transport=transport, max_retries=3, transport_retries=0
+    )
+    with pytest.raises(CriticError):
+        critic.propose(
+            history=[],
+            current_knobs={},
+            last_failure_mode=None,
+            last_metric_summary=None,
+            last_timeline_summary=None,
+        )
+    # A transport failure must still leave the failing attempt on the
+    # transaction log so the scheduler can persist it for debugging.
+    assert len(critic.transaction_log) == 1
+    record = critic.transaction_log[0]
+    assert record["attempt"] == 0
+    assert "InvalidParameter" in record["parse_error"]
+    assert record["prompt_debug"]  # captured the prompt Codex saw
+
+
+def test_codex_critic_retries_transient_transport_failure() -> None:
+    schema = KnobSchema()
+    good = _make_codex_response({KNOB_MICRO_BATCH_SIZE: 32}, "shrink")
+    calls = {"n": 0}
+
+    def transport(_prompt: str) -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:  # two transient failures, then success
+            raise CriticError("ask-codex.sh exited with code 1: InvalidParameter")
+        return good
+
+    critic = CodexCritic(
+        schema=schema,
+        transport=transport,
+        transport_retries=2,
+        transport_retry_backoff_s=0,  # no real sleep in tests
+    )
+    output = critic.propose(
+        history=[],
+        current_knobs={KNOB_MICRO_BATCH_SIZE: 64},
+        last_failure_mode=None,
+        last_metric_summary=None,
+        last_timeline_summary=None,
+    )
+    assert output.delta == {KNOB_MICRO_BATCH_SIZE: 32}
+    assert calls["n"] == 3  # 1 initial + 2 retries
+    # The transient failures are transparent to the propose loop: only the
+    # single successful transport exchange lands on the transaction log.
+    assert len(critic.transaction_log) == 1
+    assert critic.transaction_log[0]["validation_ok"] is True
+
+
+def test_codex_critic_gives_up_after_transport_retries_exhausted() -> None:
+    schema = KnobSchema()
+    calls = {"n": 0}
+
+    def transport(_prompt: str) -> str:
+        calls["n"] += 1
+        raise CriticError("ask-codex.sh exited with code 1: InvalidParameter")
+
+    critic = CodexCritic(
+        schema=schema,
+        transport=transport,
+        transport_retries=2,
+        transport_retry_backoff_s=0,
+    )
+    with pytest.raises(CriticError):
+        critic.propose(
+            history=[],
+            current_knobs={},
+            last_failure_mode=None,
+            last_metric_summary=None,
+            last_timeline_summary=None,
+        )
+    assert calls["n"] == 3  # 1 initial + 2 retries, then give up
+
+
 
 
 def test_build_prompt_contains_all_required_sections() -> None:
@@ -999,7 +1104,9 @@ def test_memory_summary_block_rendered_when_supplied() -> None:
     assert "peak_process_gpu_mem=61.000 GiB" in txt
     assert "device_cap=80.000 GiB" in txt
     assert "actor/r0/pid1" in txt
-    # 57% util < 85% threshold -> no soft-pressure WARNING for this trial.
+    # Per-process row carries max_gpu_util alongside memory + gpu_indices.
+    assert "max_process_gpu_mem=61.000 GiB max_gpu_util=100.0% [gpu 0]" in txt
+    # 61/80 = 76% occupancy < 95% threshold -> no soft-pressure WARNING.
     # (Use the rendered form — the wiki §7.5 describes the warning prefix
     # verbatim, so the bare prefix matches the wiki too.)
     assert "WARNING: memory pressure — peak=" not in txt
@@ -1017,12 +1124,12 @@ def test_memory_summary_block_soft_pressure_warning() -> None:
         last_metric_summary=None,
         last_timeline_summary=None,
         last_memory_summary=_mem_summary(
-            peak_mem_util_percent=90.0, peak_gpu_mem_gib=72.0,
+            peak_mem_util_percent=90.0, peak_gpu_mem_gib=77.0,
         ),
     )
     txt = str(prompt)
     assert "WARNING: memory pressure — peak=" in txt
-    assert "90% of cap" in txt
+    assert "96% of cap" in txt
     assert "did not OOM" in txt
 
 

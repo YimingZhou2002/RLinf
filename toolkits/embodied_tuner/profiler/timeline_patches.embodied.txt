@@ -1,0 +1,43 @@
+# Embodied PPO/OpenPI style jobs.
+# Use with:
+#   export RLINF_TIMELINE_DIR=auto
+#   export RLINF_TIMELINE_WORKER_TIMER=1
+#   export RLINF_TIMELINE_ACTOR_TRAINING=1
+#   export RLINF_TIMELINE_PATCH_FILE=/mnt/public/zengwen/rlinf_utils/timeline_patches.embodied.txt
+#
+# NOTE: Inter-component communication tracing (send_to / recv_from / chan_put /
+#   chan_get across env / rollout / reward / actor) is NOT listed here. It does
+#   not go through this PatchSpec file — the generic PatchSpec wrapper cannot
+#   capture async wait() spans, resolve the caller component dynamically, read
+#   Channel (non-Worker) context, or suppress nested re-entrant puts. It is
+#   instead installed by a dedicated hook in autopatch.py and is enabled
+#   automatically whenever RLINF_TIMELINE_WORKER_TIMER is on.
+
+rlinf.runners.embodied_runner:EmbodiedRunner.run:runner:run
+
+rlinf.workers.env.env_worker:EnvWorker.prefetch_train_bootstrap:env:prefetch_train_bootstrap
+
+rlinf.workers.rollout.hf.huggingface_worker:MultiStepRolloutWorker.predict:rollout:predict
+
+rlinf.workers.actor.fsdp_actor_worker:EmbodiedFSDPActor.compute_advantages_and_returns:actor:compute_advantages_and_returns
+
+# enable_offload=True 时的权重/优化器/模型/env 搬运时长
+# Actor: EmbodiedFSDPActor 的权重/优化器搬运。注意原 spec 写的
+#   EmbodiedFSDPActor._load_weight_and_optimizer 在 embodied 链路里并不存在 —— 该方法
+#   定义在 FSDPActor（非 embodied 兄弟类），EmbodiedFSDPActor 不继承它。embodied 实际
+#   用的 EmbodiedFSDPActor 继承自 FSDPModelManager，其 offload/load 散落在以下四个方法
+#   （定义于 rlinf.hybrid_engines.fsdp.fsdp_model_manager）。patch 基类方法即可被子类实例命中。
+rlinf.hybrid_engines.fsdp.fsdp_model_manager:FSDPModelManager.offload_param_and_grad:actor:offload_param_and_grad
+rlinf.hybrid_engines.fsdp.fsdp_model_manager:FSDPModelManager.offload_optimizer:actor:offload_optimizer
+rlinf.hybrid_engines.fsdp.fsdp_model_manager:FSDPModelManager.load_param_and_grad:actor:load_param_and_grad
+rlinf.hybrid_engines.fsdp.fsdp_model_manager:FSDPModelManager.load_optimizer:actor:load_optimizer
+
+# Rollout: 模型 reload/offload
+rlinf.workers.rollout.hf.huggingface_worker:MultiStepRolloutWorker.reload_model:rollout:reload_model
+rlinf.workers.rollout.hf.huggingface_worker:MultiStepRolloutWorker.offload_model:rollout:offload_model
+
+# Env: onload/offload（maniskill）。注意类名是 ManiskillOffloadEnv（skill 全小写），
+#   不是 ManiSkillOffloadEnv。该模块在 import 时存在循环引用，import-hook 会在模块
+#   尚未完整定义类时尝试 patch 而失败；autopatch 的 deferred-retry 会在模块完整加载后补 patch。
+rlinf.envs.maniskill.maniskill_offload_env:ManiskillOffloadEnv.onload:env:onload
+rlinf.envs.maniskill.maniskill_offload_env:ManiskillOffloadEnv.offload:env:offload

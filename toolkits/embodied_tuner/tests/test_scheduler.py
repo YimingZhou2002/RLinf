@@ -28,7 +28,7 @@ from typing import Any
 
 import pytest
 
-from toolkits.embodied_tuner.critic import CriticOutput, Rationale
+from toolkits.embodied_tuner.critic import CriticError, CriticOutput, Rationale
 from toolkits.embodied_tuner.fake_critic import FakeCritic
 from toolkits.embodied_tuner.ledger import Ledger
 from toolkits.embodied_tuner.override_wrapper import LaunchSpec
@@ -421,6 +421,44 @@ def test_critic_exhaustion_terminates_loop(tmp_path: Path) -> None:
     result = scheduler.run()
     assert result.stop_reason == "critic_failure"
     assert result.trial_count == 0
+
+
+def test_critic_failure_persists_transaction_log(tmp_path: Path) -> None:
+    """On critic_failure the captured attempts must be dumped to disk.
+
+    A failed proposal has no trial log dir of its own, so the scheduler
+    writes the transaction log under ``critic-failure-trial-NN/`` beside
+    the ledger. Regression guard: previously these attempts vanished.
+    """
+
+    class _RaisingCritic(FakeCritic):
+        def propose(self, **kwargs: Any) -> CriticOutput:  # type: ignore[override]
+            self.transaction_log = [
+                {
+                    "attempt": 0,
+                    "prompt_debug": "prompt for attempt 0",
+                    "response": "",
+                    "parse_error": "ask-codex.sh exited with code 1: InvalidParameter",
+                    "validation_ok": False,
+                    "validation_reason": "",
+                }
+            ]
+            raise CriticError("ask-codex.sh exited with code 1")
+
+    critic = _RaisingCritic(outputs=[])
+    scheduler = _SchedulerFactory(tmp_path=tmp_path).build(
+        critic, BudgetConfig(max_trials=3, budget_seconds=999, max_oom=99)
+    )
+    result = scheduler.run()
+    assert result.stop_reason == "critic_failure"
+
+    critic_dir = tmp_path / "critic-failure-trial-00" / "critic"
+    prompt = critic_dir / "attempt-00-prompt.md"
+    response = critic_dir / "attempt-00-response.txt"
+    assert prompt.exists() and response.exists()
+    assert "InvalidParameter" in prompt.read_text()
+    assert "prompt for attempt 0" in prompt.read_text()
+
 
 
 # ---------------------------------------------------------------------------

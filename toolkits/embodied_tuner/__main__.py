@@ -41,6 +41,7 @@ import argparse
 import functools
 import json
 import logging
+import re
 import sys
 import time as _time
 from collections.abc import Mapping
@@ -74,6 +75,7 @@ from toolkits.embodied_tuner.scheduler import (
     Scheduler,
 )
 from toolkits.embodied_tuner.schema import KnobSchema
+from toolkits.embodied_tuner.timeline_feed import JsonlFeedMode
 from toolkits.embodied_tuner.utils.emit_all_responses import (
     emit_all_responses,
 )
@@ -113,6 +115,7 @@ class CLIArgs:
     fake_critic_path: Path | None
     ledger_dir: Path
     ask_codex_path: str
+    single_codex_session: bool = False
     max_siblings: int = 3
 
 
@@ -270,6 +273,17 @@ def build_parser() -> argparse.ArgumentParser:
             "next to this module). The name is kept for backwards compatibility."
         ),
     )
+    parser.add_argument(
+        "--single-codex-session",
+        action="store_true",
+        help=(
+            "Run the whole campaign inside ONE Codex conversation: every critic "
+            "round resumes the same session so context accumulates across rounds "
+            "(passed to ask-codex.sh as --codex-session, keyed by the ledger dir). "
+            "Off by default — each round is an independent one-shot consult. Only "
+            "affects the 'codex' backend."
+        ),
+    )
     return parser
 
 
@@ -333,6 +347,7 @@ def parse_cli_args(argv: list[str] | None = None) -> CLIArgs:
         fake_critic_path=ns.fake_critic,
         ledger_dir=ledger_dir,
         ask_codex_path=ask_script_path,
+        single_codex_session=ns.single_codex_session,
         max_siblings=ns.max_siblings,
     )
 
@@ -565,6 +580,9 @@ def _parser_adapter(
         timed_out=outcome.timed_out,
         stderr_path=outcome.stdout_path,
         enable_offload=enable_offload,
+        # TEMP: disable raw timeline JSONL injection into the critic prompt.
+        # Revert to the default (drop this kwarg) to restore PER_COMPONENT_LATEST.
+        jsonl_feed_mode=JsonlFeedMode.NONE,
         nvitop_feed_mode=feed_mode,
         plot_formats=("png", "html"),
     )
@@ -645,7 +663,18 @@ def _extract_baseline_knobs(baseline: Path, schema: KnobSchema) -> dict[str, Any
 def _build_critic(args: CLIArgs, schema: KnobSchema) -> Critic:
     if args.fake_critic_path is not None:
         return _load_fake_critic(args.fake_critic_path)
-    return CodexCritic(schema=schema, ask_codex_path=args.ask_codex_path)
+    codex_session: str | None = None
+    if args.single_codex_session:
+        # One conversation per campaign: key by the ledger-dir name (unique
+        # per run). Sanitise to ask-codex.sh's allowed charset
+        # (alphanumerics, dot, underscore, dash) — the default ledger name
+        # carries colons from the timestamp.
+        codex_session = re.sub(r"[^A-Za-z0-9._-]", "-", args.ledger_dir.name)
+    return CodexCritic(
+        schema=schema,
+        ask_codex_path=args.ask_codex_path,
+        codex_session=codex_session,
+    )
 
 
 def _load_fake_critic(path: Path) -> FakeCritic:

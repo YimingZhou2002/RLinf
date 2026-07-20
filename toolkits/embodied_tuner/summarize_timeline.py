@@ -234,13 +234,16 @@ def build_summary(timeline_dir: Path, *, enable_offload=None) -> str:
     if not events:
         sections.append("(no events)")
         return "\n".join(sections) + "\n"
+    # Lead with the two views the critic weighs most heavily: steady-state
+    # per-call cost and CPU<->GPU offload cost. Keep the txt ordering in sync
+    # with the critic verbose block (see critic._render_timeline_verbose).
+    sections += _render_call_avgs(tp.compute_component_call_averages(events))
+    sections += _render_offload_block(tp.compute_offload_cost(events))
     sections += _render_stalls(tp.compute_stall_fractions(events))
     sections += _render_tag_stats(
         tp.compute_tag_stats(events, headline_tags=_HEADLINE_TAGS)
     )
-    sections += _render_offload_block(tp.compute_offload_cost(events))
     sections += _render_bubble(tp.compute_per_component_bubble(events))
-    sections += _render_call_avgs(tp.compute_component_call_averages(events))
     sections += _render_outliers(
         tp.compute_outliers(events, enable_offload=enable_offload)
     )

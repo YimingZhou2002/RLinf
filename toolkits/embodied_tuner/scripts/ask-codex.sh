@@ -6,7 +6,7 @@
 # This is an active, one-shot skill (unlike the passive RLCR loop).
 #
 # Usage:
-#   ask-codex.sh [--codex-model MODEL:EFFORT] [--codex-timeout SECONDS] [question...]
+#   ask-codex.sh [--codex-model MODEL:EFFORT] [--codex-timeout SECONDS] [--codex-session KEY] [question...]
 #
 # Output:
 #   stdout: Codex's response (for Claude to read)
@@ -49,6 +49,10 @@ CODEX_MODEL="$DEFAULT_CODEX_MODEL"
 CODEX_EFFORT="$DEFAULT_CODEX_EFFORT"
 CODEX_TIMEOUT="$DEFAULT_ASK_CODEX_TIMEOUT"
 USE_STDIN=false
+# When set, all invocations sharing this key run inside ONE Codex conversation:
+# the first records the session id printed by `codex exec`, later ones resume
+# it. Empty = current behaviour (a fresh one-shot session per call).
+CODEX_SESSION_KEY=""
 
 # ========================================
 # Help
@@ -68,6 +72,12 @@ OPTIONS:
                        Timeout for the Codex query in seconds (default: 3600)
   --stdin              Read the question from stdin instead of argv (avoids
                        the 128 KiB per-argv cap for large prompts)
+  --codex-session <KEY>
+                       Bind this call to a persistent Codex conversation named
+                       KEY. The first call for a KEY starts a session and records
+                       its id; subsequent calls resume it (`codex exec resume`),
+                       so a whole tuner campaign shares one context. Omit for the
+                       default one-shot-per-call behaviour.
   -h, --help           Show this help message
 
 DESCRIPTION:
@@ -143,6 +153,14 @@ while [[ $# -gt 0 ]]; do
             USE_STDIN=true
             shift
             ;;
+        --codex-session)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --codex-session requires a KEY argument" >&2
+                exit 1
+            fi
+            CODEX_SESSION_KEY="$2"
+            shift 2
+            ;;
         -*)
             echo "Error: Unknown option: $1" >&2
             echo "Use --help for usage information" >&2
@@ -210,6 +228,23 @@ if [[ ! "$CODEX_EFFORT" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     exit 1
 fi
 
+# Validate codex session key: it becomes a filename, so reject path separators
+# and dot-prefixes (same guard as cancel-rlcr-session.sh).
+if [[ -n "$CODEX_SESSION_KEY" ]]; then
+    if [[ "$CODEX_SESSION_KEY" == *"/"* || "$CODEX_SESSION_KEY" == *"\\"* ]]; then
+        echo "Error: --codex-session must not contain a path separator: $CODEX_SESSION_KEY" >&2
+        exit 1
+    fi
+    if [[ "$CODEX_SESSION_KEY" == .* ]]; then
+        echo "Error: --codex-session must not start with a dot: $CODEX_SESSION_KEY" >&2
+        exit 1
+    fi
+    if [[ ! "$CODEX_SESSION_KEY" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "Error: --codex-session allows only alphanumerics, dot, underscore, dash: $CODEX_SESSION_KEY" >&2
+        exit 1
+    fi
+fi
+
 # ========================================
 # Detect Project Root
 # ========================================
@@ -240,6 +275,33 @@ if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
     CACHE_DIR="$SKILL_DIR/cache"
     mkdir -p "$CACHE_DIR"
     echo "ask-codex: warning: home cache not writable, using $CACHE_DIR" >&2
+fi
+
+# ========================================
+# Resolve Codex Session (shared-conversation mode)
+# ========================================
+
+# When --codex-session KEY is set, persist the Codex conversation id under a
+# stable per-(project, key) path so every call with the same KEY resumes the
+# same conversation instead of cold-starting. The first call has no recorded
+# id and runs a fresh `codex exec`; it then captures the "session id: <uuid>"
+# line Codex prints and writes it here for the next call to resume.
+CODEX_SESSION_ID=""
+CODEX_SESSION_STATE_FILE=""
+CODEX_SESSION_RESUME=false
+if [[ -n "$CODEX_SESSION_KEY" ]]; then
+    SESSION_STATE_DIR="$CACHE_BASE/humanize/$SANITIZED_PROJECT_PATH/codex-session"
+    if ! mkdir -p "$SESSION_STATE_DIR" 2>/dev/null; then
+        SESSION_STATE_DIR="$SKILL_DIR/codex-session"
+        mkdir -p "$SESSION_STATE_DIR"
+    fi
+    CODEX_SESSION_STATE_FILE="$SESSION_STATE_DIR/$CODEX_SESSION_KEY.sid"
+    if [[ -s "$CODEX_SESSION_STATE_FILE" ]]; then
+        CODEX_SESSION_ID="$(head -n1 "$CODEX_SESSION_STATE_FILE" | tr -d '[:space:]')"
+        if [[ -n "$CODEX_SESSION_ID" ]]; then
+            CODEX_SESSION_RESUME=true
+        fi
+    fi
 fi
 
 # ========================================
@@ -309,6 +371,20 @@ fi
 
 CODEX_EXEC_ARGS+=("$CODEX_AUTO_FLAG" "-C" "$PROJECT_ROOT")
 
+# Resume-mode argv. `codex exec resume` does NOT accept --full-auto or -C, so
+# we drop them and cd into the project root at run time instead. Sandbox parity:
+# bypass when requested, otherwise Codex's default non-interactive policy (a
+# read-only consult needs no write access). --skip-git-repo-check keeps resume
+# working when the campaign cwd is not the git root.
+CODEX_RESUME_ARGS=(${CODEX_DISABLE_HOOKS_ARGS[@]+"${CODEX_DISABLE_HOOKS_ARGS[@]}"} "-m" "$CODEX_MODEL")
+if [[ -n "$CODEX_EFFORT" ]]; then
+    CODEX_RESUME_ARGS+=("-c" "model_reasoning_effort=${CODEX_EFFORT}")
+fi
+if [[ "${HUMANIZE_CODEX_BYPASS_SANDBOX:-}" == "true" ]] || [[ "${HUMANIZE_CODEX_BYPASS_SANDBOX:-}" == "1" ]]; then
+    CODEX_RESUME_ARGS+=("--dangerously-bypass-approvals-and-sandbox")
+fi
+CODEX_RESUME_ARGS+=("--skip-git-repo-check")
+
 # ========================================
 # Save Debug Command
 # ========================================
@@ -348,8 +424,15 @@ epoch_to_iso() {
 START_TIME=$(date +%s)
 
 CODEX_EXIT_CODE=0
-printf '%s' "$QUESTION" | run_with_timeout "$CODEX_TIMEOUT" codex exec "${CODEX_EXEC_ARGS[@]}" - \
-    > "$CODEX_STDOUT_FILE" 2> "$CODEX_STDERR_FILE" || CODEX_EXIT_CODE=$?
+if [[ "$CODEX_SESSION_RESUME" == "true" ]]; then
+    echo "ask-codex: resuming codex session $CODEX_SESSION_ID (key=$CODEX_SESSION_KEY)" >&2
+    printf '%s' "$QUESTION" | ( cd "$PROJECT_ROOT" && run_with_timeout "$CODEX_TIMEOUT" \
+        codex exec resume "${CODEX_RESUME_ARGS[@]}" "$CODEX_SESSION_ID" - ) \
+        > "$CODEX_STDOUT_FILE" 2> "$CODEX_STDERR_FILE" || CODEX_EXIT_CODE=$?
+else
+    printf '%s' "$QUESTION" | run_with_timeout "$CODEX_TIMEOUT" codex exec "${CODEX_EXEC_ARGS[@]}" - \
+        > "$CODEX_STDOUT_FILE" 2> "$CODEX_STDERR_FILE" || CODEX_EXIT_CODE=$?
+fi
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
@@ -439,6 +522,27 @@ EOF
 fi
 
 # ========================================
+# Record Session Id (first round of a shared session)
+# ========================================
+
+# On the first successful call for a --codex-session KEY, capture the session
+# id Codex printed ("session id: <uuid>") so the next call resumes this exact
+# conversation. Skipped when resuming (the id is already known).
+if [[ -n "$CODEX_SESSION_KEY" && "$CODEX_SESSION_RESUME" != "true" && -n "$CODEX_SESSION_STATE_FILE" ]]; then
+    CAPTURED_SID="$(grep -oiE 'session id:[[:space:]]*[0-9a-fA-F-]{36}' "$CODEX_STDERR_FILE" 2>/dev/null \
+        | head -n1 | grep -oiE '[0-9a-fA-F-]{36}' | head -n1)"
+    if [[ -n "$CAPTURED_SID" ]]; then
+        if printf '%s\n' "$CAPTURED_SID" > "$CODEX_SESSION_STATE_FILE" 2>/dev/null; then
+            echo "ask-codex: recorded codex session $CAPTURED_SID (key=$CODEX_SESSION_KEY)" >&2
+        else
+            echo "ask-codex: warning: could not persist session id to $CODEX_SESSION_STATE_FILE" >&2
+        fi
+    else
+        echo "ask-codex: warning: no session id found in codex output; next call for key=$CODEX_SESSION_KEY starts fresh" >&2
+    fi
+fi
+
+# ========================================
 # Save Output and Metadata
 # ========================================
 
@@ -456,6 +560,8 @@ exit_code: 0
 duration: ${DURATION}s
 status: success
 started_at: $(epoch_to_iso "$START_TIME")
+session_key: ${CODEX_SESSION_KEY:-none}
+session_resumed: $CODEX_SESSION_RESUME
 ---
 EOF
 

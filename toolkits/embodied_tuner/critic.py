@@ -43,8 +43,10 @@ independently by tests and the AC-11 smoke harness.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +58,8 @@ from toolkits.embodied_tuner.schema import (
     KnobSchema,
     KnobSchemaError,
 )
+
+_log = logging.getLogger("embodied_tuner.critic")
 
 
 # --------------------------------------------------------------------------
@@ -465,12 +469,14 @@ def _render_memory_pressure(last_failure_mode: str | None) -> str:
 # Soft memory-pressure threshold. When the last trial did NOT OOM but GPU
 # memory occupancy (used/total, ``max_mem_occ``) reached this fraction of the
 # device cap, the critic should still prefer memory-reducing deltas
-# proactively — the OOM block above only fires after a crash. Mirrors the
-# "~85% of the device cap" rule of thumb in wiki/06-playbook.md §2.
+# proactively — the OOM block above only fires after a crash. Set stricter
+# than the "~85% of the device cap" shrink rule of thumb in
+# wiki/06-playbook.md §2 so the WARNING flags genuine near-misses rather than
+# routine high-but-safe occupancy.
 # (Earlier this also kept a separate peak/cap-ratio clause; the occupancy
 # ratio subsumes it, since occupancy IS used/total, so the two collapsed
 # into one check.)
-MEMORY_PRESSURE_UTIL_THRESHOLD = 85.0
+MEMORY_PRESSURE_UTIL_THRESHOLD = 95.0
 
 
 def _fmt_gib(value: float | None) -> str:
@@ -578,7 +584,8 @@ def _render_memory_summary(
     per_process = memory_summary.get("per_process") or ()
     if per_process:
         lines.append(
-            "- per-process (component/rank / max_process_gpu_mem / gpu_indices):"
+            "- per-process (component/rank / max_process_gpu_mem / "
+            "max_gpu_util / gpu_indices):"
         )
         for proc in per_process[:24]:
             idx = proc.get("gpu_indices")
@@ -586,6 +593,7 @@ def _render_memory_summary(
             lines.append(
                 f"  - {proc.get('label') or proc.get('component')}: "
                 f"max_process_gpu_mem={_fmt_gib(proc.get('max_process_gpu_mem'))} "
+                f"max_gpu_util={_fmt_pct(proc.get('max_process_gpu_util'))} "
                 f"[gpu {idx_str}]"
             )
 
@@ -684,7 +692,23 @@ def _render_timeline_verbose(
         return ""
     sections: list[str] = []
 
+    component_call_averages = timeline_summary.get("component_call_averages") or {}
+    offload_cost = timeline_summary.get("offload_cost") or {}
     per_tag = timeline_summary.get("per_tag", ())
+    critical_path = timeline_summary.get("critical_path") or {}
+    outliers = timeline_summary.get("outliers") or ()
+    per_component_bubble = timeline_summary.get("per_component_bubble") or {}
+    raw_excerpts = timeline_summary.get("raw_excerpts") or ()
+    raw_jsonl = timeline_summary.get("raw_jsonl") or {}
+
+    # Lead with steady-state per-call cost and CPU<->GPU offload cost: these
+    # are the first-order signals for whether a knob moved the *typical* call
+    # or just paid weight-movement overhead, so the critic reads them first.
+    if component_call_averages:
+        sections.append(_render_component_call_averages(component_call_averages))
+    if offload_cost:
+        sections.append(_render_offload_cost(offload_cost))
+
     if per_tag:
         lines = ["## Last trial — headline tag stats (component / rank / tag / count / median)"]
         for stat in per_tag[:24]:  # keep the prompt compact
@@ -694,19 +718,10 @@ def _render_timeline_verbose(
             )
         sections.append("\n".join(lines))
 
-    critical_path = timeline_summary.get("critical_path") or {}
-    outliers = timeline_summary.get("outliers") or ()
-    per_component_bubble = timeline_summary.get("per_component_bubble") or {}
-    raw_excerpts = timeline_summary.get("raw_excerpts") or ()
-    raw_jsonl = timeline_summary.get("raw_jsonl") or {}
-    component_call_averages = timeline_summary.get("component_call_averages") or {}
-
     if critical_path:
         sections.append(_render_critical_path(critical_path))
     if per_component_bubble:
         sections.append(_render_per_component_bubble(per_component_bubble))
-    if component_call_averages:
-        sections.append(_render_component_call_averages(component_call_averages))
     if outliers:
         sections.append(_render_outliers(outliers))
     if raw_excerpts:
@@ -854,6 +869,50 @@ def _render_component_call_averages(
             f"n={info.get('remaining_count')} "
             f"(skipped={info.get('skipped')} of "
             f"total={info.get('call_count_total')})"
+        )
+    return "\n".join(lines)
+
+
+def _render_offload_cost(offload_cost: Mapping[str, Any]) -> str:
+    """Per-component CPU<->GPU weight-movement cost (``enable_offload=True``).
+
+    Renders the ``compute_offload_cost`` view. ``onload`` = CPU->GPU paid
+    before real work resumes; ``offload`` = GPU->CPU paid to free the
+    device. ``combined_frac_of_wall`` answers "how much of this trial's
+    wall was spent just moving weights around" — a first-order signal the
+    critic uses to decide whether to flip a component's ``enable_offload``.
+    Empty when no offload-bearing events exist (offload likely disabled).
+    """
+    def _pct(value: Any) -> str:
+        try:
+            return f"{float(value) * 100:.1f}%"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    totals = offload_cost.get("totals") or {}
+    lines = [
+        "## Last trial — CPU<->GPU offload cost (weight movement under enable_offload)",
+        "onload=CPU->GPU (paid before real work resumes); offload=GPU->CPU (paid "
+        "to free the device). combined_frac_of_wall = share of wall spent moving "
+        "weights; a high value argues for flipping that component's enable_offload.",
+        f"  wall={offload_cost.get('wall_s')}s  "
+        f"onload_total={totals.get('onload_total_s')}s  "
+        f"offload_total={totals.get('offload_total_s')}s  "
+        f"combined={totals.get('combined_total_s')}s "
+        f"({_pct(totals.get('combined_frac_of_wall'))} of wall)",
+    ]
+    per_component = offload_cost.get("per_component") or {}
+    for component in sorted(per_component):
+        info = per_component[component] or {}
+        onload = info.get("onload") or {}
+        offload = info.get("offload") or {}
+        lines.append(
+            f"  - {component}: combined={info.get('combined_total_s')}s "
+            f"({_pct(info.get('combined_frac_of_wall'))} of wall)  "
+            f"onload[n={onload.get('count')} total={onload.get('total_s')}s "
+            f"median={onload.get('median_s')}s]  "
+            f"offload[n={offload.get('count')} total={offload.get('total_s')}s "
+            f"median={offload.get('median_s')}s]"
         )
     return "\n".join(lines)
 
@@ -1133,11 +1192,24 @@ class CodexCritic:
     Attributes:
         ask_codex_path: Path to ``ask-codex.sh``. Tests inject a fake
             shell-callable via ``transport``.
+        codex_session: When set, passed through as ``--codex-session`` so
+            every ``propose`` round in the campaign shares one Codex
+            conversation (context accumulates across rounds). ``None``
+            keeps the default one-shot-per-round behaviour.
         max_retries: Maximum dual-source / schema retries before raising
             :class:`CriticError`. Mirrors the AC-7 default of 3.
         transport: Optional injection point. When set, called as
             ``transport(prompt) -> str``; otherwise the script is invoked
             via :func:`subprocess.run`.
+        transport_retries: Number of *extra* transport attempts made when
+            a call fails with a transient error (non-zero ask-codex exit,
+            timeout, or OSError) — e.g. a flaky Codex API ``InvalidParameter``
+            response. ``0`` reproduces the old fail-fast behaviour. These
+            retries are transparent to the schema/dual-source retry loop in
+            :meth:`propose`; only the final failure surfaces there.
+        transport_retry_backoff_s: Base linear backoff between transport
+            retries; the *n*-th retry sleeps ``n * backoff`` seconds. Set to
+            ``0`` in tests to avoid real sleeps.
         transaction_log: Per-``propose`` capture of each transport
             exchange, for the scheduler to persist under
             ``<trial_log_dir>/critic/``. Reset at the start of each
@@ -1154,8 +1226,11 @@ class CodexCritic:
     ask_codex_path: str = str(
         Path(__file__).resolve().parent / "scripts" / "ask-codex.sh"
     )
+    codex_session: str | None = None
     max_retries: int = 3
     transport: Callable[[str], str] | None = None
+    transport_retries: int = 2
+    transport_retry_backoff_s: float = 5.0
     transaction_log: list[dict[str, Any]] = field(default_factory=list)
 
     def propose(
@@ -1212,7 +1287,25 @@ class CodexCritic:
                 dag_block=dag_block,
             )
             debug_prompt = prompt.to_debug_text()
-            response = self._invoke_transport(str(prompt))
+            try:
+                response = self._invoke_transport(str(prompt))
+            except CriticError as exc:
+                # A transport failure (e.g. ask-codex.sh / Codex exiting
+                # non-zero) is not retriable here, but the failing attempt
+                # must still land in the transaction log so the scheduler
+                # can persist its prompt + error for a human to audit —
+                # otherwise the round vanishes with no on-disk trace.
+                self.transaction_log.append(
+                    {
+                        "attempt": attempt,
+                        "prompt_debug": debug_prompt,
+                        "response": "",
+                        "parse_error": str(exc),
+                        "validation_ok": False,
+                        "validation_reason": "",
+                    }
+                )
+                raise
             record: dict[str, Any] = {
                 "attempt": attempt,
                 "prompt_debug": debug_prompt,
@@ -1251,11 +1344,45 @@ class CodexCritic:
     # ----- Transport -------------------------------------------------------
 
     def _invoke_transport(self, prompt: str) -> str:
+        """Invoke the transport, retrying transient failures.
+
+        A single ask-codex / Codex call can fail transiently — a flaky
+        ``InvalidParameter`` API response, a timeout, a dropped socket.
+        Rather than let one such blip abort the whole campaign with
+        ``critic_failure``, retry up to ``transport_retries`` times with a
+        linear backoff. Only the final failure propagates as
+        :class:`CriticError`.
+        """
+        last_exc: CriticError | None = None
+        for attempt in range(self.transport_retries + 1):
+            try:
+                return self._invoke_transport_once(prompt)
+            except CriticError as exc:
+                last_exc = exc
+                if attempt < self.transport_retries:
+                    backoff = self.transport_retry_backoff_s * (attempt + 1)
+                    _log.warning(
+                        "critic transport failed (attempt %d/%d): %s; "
+                        "retrying in %.1fs",
+                        attempt + 1,
+                        self.transport_retries + 1,
+                        exc,
+                        backoff,
+                    )
+                    if backoff > 0:
+                        time.sleep(backoff)
+        assert last_exc is not None  # loop runs >=1 time
+        raise last_exc
+
+    def _invoke_transport_once(self, prompt: str) -> str:
         if self.transport is not None:
             return self.transport(prompt)
+        argv = [self.ask_codex_path, "--stdin"]
+        if self.codex_session:
+            argv += ["--codex-session", self.codex_session]
         try:
             result = subprocess.run(  # noqa: S603 — known argv
-                [self.ask_codex_path, "--stdin"],
+                argv,
                 input=prompt,
                 capture_output=True,
                 text=True,
