@@ -35,6 +35,7 @@ not raw `step_time`. A delta that shrinks `step_time` but shrinks
 | `T_act`  | wall time of one actor `run_training` (recv_traj + compute_adv + forward + policy_loss + backward + optimizer_step) |
 | `T_sync` | wall time of `actor/sync_model_to_rollout` when `weight_sync_interval=1`; zero otherwise          |
 | `R`      | `env.train.rollout_epoch * env.train.max_steps_per_rollout_epoch` — interact chunks per training step |
+| `O_env`, `O_rol`, `O_act` | CPU<->GPU weight-movement cost (onload + offload) of that component; **zero unless** `<component>.enable_offload=true`. Env/rollout pay it on each interact chunk (≈ scales with `R`); actor pays it once per `run_training`. Distinct from `T_env/T_rol/T_act`, which are the compute-only per-call times. |
 
 ## 3. Per-step component contributions
 

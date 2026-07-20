@@ -35,7 +35,7 @@ catalog is `07-constraints.md`.
     steady-state per-chunk `T_env` and `T_rol` are imbalanced — shift
     GPUs toward the side with the longer interact time. The
     steady-state view is the "component call averages" sub-block
-    (`03-inputs.md §9.4`), which already drops the first 2 events.
+    (`03-inputs.md §9.1`), which already drops the first 2 events.
 - **Common failure modes:**
   - Disaggregated split that leaves actor with too few GPUs; `T_act`
     grows past every other term and now the actor is bound, not
@@ -170,7 +170,7 @@ catalog is `07-constraints.md`.
 ## 7. `actor.enable_offload`
 
 - **What it moves:** offloads actor optimiser state / weights between
-  training steps. Big memory saving, big wall-time cost.
+  training steps. Big memory saving, comes with wall-time cost.
 - **When to enable:** actor or rollout OOM only.
 - **When to disable:** actor is on the critical path, or nvml curves
   show large downward-then-upward memory swings around each

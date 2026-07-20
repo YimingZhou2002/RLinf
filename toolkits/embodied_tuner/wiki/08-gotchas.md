@@ -63,10 +63,17 @@ the wall time of whichever component it applies to.
 - Rollout / actor offload move large model state and are wall-time
   expensive.
 
-Propose them only when the last trial hit `FailureMode=OOM` on that
+Propose them when the last trial hit `FailureMode=OOM` on that
 component (or on actor when actor and rollout share GPU ranks — see
 `06-playbook.md §6`) and the more effective memory rescues are
 exhausted.
+
+Offload is also acceptable *without* a crash: when the expand-from
+parent is under high memory occupancy (the §7.1 soft-pressure
+`WARNING`, `max_mem_occ >= 95%`) and offloading a component opens headroom that enables a delta with a clearly better
+throughput payoff. The offload is the enabler for that stronger
+optimization, not a throughput move in itself. The hard rule stays:
+never offload the component currently on the critical path.
 
 See `06-playbook.md §§5-7`.
 

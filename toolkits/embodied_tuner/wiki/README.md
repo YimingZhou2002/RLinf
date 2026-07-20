@@ -38,6 +38,9 @@ ascending order. Earlier files do not assume later ones.
    `DIVISIBILITY_VIOLATION` failures.
 8. [`08-gotchas.md`](08-gotchas.md) — consolidated anti-patterns
    with cross-references to the rule detail.
+9. [`09-dag-search.md`](09-dag-search.md) — the `## Search DAG` block:
+   active branch, sibling attempts, top-K OK leaderboard, recent
+   failure / duplicate leaves, and how to expand from the active leaf.
 
 ## Prompt contract
 

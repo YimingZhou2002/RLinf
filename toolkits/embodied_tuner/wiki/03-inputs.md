@@ -7,28 +7,29 @@ blocks disagree, use the priority in §10.
 
 ## 1. Prompt block order
 
-Rendered top-to-bottom by `CriticPrompt.__str__`
-(`critic.py:222-236`):
+Rendered top-to-bottom by `CriticPrompt.__str__`:
 
 1. Wiki block — this directory, concatenated in file-name order.
 2. Bitter Lessons block (§3).
-3. Trial History block (§4).
-4. Current knobs + legal ranges (§5).
-5. Hard constraints reminder (§6).
-6. Memory pressure block — conditional (§7).
-7. GPU memory summary block (§7.5) — present when the last trial has nvitop data.
-8. Metric summary compact (§8).
-9. Timeline verbose (§9).
-10. GPU memory verbose block — reserved slot, raw nvitop JSONL; default empty (§7.5).
-11. Rationale schema — the output shape the critic must emit.
-12. Feedback block — appended on retry only.
+3. Search DAG block — the persistent trial DAG; see `09-dag-search.md`.
+   Inserted between the Bitter Lessons and Trial History blocks.
+4. Trial History block (§4).
+5. Current knobs + legal ranges (§5).
+6. Hard constraints reminder (§6).
+7. Memory pressure block — conditional (§7).
+8. GPU memory summary block (§7.1) — present when the last trial has nvitop data.
+9. Metric summary compact (§8).
+10. Timeline verbose (§9).
+11. GPU memory verbose block — reserved slot, raw nvitop JSONL; default empty (§7.2).
+12. Rationale schema — the output shape the critic must emit.
+13. Feedback block — appended on retry only.
 
 The wiki is always at the top, so every later block builds on the
 definitions in `01-concepts.md`.
 
 ## 2. Wiki block
 
-Concatenation of `01-concepts.md` … `08-gotchas.md`. Reading order is
+Concatenation of `01-concepts.md` … `09-dag-search.md`. Reading order is
 the file order — earlier files do not assume later ones.
 
 Authoritative for: definitions, formulas, decision recipe, per-knob
@@ -115,7 +116,7 @@ surfaced as a `Recent failure leaf` in the DAG view + a required
 is present, the config you are expanding from genuinely crashed on
 memory — follow the triage cascade. If it is absent, the memory you
 see in §7.1 is the parent's honest baseline, and a near-cap reading
-there is a soft-pressure hint (`max_mem_occ >= 85%`), not a mandate.
+there is a soft-pressure hint (`max_mem_occ >= 95%`), not a mandate.
 
 Authoritative for: the "next delta must reduce memory" gate — but only
 for pressure that belongs to the expand-from config, not a reverted
@@ -148,7 +149,8 @@ occupancy (`max_mem_occ` — used/total ratio), and peak `max_mem_util`
 (NVML memory-controller busy ratio, kept as a diagnostic), a per-GPU
 row (index / `max_mem` / `max_mem_occ` / `max_mem_util` /
 `max_gpu_util`), a per-process row
-(`<component>/r<rank>/pid…` / `max_process_gpu_mem` / `gpu_indices`),
+(`<component>/r<rank>/pid…` / `max_process_gpu_mem` / `max_gpu_util` /
+`gpu_indices`),
 and a pointer to the nvitop curve render — `nvitop_resources.png` /
 `nvitop_resources.html` written by `profiler/plot_nvitop.py` (the
 legacy `nvitop_curves.png` name is also discovered); text-only
@@ -165,9 +167,9 @@ pressure signal. Example from a real trial: peak occupancy
 `63.6 / 80 = 79.5%` while `max_mem_util` was only `57%`.
 
 **Soft-pressure signal.** A `WARNING: memory pressure …` line appears
-when `peak_mem_occ_percent >= 85%` — i.e. peak used/total crossed the
+when `peak_mem_occ_percent >= 95%` — i.e. peak used/total crossed the
 threshold — *even if the trial did not OOM*. (Occupancy subsumes the
-legacy `peak_gpu_mem_gib / gpu_total_gib >= 0.85` clause, since
+legacy `peak_gpu_mem_gib / gpu_total_gib >= 0.95` clause, since
 occupancy IS used/total, so the two collapsed into one check.) This
 is the new signal the OOM-only §7 block could not provide: it lets
 you tighten the memory envelope *before* a crash. When this warning is
@@ -226,7 +228,7 @@ memory_util_percent, …}], process_gpu_memory_gib, …}`. Excluded
 from `to_debug_text()`.
 
 **Default: NOT injected.** The parser's `NvitopFeedMode` defaults to
-`NONE`, so the critic sees only the aggregated §7.5 block. Raw nvitop
+`NONE`, so the critic sees only the aggregated §7.1 block. Raw nvitop
 traces are large (≈0.7–0.8 MB each; actor traces run larger than
 rollout/env), so raw injection is opt-in via the
 `--nvitop-feed-mode {none,per_component_latest,all}` CLI flag.
@@ -285,9 +287,40 @@ Authoritative for: coarse "who was idle" read. For per-tag detail see
 Excluded from `to_debug_text()`. Only present when a `TimelineSummary`
 was produced by `parser.py` (see §12 for missing-data cases).
 
-Renders up to six sub-blocks in the following order.
+Renders up to seven sub-blocks. The block LEADS with the two cost
+decompositions the critic weighs first — steady-state per-call cost
+(§9.1) and CPU<->GPU offload cost (§9.2) — then per-tag baselines, the
+bottleneck view, and its corroboration blocks.
 
-### 9.1 Headline tag stats
+### 9.1 Component call averages (steady state)
+
+Header: `## Last trial — env/rollout steady-state per-call duration
+(first 2 calls dropped as warmup)`. Per-component:
+
+    - <component>: mean=<s> min=<s> max=<s> n=<int> (skipped=<int> of total=<int>)
+
+Skips the first 2 events per component (bootstrap warmup) so the mean
+reflects steady state.
+
+Authoritative for: the typical per-call cost the critic can compare
+against outliers, and whether a knob moved the *typical* call or only
+the warmup call.
+
+### 9.2 Offload cost (CPU<->GPU weight movement)
+
+Header: `## Last trial — CPU<->GPU offload cost (weight movement under
+enable_offload)`. `onload` = CPU->GPU (paid before real work resumes);
+`offload` = GPU->CPU (paid to free the device). Per-component:
+
+    - <component>: combined=<s> (<frac>% of wall)  onload[n=.. total=..s median=..s]  offload[n=.. total=..s median=..s]
+
+plus a grand-total line with `combined_frac_of_wall`.
+
+Authoritative for: how much wall went to weight movement — a first-order
+signal for the `enable_offload` knobs. Empty when no offload-bearing
+events exist (`enable_offload` likely False).
+
+### 9.3 Headline tag stats
 
 Header: `## Last trial — headline tag stats (component / rank / tag / count / median)`.
 Line format:
@@ -296,7 +329,7 @@ Line format:
 
 Capped at 24 entries. Authoritative for: per-tag baseline durations.
 
-### 9.2 Critical path per global_step
+### 9.4 Critical path per global_step
 
 Header: `## Last trial — critical path per global_step`. Prefixed by a
 one-paragraph explainer that reminds the reader `actor/recv_traj` is a
@@ -313,10 +346,12 @@ component. **The bottleneck is the lane with the largest `real_s`.** A
 lane with big `blocked_s` and small `real_s` is a downstream consumer,
 not a bottleneck; do NOT propose to shrink it.
 
-Authoritative for: bottleneck identification. **This is the primary
-signal.** All later sub-blocks are corroboration.
+Authoritative for: bottleneck identification — **the primary signal for
+*which* component to shrink.** The §9.1/§9.2 cost blocks that precede it
+are cost decompositions (per-call cost, weight-movement overhead); the
+§9.5/§9.6/§9.7 blocks that follow corroborate this one.
 
-### 9.3 Per-component bubble
+### 9.5 Per-component bubble
 
 Header: `## Last trial — per-component bubble`. Bubble = `wall −
 union(real-busy intervals across all ranks of this component)`;
@@ -331,20 +366,7 @@ Per-component format:
 Authoritative for: which component's GPU budget can be reduced (largest
 `bubble_frac` = most idle wall-clock).
 
-### 9.4 Component call averages (steady state)
-
-Header: `## Last trial — env/rollout steady-state per-call duration
-(first 2 calls dropped as warmup)`. Per-component:
-
-    - <component>: mean=<s> min=<s> max=<s> n=<int> (skipped=<int> of total=<int>)
-
-Skips the first 2 events per component (bootstrap warmup) so the mean
-reflects steady state.
-
-Authoritative for: the typical per-call cost the critic can compare
-against outliers.
-
-### 9.5 Outlier events
+### 9.6 Outlier events
 
 Header: `## Last trial — outlier events (per-tag P95, >1s)`.
 Per-row:
@@ -355,7 +377,7 @@ Per-row:
 (e.g. `env.enable_offload`). Authoritative for: knob suggestions
 that map cleanly to a single stall.
 
-### 9.6 Raw excerpts and JSONL
+### 9.7 Raw excerpts and JSONL
 
 Headers:
 `## Last trial — raw timeline excerpts (top-K longest events, runner wrapper excluded)`
@@ -374,25 +396,26 @@ Required whenever the delta touches `cluster.component_placement`
 
 Consult in this order when signals conflict:
 
-1. `## Last trial — critical path per global_step` (§9.2) — the
+1. `## Last trial — critical path per global_step` (§9.4) — the
    `real_s` decomposition is the single source of truth for bottleneck
    identification.
-2. `## Last trial — per-component bubble` (§9.3) — corroborates
-   §9.2 by showing which side was idle wall-clock.
-3. `## Last trial — component_call_averages` (§9.4) — corroborates
-   the per-call cost the parser attributed to each component.
+2. `## Last trial — per-component bubble` (§9.5) — corroborates
+   §9.4 by showing which side was idle wall-clock.
+3. `## Last trial — component_call_averages` (§9.1) and `## Last trial —
+   CPU<->GPU offload cost` (§9.2) — corroborate the per-call cost and the
+   weight-movement overhead the parser attributed to each component.
 4. `## Last trial — MetricTable Time-section keys` (§8.1) — sanity
-   check only; on ±10% divergence with §9.2, trust §9.2 (the
+   check only; on ±10% divergence with §9.4, trust §9.4 (the
    MetricTable tag is wrapper-noisy).
 
-The `## Last trial — outlier events` block (§9.5) is corroboration for
-a decision already made from §9.2 — do not use it as the primary
+The `## Last trial — outlier events` block (§9.6) is corroboration for
+a decision already made from §9.4 — do not use it as the primary
 bottleneck signal.
 
 ## 11. Failure mode enum
 
-`Status ∈ {OK, FAILED}`. `FailureMode ∈`
-(`toolkits/embodied_tuner/parser.py:73-88`):
+`Status ∈ {OK, FAILED}`. `FailureMode ∈` (the `FailureMode` enum in
+`toolkits/embodied_tuner/parser.py`):
 
 | FailureMode              | Meaning                                                                          |
 |--------------------------|----------------------------------------------------------------------------------|
@@ -407,7 +430,7 @@ bottleneck signal.
 | `DIVISIBILITY_VIOLATION` | Synthetic — matched a routing-divisibility assertion; see `07 §2.6`.             |
 
 Failure modes that require a `bitter_lesson` in the critic response
-(`critic.py:827-829`):
+(enforced in `CriticOutputValidator.validate`, `critic.py`):
 `OOM, WORKER_CRASH, TIMEOUT, CONFIG_INVALID, DIVISIBILITY_VIOLATION`.
 
 ## 12. Missing data cases

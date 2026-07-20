@@ -5,6 +5,40 @@ effect on `step_time / num_trajectories` is non-zero. Each step names
 which prompt block(s) to consult and cross-refs the wiki file that
 owns the underlying rule.
 
+## Strategy — early rounds: profile before you exploit
+
+When the campaign is young — short Trial History, the active leaf still
+at or near the root in the `## Search DAG` — spend the first few rounds
+*characterizing* the knob landscape rather than greedily chasing the
+first bottleneck you see. Each such round applies a single-knob delta to
+a different tunable knob and reads back two things from the resulting
+trial:
+
+- **Cost:** how the knob moved wall time and GPU memory — the
+  per-component cost blocks (`03-inputs.md §9.1`, `§9.2`) and the GPU
+  memory summary (`§7.1`).
+- **Payoff:** how it moved the objective `step_time / num_trajectories`
+  (`01-concepts.md §1`).
+
+The goal is an empirical cost/sensitivity map — which knobs actually
+shift the objective, in which direction, and at what memory cost — so
+later rounds can exploit the highest-payoff knob backed by evidence
+instead of a guess. This is the exploration phase; the
+bottleneck-driven exploitation in §§2-4 is what you switch to once the
+map exists.
+
+Guardrails while probing:
+
+- Every probe is still **one knob per delta** (§7) and must pass the
+  constraint checklist (§5).
+- Prefer probing knobs that plausibly touch the current critical-path
+  component first (§2) — a probe on an off-path knob teaches little.
+- Do not re-probe a knob at a value already in the Trial History / DAG
+  (§7, `09-dag-search.md`); vary the value so each probe adds new
+  evidence.
+- Stop exploring and commit to exploitation once the dominant term's
+  sensitivity is clear, or the remaining round budget is short.
+
 ## 1. Identify placement and runner mode
 
 Read `cluster.component_placement` and `runner.use_training_pipeline`
@@ -20,7 +54,7 @@ loop.
 Read the timeline verbose block (`03-inputs.md §9`) in the priority
 order from `03-inputs.md §10`:
 
-1. **Critical path per global_step** (`§9.2`). Each lane row separates
+1. **Critical path per global_step** (`§9.4`). Each lane row separates
    `real_s` (actual GPU work) from `blocked_s` (waiting on another
    component). **The bottleneck is the lane with the largest `real_s`.**
    A lane with big `blocked_s` and small `real_s` is a downstream
@@ -34,18 +68,18 @@ order from `03-inputs.md §10`:
     `actor/run_training` only as MetricTable sanity-check evidence when
     actor phase tags are missing; never cite recv tags as actor
     compute.
-2. **Per-component bubble** (`§9.3`). Largest `bubble_frac` = most
+2. **Per-component bubble** (`§9.5`). Largest `bubble_frac` = most
    idle wall-clock; usually the side whose GPU budget can be reduced.
-3. **Component call averages** (`§9.4`). Typical per-call cost after
+3. **Component call averages** (`§9.1`). Typical per-call cost after
    the first 2 warmup calls are dropped.
 4. **MetricTable Time-section keys** (`§8.1`). Sanity-check against
    the timeline's per-step attribution within ~10%. Divergence means
    one of the tags is wrapper-noisy — trust the timeline `real_s`.
-5. **Outlier events** (`§9.5`). Rows carry `knob_hint` when the parser
+5. **Outlier events** (`§9.6`). Rows carry `knob_hint` when the parser
    can map the stall to a knob. Use as corroboration for the delta
    chosen in step 1 — not as a substitute for reading the critical
    path.
-6. **Raw excerpts / JSONL** (`§9.6`). Verbatim events. Cite one of
+6. **Raw excerpts / JSONL** (`§9.7`). Verbatim events. Cite one of
    these whenever the delta touches `cluster.component_placement`
    (dual-source rule — see §6).
 

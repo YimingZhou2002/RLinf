@@ -13,16 +13,16 @@ give you the numerator.
 
 | Placement                          | Runner mode      | Critical path per step                          | Shrinking a non-max term buys |
 |------------------------------------|------------------|--------------------------------------------------|-------------------------------|
-| Collocated                         | either           | `T_sync + R*(T_env + T_rol) + T_act`             | direct — every term on path   |
-| Hybrid                             | either           | `T_sync + R*max(T_env, T_rol) + T_act`           | 0 for the shorter of env / rol |
-| Disaggregated                      | `run`            | `T_sync + R*max(T_env, T_rol) + T_act`           | 0 for shorter of env / rol; actor GPUs also idle during interact |
-| Disaggregated                      | `run_pipeline`   | `T_sync + max(R*T_env, R*T_rol, T_act)`          | 0 for non-max components      |
+| Collocated                         | either           | `T_sync + O_env+O_rol+R*(T_env + T_rol) + T_act+O_act`             | direct — every term on path   |
+| Hybrid                             | either           | `T_sync + max(O_env+O_rol)+R*max(T_env, T_rol) + T_act`           | 0 for the shorter of env / rol |
+| Disaggregated                      | `run`            | `T_sync + max(O_env+O_rol)+R*max(T_env, T_rol) + T_act`           | 0 for shorter of env / rol; actor GPUs also idle during interact |
+| Disaggregated                      | `run_pipeline`   | `T_sync + max(O_env+O_rol) + max(R*T_env, R*T_rol, T_act+O_act)`          | 0 for non-max components      |
 
 ## 2. Collocated
 
 Every worker time-slices on the same GPUs, so nothing overlaps.
 
-    step_time ≈ T_sync + R*(T_env + T_rol) + T_act
+    step_time ≈ T_sync + O_env+O_rol+R*(T_env + T_rol) + T_act+O_act
 
 Every component is on the critical path; any shrink helps. Pick the
 dominant term:
@@ -49,7 +49,7 @@ Both runner modes share the same interact-side critical path here.
 the SAME step, but under hybrid the actor uses all 8 GPUs and contends
 with env/rollout — the pipeline gain is small and often negative.
 
-    step_time ≈ T_sync + R*max(T_env, T_rol) + T_act    (both runner modes)
+    step_time ≈ T_sync + max(O_env+O_rol)+R*max(T_env, T_rol) + T_act    (both runner modes)
 
 **Consequences.**
 
@@ -80,7 +80,7 @@ Actor still gates on `recv_rollout_trajectories.wait()`, so the
 critical path is identical to hybrid — the disjoint actor GPUs simply
 sit idle during the interact loop:
 
-    step_time ≈ T_sync + R*max(T_env, T_rol) + T_act
+    step_time ≈ T_sync + max(O_env+O_rol)+R*max(T_env, T_rol) + T_act
 
 **Consequence.** Under `run`, disaggregated wastes the actor's GPUs
 during the interact loop. Prefer hybrid (actor collocated on all GPUs)
@@ -92,7 +92,7 @@ unless a memory reason forces dedicated actor GPUs. See
 Actor training of step N overlaps the interact loop of step N. Steady
 state:
 
-    step_time ≈ T_sync + max(R*T_env, R*T_rol, T_act)
+    step_time ≈ T_sync + max(O_env+O_rol) + max(R*T_env, R*T_rol, T_act+O_act)
 
 Add one `R*max(T_env, T_rol)` for pipeline drain at the very last step
 of the run — negligible over long runs. This is the pattern where

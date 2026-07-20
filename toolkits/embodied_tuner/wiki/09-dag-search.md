@@ -67,6 +67,14 @@ identifiers are stable across rounds.
    the resolved SHA on the next proposal (change a different knob,
    change the magnitude of the change, or explicitly propose
    `stop_requested`).
+6. **Early rounds are for breadth, not depth.** When the active branch
+   is still shallow (the root or only a handful of nodes deep), a spread
+   of single-knob children off the same parent — each probing a
+   different knob — builds the cost/sensitivity map faster than drilling
+   one branch deep. Once the DAG's top-K OK leaderboard shows which knob
+   moves the objective most, switch to depth: keep expanding the best OK
+   leaf. See the early-rounds strategy note at the top of
+   `05-recipe.md`.
 
 ## Node line format
 
