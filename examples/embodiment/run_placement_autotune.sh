@@ -21,3 +21,8 @@ fi
 python ${REPO_PATH}/toolkits/auto_placement/auto_placement_worker.py \
     --config-path ${EMBODIED_PATH}/config \
     --config-name $CONFIG_NAME \
+    +dry_run=true \
+    +gpus_per_node=2 \
+    +profile_data=autotune_demo \
+    +data.env_num=32 \
+    "${@:2}"

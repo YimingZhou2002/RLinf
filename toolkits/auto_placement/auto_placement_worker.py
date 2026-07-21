@@ -24,6 +24,7 @@ from node import (
     MegatronNode,
     RolloutNode,
 )
+from offline_cluster import build_offline_cluster
 from placement import (
     ScheduleMode,
     ScheduleResult,
@@ -190,7 +191,18 @@ def get_workflow_graph(cfg) -> dict[str, list[str]]:
 
 @hydra.main(version_base="1.1")
 def main(cfg):
-    cluster = Cluster(cfg.cluster.num_nodes)
+    dry_run = cfg.get("dry_run", False)
+    if dry_run:
+        gpus_per_node = cfg.get("gpus_per_node", 8)
+        logging.info(
+            "DRY-RUN: using an offline cluster of %d node(s) x %d GPU(s) "
+            "(no Ray connection).",
+            cfg.cluster.num_nodes,
+            gpus_per_node,
+        )
+        cluster = build_offline_cluster(cfg.cluster.num_nodes, gpus_per_node)
+    else:
+        cluster = Cluster(cfg.cluster.num_nodes)
     if cfg.runner.task_type == "reasoning":
         component_placement = ModelParallelComponentPlacement(cfg, cluster)
     else:  # embodiment task

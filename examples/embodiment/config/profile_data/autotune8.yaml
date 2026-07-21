@@ -1,0 +1,25 @@
+# Fabricated profile data for an 8-GPU auto-placement dry run (demo only).
+#
+# Schema (see toolkits/auto_placement/util.init_global_config_env + node.py):
+#   env_profile_data / rollout_profile_data : {env_num_per_instance: cost_seconds}
+#       -> fitted by DataFitter (power/exp/log/poly); give several monotonic
+#          points spanning the env-count range you expect per instance.
+#   actor_cost : scalar collocated total cost for the actor (FSDP/Megatron) node.
+#
+# env_num=64 in the demo, so per-instance env counts across 1..8 instances are
+# 64/32/16/8 (aligned divisors); keys below cover that range. Numbers are MADE
+# UP to exercise the planner offline -- replace with real batch-profile output.
+
+env_profile_data:
+  8: 0.80
+  16: 1.45
+  32: 2.90
+  64: 6.10
+
+rollout_profile_data:
+  8: 0.55
+  16: 1.05
+  32: 2.30
+  64: 5.40
+
+actor_cost: 120

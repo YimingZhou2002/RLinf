@@ -1,0 +1,24 @@
+# Fabricated profile data for auto-placement dry runs (demo only).
+#
+# Schema consumed by toolkits/auto_placement (see util.init_global_config_env,
+# node.EnvProfiler / MegatronNode):
+#   - env_profile_data / rollout_profile_data: {env_num_per_instance: cost_seconds}
+#     fitted by DataFitter (power/exp/log/poly), so several monotonic points help.
+#   - actor_cost: scalar collocated total cost for the actor (Megatron/FSDP) node.
+#
+# These numbers are made up to exercise the planner offline; they are NOT
+# measured. Replace with real batch-profile output before trusting a placement.
+
+env_profile_data:
+  8: 0.80
+  16: 0.85
+  24: 0.92
+  32: 1.05
+
+rollout_profile_data:
+  8: 0.40
+  16: 0.62
+  24: 0.88
+  32: 1.18
+
+actor_cost: 100
