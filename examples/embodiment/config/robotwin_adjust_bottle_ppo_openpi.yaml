@@ -26,13 +26,13 @@ runner:
     experiment_name: "robotwin_ppo_openpi"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 2
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 10
-  save_interval: 10
-
+  val_check_interval: -1
+  save_interval: -1
+  overlap_env_bootstrap: true
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
@@ -70,16 +70,18 @@ env:
   enable_offload: True
   # Override the default values in env/robotwin_adjust_bottle
   train:
-    rollout_epoch: 4
+    rollout_epoch: 1
     total_num_envs: 256
     reward_coef: ${algorithm.reward_coef}
     max_episode_steps: 200
     max_steps_per_rollout_epoch: 200
     group_size: ${algorithm.group_size}
-    assets_path: "/path/to/robotwin_assets"
+    assets_path: "/mnt/public/zhouyiming/RoboTwin"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/train_seeds.json
     center_crop: False
     task_config:
+      # skip_stability_check: true
+      clear_cache_freq: 10000
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
@@ -101,8 +103,8 @@ env:
     max_steps_per_rollout_epoch: 200
     group_size: 1
     use_fixed_reset_state_ids: True
-    is_eval: True
-    assets_path: "/path/to/robotwin_assets"
+    is_eval: False
+    assets_path: "/mnt/public/zhouyiming/RoboTwin"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
     video_cfg:
       save_video: True
@@ -135,20 +137,20 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 32
-  global_batch_size: 2048 # 1024
+  global_batch_size: 1024 # 1024
   seed: 1234
   enable_offload: True
 
   # Override the default values in model/openpi
   model:
-    model_path: "/path/to/RLinf/RLinf-Pi0-RoboTwin-SFT-adjust_bottle"
+    model_path: "/mnt/public/zhouyiming/model/RLinf-Pi0-RoboTwin-SFT-adjust_bottle"
     num_action_chunks: 50 # interface for the env
     add_value_head: True
     action_dim: 14
     openpi:
       config_name: "pi0_aloha_robotwin"
       num_images_in_input: 3
-      detach_critic_input: True
+      detach_critic_input: True=
 
   optim:
     lr: 5.6e-6

@@ -57,7 +57,7 @@ def _preload_numba_llvmlite() -> None:
             pass
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, runtime_env={"env_vars": {"OMNI_KIT_ACCEPT_EULA": "YES"}})
 class BehaviorProcess:
     def __init__(
         self,
@@ -65,6 +65,9 @@ class BehaviorProcess:
         num_envs: int,
         pipeline_stage_num: int,
     ):
+        # Accept NVIDIA Omniverse EULA upfront so the Isaac Sim / OmniGibson
+        # import chain does not block on an interactive prompt inside Ray workers.
+        os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
         _preload_numba_llvmlite()
         from omnigibson.envs import VectorEnvironment
 

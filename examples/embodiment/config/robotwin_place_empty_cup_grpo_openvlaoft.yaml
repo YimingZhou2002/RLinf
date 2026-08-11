@@ -26,7 +26,7 @@ runner:
     experiment_name: "robotwin_grpo_openvlaoft"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 1
   max_steps: -1
 
   only_eval: False
@@ -70,13 +70,13 @@ env:
 
   # Override the default values in env/robotwin_place_empty_cup
   train:
-    rollout_epoch: 8
+    rollout_epoch: 1
     total_num_envs: 128
     reward_coef: ${algorithm.reward_coef}
     max_episode_steps: 200
     max_steps_per_rollout_epoch: 200
     group_size: ${algorithm.group_size}
-    assets_path: "/path/to/robotwin_assets"
+    assets_path: "/mnt/public/zhouyiming/RoboTwin"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/train_seeds.json
 
     enable_offload: True
@@ -92,7 +92,7 @@ env:
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
-    assets_path: "/path/to/robotwin_assets"
+    assets_path: "/mnt/public/zhouyiming/RoboTwin"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
     video_cfg:
       save_video: True
@@ -127,7 +127,7 @@ actor:
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/RLinf/RLinf-OpenVLAOFT-RoboTwin-SFT-place_empty_cup" # https://huggingface.co/RLinf/RLinf-OpenVLAOFT-RoboTwin-SFT-place_empty_cup
+    model_path: "/mnt/public/zhouyiming/model/RLinf-OpenVLAOFT-RoboTwin-SFT-place_empty_cup" # https://huggingface.co/RLinf/RLinf-OpenVLAOFT-RoboTwin-SFT-place_empty_cup
     implement_version: "official"
     model_type: "openvla_oft"
     value_type: ${algorithm.reward_type}  # 'action' or 'token'
