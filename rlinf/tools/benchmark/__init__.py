@@ -34,6 +34,7 @@ __all__ = [
 _LAZY = {
     "BenchRolloutWorker": "rlinf.tools.benchmark.bench_workers",
     "BenchEmbodiedActor": "rlinf.tools.benchmark.bench_workers",
+    "BenchNFTEmbodiedActor": "rlinf.tools.benchmark.bench_workers",
     "BenchEnvWorker": "rlinf.tools.benchmark.bench_workers",
     "resize_batch": "rlinf.tools.benchmark.fake_messages",
     "make_sizes": "rlinf.tools.benchmark.sweeps",

@@ -137,6 +137,52 @@ class _ResourceSampler:
         return out
 
 
+def timed_once(
+    fn: Callable[[], Any],
+    *,
+    sample_host: bool = False,
+    sample_gpu: bool = False,
+    device_index: int | None = None,
+) -> dict[str, Any]:
+    """Time a single, non-repeatable op (e.g. weight onload/offload, env build).
+
+    Unlike ``timed_vram`` this runs ``fn`` **exactly once** -- no warmup, no
+    repeats -- because onload/offload and env construction mutate state and
+    cannot be replayed in place. Returns ``{"ms": ...}`` plus, when CUDA is
+    available, ``peak_alloc_MB``/``peak_reserved_MB`` measured across the call,
+    and (when requested) the same ``host_rss_*`` / ``cpu_percent_*`` /
+    ``gpu_util_*`` samples ``timed_vram`` collects. Exceptions raised by ``fn``
+    propagate (the sampler is still stopped).
+    """
+    cuda = torch.cuda.is_available()
+    if cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+    sampler = _ResourceSampler(
+        sample_host=sample_host,
+        sample_gpu=sample_gpu,
+        device_index=device_index,
+    )
+    sampler.start()
+
+    t0 = perf_counter()
+    try:
+        fn()
+        if cuda:
+            torch.cuda.synchronize()
+        ms = (perf_counter() - t0) * 1000.0
+    finally:
+        resource_stats = sampler.stop()
+
+    record: dict[str, Any] = {"ms": round(ms, 4)}
+    if cuda:
+        record["peak_alloc_MB"] = round(torch.cuda.max_memory_allocated() / 1e6, 2)
+        record["peak_reserved_MB"] = round(torch.cuda.max_memory_reserved() / 1e6, 2)
+    record.update(resource_stats)
+    return record
+
+
 def progress_iter(items: Iterable, *, desc: str, enabled: bool = True):
     """Wrap ``items`` in a tqdm progress bar when possible.
 
